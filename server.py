@@ -68,7 +68,7 @@ SOURCE_MAX_DIM = 2048  # Source images for edit/variations — high quality but 
 GCS_BUCKET = os.environ.get("GCS_BUCKET")  # e.g. "my-nanobanana-images"
 S3_BUCKET = os.environ.get("S3_BUCKET")    # e.g. "claude-image-cache"
 S3_REGION = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
-_default_output_fallback = "cloud" if (os.environ.get("S3_BUCKET") or os.environ.get("GCS_BUCKET")) else "base64"
+_default_output_fallback = "cloud" if (os.environ.get("S3_BUCKET") or os.environ.get("GCS_BUCKET")) else "url"
 DEFAULT_OUTPUT = os.environ.get("DEFAULT_OUTPUT", _default_output_fallback)
 
 # ---------------------------------------------------------------------------
@@ -727,9 +727,11 @@ def _build_image_response(
 
     generated: list of (jpeg_bytes, per_image_metadata) tuples.
 
+    url mode (default): stores images server-side, returns /images/ URLs.
+        Avoids large base64 blobs that overflow Claude Code's tool result limit.
     base64 mode: returns [json_metadata, Image, Image, ...]
-        Images render natively in Claude. Metadata includes stored URLs for re-use.
-    cloud mode (gcs/s3): returns json_metadata string with public URLs.
+        Images render natively in Claude.ai. Avoid for large images in Claude Code.
+    cloud mode (gcs/s3): uploads to cloud storage, returns durable public URLs.
     """
     if output_mode in ("gcs", "s3", "cloud"):
         for jpeg_bytes, meta in generated:
@@ -742,8 +744,23 @@ def _build_image_response(
         else:
             result["images"] = [meta for _, meta in generated]
         return json.dumps(result)
+    elif output_mode == "url":
+        # Store server-side; return browser-accessible /images/ URLs.
+        # Safe for Claude Code (no base64 overflow) and pipelines (URLs chain between tools).
+        base_url = _get_upload_base_url()
+        for jpeg_bytes, meta in generated:
+            img_id = _store_image(jpeg_bytes, "image/jpeg")
+            meta["image_url"] = f"{base_url}/images/{img_id}"
+            meta["expires_in"] = "1 hour"
+            meta["size_kb"] = len(jpeg_bytes) // 1024
+        if len(generated) == 1:
+            result.update(generated[0][1])
+            result.pop("index", None)
+        else:
+            result["images"] = [meta for _, meta in generated]
+        return json.dumps(result)
     else:
-        # Store images server-side so they can be referenced by URL in later tool calls
+        # base64: store server-side for chaining + return inline Image content blocks
         for jpeg_bytes, meta in generated:
             img_id = _store_image(jpeg_bytes, "image/jpeg")
             meta["image_url"] = f"nanobanana://{img_id}"
@@ -911,7 +928,7 @@ async def generate_image(
         quality: "default" (fast) or "pro" (higher quality). Default: default
         count: Number of images to generate (1–4). Default: 1
         qa: If true, AI-score each image. When count > 1, ranks by total score.
-        output: "cloud"/"s3"/"gcs" uploads to cloud storage and returns URLs (default when configured). "base64" returns inline images.
+        output: "url" (default, returns /images/ URLs), "base64" (inline images), "cloud"/"s3"/"gcs" (durable cloud URLs).
 
     Returns:
         Metadata JSON + inline images (base64 mode) or metadata with URLs (cloud mode).
@@ -924,8 +941,8 @@ async def generate_image(
         return json.dumps({"error": f"Unsupported resolution '{resolution}'.", "supported": sorted(RESOLUTIONS)})
     if style and style not in STYLE_PRESETS:
         return json.dumps({"error": f"Unknown style '{style}'.", "available": sorted(STYLE_PRESETS.keys())})
-    if output not in ("base64", "gcs", "s3", "cloud"):
-        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["base64", "gcs", "s3", "cloud"]})
+    if output not in ("url", "base64", "gcs", "s3", "cloud"):
+        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["url", "base64", "gcs", "s3", "cloud"]})
     if output in ("gcs", "s3", "cloud") and not S3_BUCKET and not GCS_BUCKET:
         return json.dumps({"error": "Cloud output requested but no storage configured. Set S3_BUCKET or GCS_BUCKET env var, or use output='base64'."})
 
@@ -1022,7 +1039,7 @@ async def edit_image(
                    "outpaint" (extend canvas). Default: inpaint-insertion
         aspect_ratio: Output aspect ratio (useful for outpaint). Default: same as input.
         count: Number of candidates (1–4). Default: 1
-        output: "cloud"/"s3"/"gcs" (default when storage configured), or "base64".
+        output: "url" (default, returns /images/ URLs), "base64" (inline images), "cloud"/"s3"/"gcs" (durable cloud URLs).
 
     Returns:
         Metadata JSON + inline images (base64 mode) or metadata with URLs (gcs mode).
@@ -1032,8 +1049,10 @@ async def edit_image(
     valid_edit_modes = {"inpaint-insertion", "inpaint-removal", "outpaint"}
     if edit_mode not in valid_edit_modes:
         return json.dumps({"error": f"Unknown edit_mode '{edit_mode}'.", "available": sorted(valid_edit_modes)})
-    if output not in ("base64", "gcs", "s3", "cloud"):
-        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["base64", "gcs", "s3", "cloud"]})
+    if aspect_ratio is not None and aspect_ratio not in SUPPORTED_RATIOS:
+        return json.dumps({"error": f"Unsupported aspect ratio '{aspect_ratio}'.", "supported": sorted(SUPPORTED_RATIOS)})
+    if output not in ("url", "base64", "gcs", "s3", "cloud"):
+        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["url", "base64", "gcs", "s3", "cloud"]})
     if output in ("gcs", "s3", "cloud") and not S3_BUCKET and not GCS_BUCKET:
         return json.dumps({"error": "Cloud output requested but no storage configured. Set S3_BUCKET or GCS_BUCKET env var, or use output='base64'."})
 
@@ -1118,15 +1137,17 @@ async def swap_background(
         background: Description of the new background. Be specific.
         aspect_ratio: Output aspect ratio. Default: same as input.
         count: Number of candidates (1–4). Default: 1
-        output: "cloud"/"s3"/"gcs" (default when storage configured), or "base64".
+        output: "url" (default, returns /images/ URLs), "base64" (inline images), "cloud"/"s3"/"gcs" (durable cloud URLs).
 
     Returns:
         Metadata JSON + inline images (base64 mode) or metadata with URLs (gcs mode).
     """
     from google.genai import types
 
-    if output not in ("base64", "gcs", "s3", "cloud"):
-        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["base64", "gcs", "s3", "cloud"]})
+    if aspect_ratio is not None and aspect_ratio not in SUPPORTED_RATIOS:
+        return json.dumps({"error": f"Unsupported aspect ratio '{aspect_ratio}'.", "supported": sorted(SUPPORTED_RATIOS)})
+    if output not in ("url", "base64", "gcs", "s3", "cloud"):
+        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["url", "base64", "gcs", "s3", "cloud"]})
     if output in ("gcs", "s3", "cloud") and not S3_BUCKET and not GCS_BUCKET:
         return json.dumps({"error": "Cloud output requested but no storage configured. Set S3_BUCKET or GCS_BUCKET env var, or use output='base64'."})
 
@@ -1196,7 +1217,7 @@ async def create_variations(
         quality: "default" or "pro". Default: default
         count: Number of variations (1–4). Default: 3
         qa: Score each variation and rank by quality. Default: false
-        output: "cloud"/"s3"/"gcs" (default when storage configured), or "base64".
+        output: "url" (default, returns /images/ URLs), "base64" (inline images), "cloud"/"s3"/"gcs" (durable cloud URLs).
 
     Returns:
         Metadata JSON + inline images (base64 mode) or metadata with URLs (gcs mode).
@@ -1207,8 +1228,8 @@ async def create_variations(
         return json.dumps({"error": f"Unsupported aspect ratio '{aspect_ratio}'.", "supported": sorted(SUPPORTED_RATIOS)})
     if resolution not in RESOLUTIONS:
         return json.dumps({"error": f"Unsupported resolution '{resolution}'.", "supported": sorted(RESOLUTIONS)})
-    if output not in ("base64", "gcs", "s3", "cloud"):
-        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["base64", "gcs", "s3", "cloud"]})
+    if output not in ("url", "base64", "gcs", "s3", "cloud"):
+        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["url", "base64", "gcs", "s3", "cloud"]})
     if output in ("gcs", "s3", "cloud") and not S3_BUCKET and not GCS_BUCKET:
         return json.dumps({"error": "Cloud output requested but no storage configured. Set S3_BUCKET or GCS_BUCKET env var, or use output='base64'."})
 
