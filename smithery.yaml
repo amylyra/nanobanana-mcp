@@ -1,0 +1,18 @@
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    properties:
+      geminiApiKey:
+        type: string
+        description: "Google AI API key with Gemini image generation access"
+    required:
+      - geminiApiKey
+  commandFunction: |-
+    (config) => ({
+      command: 'python',
+      args: ['server.py'],
+      env: {
+        GEMINI_API_KEY: config.geminiApiKey
+      }
+    })
