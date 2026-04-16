@@ -2,9 +2,19 @@
 
 General-purpose image generation, editing, and analysis server for [Claude](https://claude.ai) via the [Model Context Protocol](https://modelcontextprotocol.io). Powered by Google Gemini.
 
-> **Tip:** Pass image URLs instead of base64 whenever possible — the server fetches them directly, avoiding size and truncation issues with inline data.
+> **Tip:** When working with uploaded images, call `upload_image` first to store the image server-side. It returns a `nanobanana://` URL you can pass to any other tool — no base64 truncation issues.
 
 ## Tools
+
+### `upload_image`
+
+Upload an image to the server and get a `nanobanana://` URL. **Call this first** when a user provides/uploads an image, then pass the returned URL to other tools.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `image` | string | yes | — | Base64 data URI, raw base64, or URL |
+
+Returns a `nanobanana://` URL (valid for 1 hour), image dimensions, and size. Use the URL in any other tool's `image` or `reference_images` parameter.
 
 ### `generate_image`
 
@@ -151,6 +161,20 @@ gcloud run services update nanobanana \
 Then use `output: "gcs"` in any tool call. Images are uploaded and a public URL is returned.
 
 ## Examples
+
+**Upload an image, then edit it (recommended workflow):**
+```json
+// Step 1: Upload
+upload_image({ "image": "data:image/jpeg;base64,/9j/4AAQ..." })
+// Returns: { "url": "nanobanana://a1b2c3d4e5f6", ... }
+
+// Step 2: Edit using the returned URL
+edit_image({
+  "image": "nanobanana://a1b2c3d4e5f6",
+  "prompt": "Replace the bottle with a blue one",
+  "edit_mode": "inpaint-insertion"
+})
+```
 
 **Generate with style + prompt enhancement:**
 ```json

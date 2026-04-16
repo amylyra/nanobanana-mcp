@@ -2,6 +2,7 @@
 NanoBanana MCP Server — Image generation, editing, and variations via Gemini.
 
 Tools:
+  - upload_image:      Upload an image to the server, get back a URL for other tools.
   - generate_image:    Text-to-image with references, styles, prompt enhancement, QA.
   - edit_image:        Edit an existing image (inpaint, remove, outpaint).
   - swap_background:   Keep foreground subject, replace background.
@@ -10,6 +11,7 @@ Tools:
   - list_styles:       List available style presets.
 
 Features:
+  - Server-side image store: upload once, reference by URL in all subsequent calls
   - Image QA: optional AI scoring of generated images (composition, clarity, etc.)
   - GCS output: optionally save images to Google Cloud Storage and return URLs
   - Background swap: one-step foreground preservation + background replacement
@@ -20,6 +22,8 @@ Deployment: Cloud Run with Streamable HTTP transport.
 import base64
 import json
 import os
+import threading
+import time
 import uuid
 from io import BytesIO
 from urllib.parse import urlparse
@@ -50,6 +54,44 @@ SOURCE_MAX_DIM = 2048  # Source images for edit/variations — high quality but 
 # GCS config (optional — set GCS_BUCKET env var to enable)
 # ---------------------------------------------------------------------------
 GCS_BUCKET = os.environ.get("GCS_BUCKET")  # e.g. "my-nanobanana-images"
+
+# ---------------------------------------------------------------------------
+# Server-side image store — upload once, reference by nanobanana:// URL
+# Images expire after 1 hour to prevent unbounded memory growth.
+# ---------------------------------------------------------------------------
+_IMAGE_STORE: dict[str, tuple[bytes, str, float]] = {}  # id -> (bytes, mime, timestamp)
+_STORE_LOCK = threading.Lock()
+_STORE_TTL = 3600  # 1 hour
+
+
+def _store_image(img_bytes: bytes, mime: str) -> str:
+    """Store image bytes and return a nanobanana:// URL."""
+    _gc_store()
+    img_id = uuid.uuid4().hex[:12]
+    with _STORE_LOCK:
+        _IMAGE_STORE[img_id] = (img_bytes, mime, time.time())
+    return f"nanobanana://{img_id}"
+
+
+def _fetch_from_store(img_id: str) -> tuple[bytes, str]:
+    """Retrieve image bytes from the store."""
+    with _STORE_LOCK:
+        entry = _IMAGE_STORE.get(img_id)
+    if not entry:
+        raise ValueError(
+            f"Image '{img_id}' not found in server store. "
+            "It may have expired (images are kept for 1 hour). Upload again."
+        )
+    return entry[0], entry[1]
+
+
+def _gc_store():
+    """Remove expired images from the store."""
+    now = time.time()
+    with _STORE_LOCK:
+        expired = [k for k, (_, _, ts) in _IMAGE_STORE.items() if now - ts > _STORE_TTL]
+        for k in expired:
+            del _IMAGE_STORE[k]
 
 # ---------------------------------------------------------------------------
 # Style presets — tuned prompt prefixes
@@ -96,14 +138,13 @@ mcp = FastMCP(
     "nanobanana",
     instructions=(
         "NanoBanana image generation server powered by Gemini. "
-        "Tools: generate_image (text-to-image with references, styles, prompt enhancement, QA), "
-        "edit_image (inpaint, remove objects, outpaint), "
-        "swap_background (keep subject, replace background), "
-        "create_variations (produce variations of an existing image), "
-        "analyze_image (describe/tag an image). "
+        "WORKFLOW: When a user provides/uploads an image, ALWAYS call upload_image FIRST "
+        "to store it server-side and get a nanobanana:// URL. Then pass that URL to "
+        "other tools (edit_image, swap_background, create_variations, analyze_image, "
+        "generate_image reference_images). This avoids base64 truncation issues. "
+        "Tools: upload_image, generate_image, edit_image, swap_background, "
+        "create_variations, analyze_image, list_styles. "
         "Default aspect ratio 4:5, resolution 1K. "
-        "IMPORTANT: For best results, pass image URLs instead of base64 — "
-        "the server fetches them directly, avoiding size/truncation issues with inline data. "
         "Set output='gcs' to return URLs instead of base64 (requires GCS_BUCKET env var)."
     ),
     host=os.environ.get("HOST", "0.0.0.0"),
@@ -193,6 +234,9 @@ def _normalize_image(img_bytes: bytes, max_dim: int, quality: int = 85,
 
 
 def _decode_raw(ref: str) -> tuple[bytes, str]:
+    if ref.startswith("nanobanana://"):
+        img_id = ref.replace("nanobanana://", "")
+        return _fetch_from_store(img_id)
     if _is_url(ref):
         return _fetch_url(ref)
     if ref.startswith("data:"):
@@ -367,6 +411,57 @@ def _score_image(client, img_bytes: bytes, prompt: str) -> dict:
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
+@mcp.tool()
+def upload_image(
+    image: str,
+) -> str:
+    """Upload an image to the server and get back a nanobanana:// URL.
+
+    Use this FIRST when working with user-uploaded images. The returned URL
+    can be passed to any other tool (edit_image, swap_background,
+    create_variations, analyze_image, or generate_image reference_images).
+
+    This avoids base64 truncation issues — the image is stored server-side
+    and other tools fetch it instantly by URL.
+
+    The image is downscaled to 2048px max dimension and stored for 1 hour.
+
+    Args:
+        image: The image to upload. Base64 data URI, raw base64 string, or URL.
+               For user-uploaded images in Claude, pass the base64 data here.
+
+    Returns:
+        JSON with the nanobanana:// URL to use in other tools, plus image dimensions.
+    """
+    from PIL import Image as PILImage
+
+    try:
+        raw, mime = _decode_raw(image)
+    except Exception as e:
+        return json.dumps({"error": f"Failed to decode image: {e}"})
+
+    # Normalize and store
+    try:
+        normalized, norm_mime = _normalize_image(raw, max_dim=SOURCE_MAX_DIM, quality=92)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+    # Get dimensions for feedback
+    img = PILImage.open(BytesIO(normalized))
+    w, h = img.size
+
+    url = _store_image(normalized, norm_mime)
+
+    return json.dumps({
+        "url": url,
+        "width": w,
+        "height": h,
+        "size_kb": len(normalized) // 1024,
+        "expires_in": "1 hour",
+        "usage": "Pass this URL to any other tool's image parameter",
+    })
+
+
 @mcp.tool()
 def generate_image(
     prompt: str,
