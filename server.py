@@ -101,7 +101,8 @@ def _fetch_from_store(img_id: str) -> tuple[bytes, str]:
     if not entry:
         raise ValueError(
             f"Image '{img_id}' not found in server store. "
-            "It may have expired (images are kept for 1 hour). Upload again."
+            "It may have expired (images are kept for 1 hour) or been evicted under memory pressure. "
+            "Upload the image again to get a fresh URL."
         )
     return entry[0], entry[1]
 
@@ -193,7 +194,7 @@ mcp = FastMCP(
         "they drag the image there and paste the returned URL back.\n\n"
         "Never fabricate URLs. Never pass API endpoints or web pages as image parameters.\n\n"
         "## Tools\n"
-        "- upload_image — re-host any image URL to a durable S3 URL\n"
+        "- upload_image — re-host any image (URL or data URI) to a server URL for use in other tools\n"
         "- generate_image — text-to-image, optional reference image URLs, style presets\n"
         "- edit_image — edit an image (inpaint, remove, outpaint)\n"
         "- swap_background — keep subject, replace background\n"
@@ -445,6 +446,18 @@ def _fetch_url(url: str) -> tuple[bytes, str]:
     except httpx.TimeoutException:
         raise ValueError(f"Timed out fetching image from URL: {url}")
     content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+    if content_type == "text/html":
+        if "drive.google.com" in url:
+            raise ValueError(
+                "Google Drive returned an HTML page instead of the image file. "
+                "This happens with large files (>25MB) that require a virus-scan confirmation. "
+                "To fix: open the link in your browser and click 'Download anyway', then use "
+                "that download URL — or use the Google Drive MCP to read the file directly."
+            )
+        raise ValueError(
+            "URL returned an HTML page instead of an image. "
+            "Check that the URL points directly to an image file, not a web page."
+        )
     return resp.content, content_type
 
 
@@ -607,30 +620,40 @@ async def _run_in_thread(fn, *args, **kwargs):
     return await asyncio.get_running_loop().run_in_executor(None, call)
 
 
-def _generate_loop(client, model, parts, config, count, label, qa_prompt=None):
-    """Synchronous generation loop — meant to be called via _run_in_thread.
+async def _generate_images(client, model, parts, config, count, label, qa_prompt=None):
+    """Run count Gemini image generation calls concurrently, then score concurrently if qa_prompt given.
 
-    Runs count Gemini calls, extracts images, converts to JPEG, optionally scores.
+    All generation calls fire in parallel (each in its own thread), cutting wall time
+    from count*T to ~T for a single model latency T. QA scoring also runs in parallel
+    after all images are ready. This prevents Cloud Run timeout on count > 2 with qa=True.
+
     Returns (generated, errors) where generated is [(jpeg_bytes, meta_dict), ...].
     """
-    generated = []
-    errors = []
-    for i in range(count):
+    async def _gen_one(index):
         try:
-            response = client.models.generate_content(
+            response = await _run_in_thread(
+                client.models.generate_content,
                 model=model, contents=parts, config=config,
             )
             img_bytes = _extract_image(response)
             if img_bytes:
-                jpeg_bytes = _to_jpeg(img_bytes)
-                meta = {"index": i + 1}
-                if qa_prompt:
-                    meta["qa"] = _score_image(client, jpeg_bytes, qa_prompt)
-                generated.append((jpeg_bytes, meta))
-            else:
-                errors.append(f"{label} {i + 1}: no image in response")
+                jpeg_bytes = await _run_in_thread(_to_jpeg, img_bytes)
+                return (jpeg_bytes, {"index": index}), None
+            return None, f"{label} {index}: no image in response"
         except Exception as e:
-            errors.append(f"{label} {i + 1}: {e}")
+            return None, f"{label} {index}: {e}"
+
+    results = await asyncio.gather(*[_gen_one(i + 1) for i in range(count)])
+    generated = [item for item, _ in results if item]
+    errors = [err for _, err in results if err]
+
+    if qa_prompt and generated:
+        async def _score_one(item):
+            jpeg_bytes, meta = item
+            meta["qa"] = await _run_in_thread(_score_image, client, jpeg_bytes, qa_prompt)
+            return jpeg_bytes, meta
+        generated = list(await asyncio.gather(*[_score_one(item) for item in generated]))
+
     return generated, errors
 
 
@@ -742,7 +765,7 @@ def _build_image_response(
             result.update(generated[0][1])
             result.pop("index", None)
         else:
-            result["images"] = [meta for _, meta in generated]
+            result["images"] = [{k: v for k, v in meta.items() if k != "index"} for _, meta in generated]
         return json.dumps(result)
     elif output_mode == "url":
         # Store server-side; return browser-accessible /images/ URLs.
@@ -769,7 +792,7 @@ def _build_image_response(
             result.update(generated[0][1])
             result.pop("index", None)
         else:
-            result["images"] = [meta for _, meta in generated]
+            result["images"] = [{k: v for k, v in meta.items() if k != "index"} for _, meta in generated]
         # Return metadata text + native Image content blocks
         return [json.dumps(result)] + [
             Image(data=jpeg_bytes, format="jpeg")
@@ -853,13 +876,17 @@ async def upload_image(
     ctx: Context,
     image: str,
 ) -> str:
-    """Store an image and get back a durable URL for other tools.
+    """Store an image and get back a URL for other tools.
 
-    Use this when the user pastes/uploads an image and you need a URL.
-    Accepts: http/https URLs, nanobanana:// URLs, or data URIs (data:image/...;base64,...).
+    Use this when you have a data URI from the Drive MCP and need to convert it to a URL,
+    or to re-host an image URL to ensure server-side access.
+    Accepts: http/https URLs or data URIs (data:image/...;base64,...).
+
+    When cloud storage (S3/GCS) is configured, the returned URL is durable (no expiry).
+    Otherwise the URL expires after 1 hour — the response includes "expires_in" when applicable.
 
     Args:
-        image: Image URL, nanobanana:// URL, or data URI (data:image/png;base64,...).
+        image: Image URL or data URI (data:image/png;base64,...).
 
     Returns:
         JSON with a URL to use in other tools, plus image dimensions.
@@ -979,9 +1006,8 @@ async def generate_image(
         ),
     )
 
-    # Run all Gemini calls in a thread to keep the event loop responsive
-    generated, errors = await _run_in_thread(
-        _generate_loop, client, model_name, parts, config,
+    generated, errors = await _generate_images(
+        client, model_name, parts, config,
         count, "Image", qa_prompt=final_prompt if qa else None,
     )
 
@@ -1103,8 +1129,8 @@ async def edit_image(
         response_modalities=["IMAGE", "TEXT"],
         image_config=types.ImageConfig(aspect_ratio=aspect_ratio) if aspect_ratio else None,
     )
-    generated, errors = await _run_in_thread(
-        _generate_loop, client, MODEL_FLASH, parts, config, count, "Edit",
+    generated, errors = await _generate_images(
+        client, MODEL_FLASH, parts, config, count, "Edit",
     )
 
     if not generated:
@@ -1177,8 +1203,8 @@ async def swap_background(
         response_modalities=["IMAGE", "TEXT"],
         image_config=types.ImageConfig(aspect_ratio=aspect_ratio) if aspect_ratio else None,
     )
-    generated, errors = await _run_in_thread(
-        _generate_loop, client, MODEL_FLASH, parts, config, count, "Swap"
+    generated, errors = await _generate_images(
+        client, MODEL_FLASH, parts, config, count, "Swap",
     )
 
     if not generated:
@@ -1270,8 +1296,8 @@ async def create_variations(
             image_size=resolution,
         ),
     )
-    generated, errors = await _run_in_thread(
-        _generate_loop, client, model_name, parts, config, count, "Variation",
+    generated, errors = await _generate_images(
+        client, model_name, parts, config, count, "Variation",
         qa_prompt=variation_prompt if qa else None,
     )
 
