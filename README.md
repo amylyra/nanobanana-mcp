@@ -1,6 +1,6 @@
 # NanoBanana MCP
 
-General-purpose image generation, editing, and variation server for [Claude](https://claude.ai) via the [Model Context Protocol](https://modelcontextprotocol.io). Powered by Google Gemini.
+General-purpose image generation, editing, and analysis server for [Claude](https://claude.ai) via the [Model Context Protocol](https://modelcontextprotocol.io). Powered by Google Gemini.
 
 > **Tip:** Pass image URLs instead of base64 whenever possible — the server fetches them directly, avoiding size and truncation issues with inline data.
 
@@ -8,59 +8,84 @@ General-purpose image generation, editing, and variation server for [Claude](htt
 
 ### `generate_image`
 
-Text-to-image generation with optional reference images, style presets, and AI prompt enhancement.
+Text-to-image generation with optional reference images, style presets, AI prompt enhancement, and QA scoring.
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `prompt` | string | yes | — | Image generation instruction |
-| `reference_images` | string[] | no | null | Image URLs (recommended), base64 data URIs, or raw base64. Multiple supported. |
+| `reference_images` | string[] | no | null | Image URLs (recommended), base64 data URIs, or raw base64 |
 | `style` | string | no | null | Style preset — see [Style presets](#style-presets) |
 | `enhance_prompt` | bool | no | false | AI-expand a short prompt into a detailed generation prompt |
 | `aspect_ratio` | string | no | `4:5` | `1:1`, `2:3`, `3:2`, `3:4`, `4:3`, `4:5`, `5:4`, `9:16`, `16:9`, `21:9` |
 | `resolution` | string | no | `1K` | `0.5K`, `1K`, `2K`, `4K` |
 | `quality` | string | no | `default` | `default` (fast) or `pro` (higher quality) |
 | `count` | int | no | `1` | Number of images (1–4) |
-
-Reference images are downscaled to 1024px server-side to preserve detail (logos, labels) while keeping payloads manageable.
+| `qa` | bool | no | false | AI-score each image on composition, clarity, lighting, color, prompt adherence. Ranks results when count > 1. |
+| `output` | string | no | `base64` | `base64` (data URI) or `gcs` (upload to GCS, return URL) |
 
 ### `edit_image`
 
-Edit an existing image — add objects, remove objects, or extend the canvas. Uses the Imagen 3 editing model.
+Edit an existing image — add objects, remove objects, or extend the canvas. Uses Imagen 3.
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `image` | string | yes | — | Source image — URL (recommended), base64 data URI, or raw base64 |
-| `prompt` | string | yes | — | Edit instruction — be specific about what to change |
-| `mask` | string | no | null | Mask image (URL or base64). White = edit region, black = preserve. PNG recommended for clean edges. |
+| `image` | string | yes | — | Source image — URL (recommended) or base64 |
+| `prompt` | string | yes | — | Edit instruction — be specific |
+| `mask` | string | no | null | Mask image. White = edit, black = preserve. PNG recommended. |
 | `edit_mode` | string | no | `inpaint-insertion` | `inpaint-insertion`, `inpaint-removal`, `outpaint` |
 | `aspect_ratio` | string | no | null | Output ratio (useful for outpaint) |
 | `count` | int | no | `1` | Number of candidates (1–4) |
+| `output` | string | no | `base64` | `base64` or `gcs` |
 
-When no mask is provided, the model uses automatic semantic segmentation based on your prompt. For precise edits, provide a black-and-white mask. Source images are capped at 2048px.
+### `swap_background`
 
-### `create_variations`
-
-Generate creative variations of an existing image with controllable divergence.
+One-step background replacement — keeps the foreground subject, generates a new background.
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
-| `image` | string | yes | — | Source image — URL (recommended), base64 data URI, or raw base64 |
-| `prompt` | string | no | null | Guidance for variations (e.g. "warmer lighting", "on a beach") |
+| `image` | string | yes | — | Source image with the subject to keep |
+| `background` | string | yes | — | Description of the new background |
+| `aspect_ratio` | string | no | null | Output ratio |
+| `count` | int | no | `1` | Number of candidates (1–4) |
+| `output` | string | no | `base64` | `base64` or `gcs` |
+
+### `create_variations`
+
+Generate creative variations of an existing image with controllable divergence and optional QA.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `image` | string | yes | — | Source image — URL (recommended) or base64 |
+| `prompt` | string | no | null | Guidance for variations |
 | `variation_strength` | string | no | `medium` | `subtle`, `medium`, or `strong` |
 | `aspect_ratio` | string | no | `4:5` | Output ratio |
 | `resolution` | string | no | `1K` | `0.5K`, `1K`, `2K`, `4K` |
 | `quality` | string | no | `default` | `default` or `pro` |
 | `count` | int | no | `3` | Number of variations (1–4) |
+| `qa` | bool | no | false | Score and rank variations by quality |
+| `output` | string | no | `base64` | `base64` or `gcs` |
 
-Source images are capped at 2048px.
+### `analyze_image`
+
+Describe, tag, or assess an image using Gemini vision.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `image` | string | yes | — | Image to analyze — URL (recommended) or base64 |
+| `focus` | string | no | `general` | `general`, `tags`, `alt-text`, `quality`, `brand` |
+
+Focus modes:
+- **general** — comprehensive description (subject, style, mood, colors)
+- **tags** — keyword tags for search/SEO/asset management
+- **alt-text** — concise accessible alt text (1-2 sentences)
+- **quality** — technical quality scores (sharpness, exposure, composition)
+- **brand** — marketing analysis (target audience, tone, use cases)
 
 ### `list_styles`
 
 Returns all available style presets with descriptions.
 
 ## Style presets
-
-Use the `style` parameter in `generate_image` to apply a consistent aesthetic:
 
 | Preset | Effect |
 |---|---|
@@ -79,8 +104,8 @@ Use the `style` parameter in `generate_image` to apply a consistent aesthetic:
 
 - Python 3.12+
 - A [Google AI API key](https://aistudio.google.com/apikey) with access to:
-  - Gemini image generation (for `generate_image` and `create_variations`)
-  - Imagen 3 editing (for `edit_image`)
+  - Gemini image generation (`generate_image`, `create_variations`)
+  - Imagen 3 editing (`edit_image`, `swap_background`)
 
 ### Local
 
@@ -110,16 +135,24 @@ Add the deployed URL as a [remote MCP connector](https://modelcontextprotocol.io
 https://your-service-url.run.app/mcp
 ```
 
-## Examples
+### GCS output (optional)
 
-**Simple generation:**
-```json
-{
-  "prompt": "a coffee cup on a wooden table"
-}
+To return image URLs instead of base64, set up a GCS bucket:
+
+```bash
+# Create bucket
+gsutil mb gs://my-nanobanana-images
+
+# Set env var on Cloud Run
+gcloud run services update nanobanana \
+  --set-env-vars GEMINI_API_KEY="...",GCS_BUCKET="my-nanobanana-images"
 ```
 
-**With style preset and prompt enhancement:**
+Then use `output: "gcs"` in any tool call. Images are uploaded and a public URL is returned.
+
+## Examples
+
+**Generate with style + prompt enhancement:**
 ```json
 {
   "prompt": "a coffee cup on a wooden table",
@@ -128,58 +161,48 @@ https://your-service-url.run.app/mcp
 }
 ```
 
-**With URL reference images:**
+**Generate with QA scoring (pick the best of 3):**
 ```json
 {
-  "prompt": "Same bottle but on a beach at sunset",
-  "reference_images": [
-    "https://example.com/my-product.jpg",
-    "https://example.com/mood-board.jpg"
-  ]
+  "prompt": "luxury skincare bottle on marble",
+  "style": "product-photography",
+  "count": 3,
+  "qa": true
 }
 ```
 
-**Edit — remove an object:**
+**Swap background:**
+```json
+{
+  "image": "https://example.com/product.jpg",
+  "background": "tropical beach at sunset with palm trees"
+}
+```
+
+**Analyze an image for SEO tags:**
 ```json
 {
   "image": "https://example.com/photo.jpg",
-  "prompt": "Remove the person in the background",
-  "edit_mode": "inpaint-removal"
+  "focus": "tags"
 }
 ```
 
-**Edit — with a mask for precision:**
+**Generate and save to GCS:**
 ```json
 {
-  "image": "https://example.com/photo.jpg",
-  "prompt": "Replace the sky with a dramatic sunset",
-  "mask": "https://example.com/sky-mask.png",
-  "edit_mode": "inpaint-insertion"
-}
-```
-
-**Create variations:**
-```json
-{
-  "image": "https://example.com/product-shot.jpg",
-  "prompt": "warmer lighting, golden hour",
-  "variation_strength": "medium",
-  "count": 3
+  "prompt": "minimalist product shot",
+  "output": "gcs"
 }
 ```
 
 ## Image handling
 
-The server normalizes all input images to keep things reliable:
-
 | Context | Max dimension | Format | Quality |
 |---|---|---|---|
 | Reference images (`generate_image`) | 1024px | JPEG | 85 |
-| Source images (`edit_image`, `create_variations`) | 2048px | JPEG | 92 |
+| Source images (`edit_image`, `swap_background`, `create_variations`) | 2048px | JPEG | 92 |
 | Mask images (`edit_image`) | 2048px | PNG | lossless |
 | Output images | Full resolution | JPEG | 92 |
-
-Base64 padding is auto-fixed. Corrupt/truncated images return a clear error suggesting URL usage.
 
 ## License
 

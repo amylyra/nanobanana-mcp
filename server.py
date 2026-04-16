@@ -2,11 +2,17 @@
 NanoBanana MCP Server — Image generation, editing, and variations via Gemini.
 
 Tools:
-  - generate_image:    Text-to-image with optional reference images, style presets,
-                       prompt enhancement, and multi-model routing.
+  - generate_image:    Text-to-image with references, styles, prompt enhancement, QA.
   - edit_image:        Edit an existing image (inpaint, remove, outpaint).
+  - swap_background:   Keep foreground subject, replace background.
   - create_variations: Generate variations of an existing image.
+  - analyze_image:     Describe/tag an image using Gemini vision.
   - list_styles:       List available style presets.
+
+Features:
+  - Image QA: optional AI scoring of generated images (composition, clarity, etc.)
+  - GCS output: optionally save images to Google Cloud Storage and return URLs
+  - Background swap: one-step foreground preservation + background replacement
 
 Deployment: Cloud Run with Streamable HTTP transport.
 """
@@ -14,6 +20,7 @@ Deployment: Cloud Run with Streamable HTTP transport.
 import base64
 import json
 import os
+import uuid
 from io import BytesIO
 from urllib.parse import urlparse
 
@@ -25,7 +32,7 @@ from mcp.server.fastmcp import FastMCP
 # ---------------------------------------------------------------------------
 MODEL_FLASH = "gemini-3.1-flash-image-preview"   # NanoBanana 2 — fast
 MODEL_PRO = "gemini-3-pro-image-preview"          # NanoBanana Pro — higher quality
-MODEL_TEXT = "gemini-2.5-flash"                    # For prompt enhancement
+MODEL_TEXT = "gemini-2.5-flash"                    # For prompt enhancement + QA + analysis
 
 SUPPORTED_RATIOS = {
     "1:1", "2:3", "3:2", "3:4", "4:3", "4:5",
@@ -38,6 +45,11 @@ RESOLUTIONS = {"0.5K", "1K", "2K", "4K"}
 # ---------------------------------------------------------------------------
 REF_MAX_DIM = 1024    # Reference images — preserves logo/label detail
 SOURCE_MAX_DIM = 2048  # Source images for edit/variations — high quality but bounded
+
+# ---------------------------------------------------------------------------
+# GCS config (optional — set GCS_BUCKET env var to enable)
+# ---------------------------------------------------------------------------
+GCS_BUCKET = os.environ.get("GCS_BUCKET")  # e.g. "my-nanobanana-images"
 
 # ---------------------------------------------------------------------------
 # Style presets — tuned prompt prefixes
@@ -84,13 +96,15 @@ mcp = FastMCP(
     "nanobanana",
     instructions=(
         "NanoBanana image generation server powered by Gemini. "
-        "Tools: generate_image (text-to-image with references, styles, prompt enhancement), "
+        "Tools: generate_image (text-to-image with references, styles, prompt enhancement, QA), "
         "edit_image (inpaint, remove objects, outpaint), "
-        "create_variations (produce variations of an existing image). "
+        "swap_background (keep subject, replace background), "
+        "create_variations (produce variations of an existing image), "
+        "analyze_image (describe/tag an image). "
         "Default aspect ratio 4:5, resolution 1K. "
         "IMPORTANT: For best results, pass image URLs instead of base64 — "
         "the server fetches them directly, avoiding size/truncation issues with inline data. "
-        "Base64 is supported but large images may be corrupted in transit."
+        "Set output='gcs' to return URLs instead of base64 (requires GCS_BUCKET env var)."
     ),
     host=os.environ.get("HOST", "0.0.0.0"),
     port=int(os.environ.get("PORT", 8080)),
@@ -98,7 +112,7 @@ mcp = FastMCP(
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers — client
 # ---------------------------------------------------------------------------
 def _get_client():
     """Initialize Gemini client."""
@@ -112,8 +126,10 @@ def _get_client():
     return genai.Client(api_key=api_key)
 
 
+# ---------------------------------------------------------------------------
+# Helpers — image decode/encode
+# ---------------------------------------------------------------------------
 def _is_url(s: str) -> bool:
-    """Check if string looks like an HTTP(S) URL."""
     try:
         parsed = urlparse(s)
         return parsed.scheme in ("http", "https")
@@ -122,7 +138,6 @@ def _is_url(s: str) -> bool:
 
 
 def _fetch_url(url: str) -> tuple[bytes, str]:
-    """Fetch an image from a URL. Returns (bytes, mime_type)."""
     resp = httpx.get(url, follow_redirects=True, timeout=30)
     resp.raise_for_status()
     content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
@@ -130,7 +145,6 @@ def _fetch_url(url: str) -> tuple[bytes, str]:
 
 
 def _fix_base64_padding(s: str) -> str:
-    """Fix missing base64 padding — strings often get truncated in transit."""
     s = s.rstrip()
     missing = len(s) % 4
     if missing:
@@ -140,16 +154,6 @@ def _fix_base64_padding(s: str) -> str:
 
 def _normalize_image(img_bytes: bytes, max_dim: int, quality: int = 85,
                      output_format: str = "JPEG") -> tuple[bytes, str]:
-    """Normalize an image: convert color mode, cap dimensions, encode.
-
-    Args:
-        img_bytes: Raw image bytes.
-        max_dim: Maximum dimension (width or height).
-        quality: JPEG quality (ignored for PNG).
-        output_format: "JPEG" or "PNG".
-
-    Returns (encoded_bytes, mime_type).
-    """
     from PIL import Image as PILImage
 
     try:
@@ -160,7 +164,6 @@ def _normalize_image(img_bytes: bytes, max_dim: int, quality: int = 85,
             "Try passing an image URL instead of base64 for reliable results."
         )
 
-    # Sanity check — a truncated JPEG can open but have tiny/zero dimensions
     w, h = img.size
     if w < 1 or h < 1:
         raise ValueError(
@@ -175,7 +178,6 @@ def _normalize_image(img_bytes: bytes, max_dim: int, quality: int = 85,
             img = bg
         elif img.mode != "RGB":
             img = img.convert("RGB")
-    # For PNG masks, preserve as-is (L or RGB)
 
     if max(w, h) > max_dim:
         scale = max_dim / max(w, h)
@@ -191,10 +193,6 @@ def _normalize_image(img_bytes: bytes, max_dim: int, quality: int = 85,
 
 
 def _decode_raw(ref: str) -> tuple[bytes, str]:
-    """Decode raw bytes from a base64 string, data URI, or URL.
-
-    Returns (bytes, mime_type). Fixes base64 padding. No resizing.
-    """
     if _is_url(ref):
         return _fetch_url(ref)
     if ref.startswith("data:"):
@@ -205,34 +203,21 @@ def _decode_raw(ref: str) -> tuple[bytes, str]:
 
 
 def _decode_reference(ref: str) -> tuple[bytes, str]:
-    """Decode a reference image: fetch/decode, then downscale to REF_MAX_DIM.
-
-    1024px preserves logo/label detail while keeping size manageable.
-    """
     raw, _ = _decode_raw(ref)
     return _normalize_image(raw, max_dim=REF_MAX_DIM)
 
 
 def _decode_source(ref: str) -> tuple[bytes, str]:
-    """Decode a source image for editing/variations: fetch/decode, cap at SOURCE_MAX_DIM.
-
-    2048px retains high quality for edits while bounding memory/payload size.
-    """
     raw, _ = _decode_raw(ref)
     return _normalize_image(raw, max_dim=SOURCE_MAX_DIM, quality=92)
 
 
 def _decode_mask(ref: str) -> tuple[bytes, str]:
-    """Decode a mask image: fetch/decode, cap at SOURCE_MAX_DIM, output as PNG.
-
-    Masks use PNG to avoid JPEG compression artifacts at black/white boundaries.
-    """
     raw, _ = _decode_raw(ref)
     return _normalize_image(raw, max_dim=SOURCE_MAX_DIM, output_format="PNG")
 
 
 def _to_jpeg(img_bytes: bytes) -> bytes:
-    """Convert image bytes to high-quality JPEG for output."""
     from PIL import Image as PILImage
 
     img = PILImage.open(BytesIO(img_bytes))
@@ -248,12 +233,73 @@ def _to_jpeg(img_bytes: bytes) -> bytes:
 
 
 def _pick_model(quality: str) -> str:
-    """Select model based on quality setting."""
     return MODEL_PRO if quality == "pro" else MODEL_FLASH
 
 
+def _extract_image(response) -> bytes | None:
+    if response.candidates:
+        for part in response.candidates[0].content.parts:
+            if part.inline_data and part.inline_data.mime_type.startswith("image/"):
+                return part.inline_data.data
+    return None
+
+
+def _build_ref_parts(reference_images: list | None) -> list:
+    from google.genai import types
+
+    parts = []
+    if not reference_images:
+        return parts
+    for ref in reference_images:
+        img_bytes, mime = _decode_reference(ref)
+        parts.append(types.Part.from_bytes(data=img_bytes, mime_type=mime))
+    return parts
+
+
+# ---------------------------------------------------------------------------
+# Helpers — GCS output
+# ---------------------------------------------------------------------------
+def _upload_to_gcs(jpeg_bytes: bytes, prefix: str = "gen") -> str:
+    """Upload JPEG bytes to GCS and return a public URL.
+
+    Requires GCS_BUCKET env var and appropriate service account permissions.
+    """
+    from google.cloud import storage
+
+    client = storage.Client()
+    bucket = client.bucket(GCS_BUCKET)
+    blob_name = f"{prefix}/{uuid.uuid4().hex}.jpg"
+    blob = bucket.blob(blob_name)
+    blob.upload_from_string(jpeg_bytes, content_type="image/jpeg")
+    blob.make_public()
+    return blob.public_url
+
+
+def _format_image_output(jpeg_bytes: bytes, output_mode: str, prefix: str = "gen") -> dict:
+    """Format a JPEG image as either base64 data URI or GCS URL.
+
+    Expects pre-converted JPEG bytes — does NOT re-encode.
+    """
+    if output_mode == "gcs":
+        if not GCS_BUCKET:
+            raise ValueError(
+                "GCS output requested but GCS_BUCKET env var is not set. "
+                "Use output='base64' or configure GCS_BUCKET on the server."
+            )
+        url = _upload_to_gcs(jpeg_bytes, prefix=prefix)
+        return {"url": url, "size_kb": len(jpeg_bytes) // 1024}
+    else:
+        b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
+        return {
+            "data_uri": f"data:image/jpeg;base64,{b64}",
+            "size_kb": len(jpeg_bytes) // 1024,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Helpers — prompt enhancement
+# ---------------------------------------------------------------------------
 def _enhance_prompt(client, prompt: str) -> str:
-    """Use a text model to expand a short prompt into a detailed image generation prompt."""
     system = (
         "You are an expert image prompt engineer. Given a short description, "
         "expand it into a detailed, vivid image generation prompt. "
@@ -269,36 +315,53 @@ def _enhance_prompt(client, prompt: str) -> str:
     return resp.text.strip() if resp.text else prompt
 
 
-def _image_to_data_uri(img_bytes: bytes) -> dict:
-    """Convert raw image bytes to a JPEG data URI dict."""
-    jpeg_bytes = _to_jpeg(img_bytes)
-    b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
-    return {
-        "data_uri": f"data:image/jpeg;base64,{b64}",
-        "size_kb": len(jpeg_bytes) // 1024,
-    }
+# ---------------------------------------------------------------------------
+# Helpers — image QA
+# ---------------------------------------------------------------------------
+QA_SYSTEM_PROMPT = (
+    "You are an expert image quality analyst. Score this generated image on each "
+    "criterion below from 1-10 and provide a one-sentence rationale for each.\n\n"
+    "Criteria:\n"
+    "- composition: framing, rule of thirds, visual balance, focal point\n"
+    "- clarity: sharpness, absence of blur or artifacts, detail quality\n"
+    "- lighting: natural/intentional lighting, exposure, shadow quality\n"
+    "- color: palette harmony, saturation balance, color accuracy\n"
+    "- prompt_adherence: how well the image matches the generation prompt\n\n"
+    "Return valid JSON only, no markdown fences:\n"
+    '{"composition": {"score": N, "note": "..."}, "clarity": {"score": N, "note": "..."}, '
+    '"lighting": {"score": N, "note": "..."}, "color": {"score": N, "note": "..."}, '
+    '"prompt_adherence": {"score": N, "note": "..."}, "total": N}'
+)
 
 
-def _extract_image(response) -> bytes | None:
-    """Extract the first image from a Gemini response."""
-    if response.candidates:
-        for part in response.candidates[0].content.parts:
-            if part.inline_data and part.inline_data.mime_type.startswith("image/"):
-                return part.inline_data.data
-    return None
-
-
-def _build_ref_parts(reference_images: list | None) -> list:
-    """Build Gemini Part objects from reference images (base64, data URI, or URL)."""
+def _score_image(client, img_bytes: bytes, prompt: str) -> dict:
+    """Score a generated image using Gemini vision."""
     from google.genai import types
 
-    parts = []
-    if not reference_images:
-        return parts
-    for ref in reference_images:
-        img_bytes, mime = _decode_reference(ref)
-        parts.append(types.Part.from_bytes(data=img_bytes, mime_type=mime))
-    return parts
+    try:
+        resp = client.models.generate_content(
+            model=MODEL_TEXT,
+            contents=[
+                types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"),
+                types.Part.from_text(
+                    text=f"The image was generated from this prompt: \"{prompt}\"\n\n"
+                         "Score this image."
+                ),
+            ],
+            config={
+                "system_instruction": QA_SYSTEM_PROMPT,
+                "response_mime_type": "application/json",
+            },
+        )
+        scores = json.loads(resp.text)
+        # Ensure total is computed
+        if "total" not in scores or not isinstance(scores["total"], (int, float)):
+            criteria = ["composition", "clarity", "lighting", "color", "prompt_adherence"]
+            total = sum(scores.get(c, {}).get("score", 0) for c in criteria)
+            scores["total"] = total
+        return scores
+    except Exception as e:
+        return {"error": f"QA scoring failed: {e}", "total": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +377,8 @@ def generate_image(
     resolution: str = "1K",
     quality: str = "default",
     count: int = 1,
+    qa: bool = False,
+    output: str = "base64",
 ) -> str:
     """Generate an image from a text prompt with optional reference images and style presets.
 
@@ -327,22 +392,23 @@ def generate_image(
                           - Image URLs (recommended — fetched server-side, most reliable)
                           - Base64 data URIs (data:image/jpeg;base64,...)
                           - Raw base64 strings
-                          Multiple references are supported for combining style + subject cues.
+                          Multiple references supported for combining style + subject cues.
         style: Optional style preset. Available: cinematic, product-photography,
                editorial, watercolor, flat-illustration, neon-noir, minimalist, vintage-film.
-               Use list_styles to see descriptions.
-        enhance_prompt: If true, uses AI to expand your prompt into a detailed, vivid
-                        image generation prompt before generating. Great for short prompts
-                        like "cat on a couch". Default: false
-        aspect_ratio: Output aspect ratio. Supported: 1:1, 4:5, 9:16, 16:9, 3:4,
-                      4:3, 2:3, 3:2, 5:4, 21:9. Default: 4:5
+        enhance_prompt: If true, AI expands your prompt into a detailed generation prompt.
+                        Great for short prompts. Default: false
+        aspect_ratio: Output aspect ratio. Default: 4:5
         resolution: Output resolution: 0.5K, 1K, 2K, 4K. Default: 1K
-        quality: Model selection. "default" = NanoBanana 2 (fast);
-                 "pro" = NanoBanana Pro (higher quality). Default: default
+        quality: "default" (fast) or "pro" (higher quality). Default: default
         count: Number of images to generate (1–4). Default: 1
+        qa: If true, each image is scored by AI on composition, clarity, lighting,
+            color, and prompt adherence (1-10 each). When count > 1, images are
+            ranked by total score with the best first. Default: false
+        output: "base64" returns data URIs (default). "gcs" uploads to Google Cloud
+                Storage and returns public URLs (requires GCS_BUCKET env var on server).
 
     Returns:
-        JSON with base64 JPEG data URI(s), metadata, and enhanced prompt (if used).
+        JSON with image data (base64 or URL), metadata, QA scores (if qa=true).
     """
     from google.genai import types
 
@@ -352,6 +418,10 @@ def generate_image(
         return json.dumps({"error": f"Unsupported resolution '{resolution}'.", "supported": sorted(RESOLUTIONS)})
     if style and style not in STYLE_PRESETS:
         return json.dumps({"error": f"Unknown style '{style}'.", "available": sorted(STYLE_PRESETS.keys())})
+    if output not in ("base64", "gcs"):
+        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["base64", "gcs"]})
+    if output == "gcs" and not GCS_BUCKET:
+        return json.dumps({"error": "GCS output requested but GCS_BUCKET env var is not set on the server. Use output='base64' instead."})
 
     count = max(1, min(count, 4))
 
@@ -396,7 +466,10 @@ def generate_image(
             )
             img_bytes = _extract_image(response)
             if img_bytes:
-                entry = _image_to_data_uri(img_bytes)
+                jpeg_bytes = _to_jpeg(img_bytes)
+                entry = _format_image_output(jpeg_bytes, output, prefix="gen")
+                if qa:
+                    entry["qa"] = _score_image(client, jpeg_bytes, final_prompt)
                 entry["index"] = i + 1
                 images.append(entry)
             else:
@@ -406,6 +479,12 @@ def generate_image(
 
     if not images:
         return json.dumps({"error": "All generation attempts failed.", "details": errors})
+
+    # Rank by QA score if scoring was enabled
+    if qa and len(images) > 1:
+        images.sort(key=lambda x: x.get("qa", {}).get("total", 0), reverse=True)
+        for i, img in enumerate(images):
+            img["rank"] = i + 1
 
     result = {
         "model": model_name,
@@ -422,7 +501,7 @@ def generate_image(
 
     if count == 1:
         result.update(images[0])
-        del result["index"]
+        result.pop("index", None)
     else:
         result["images"] = images
         if errors:
@@ -439,32 +518,26 @@ def edit_image(
     edit_mode: str = "inpaint-insertion",
     aspect_ratio: str | None = None,
     count: int = 1,
+    output: str = "base64",
 ) -> str:
     """Edit an existing image — add objects, remove objects, or extend the canvas.
 
     Pass the source image as a URL (recommended) or base64.
     Provide a mask for precise control, or let the model infer the edit region.
 
-    Note: For inpaint modes without a mask, the model uses automatic segmentation.
-    For best results with precise edits, provide a black-and-white mask image.
-
     Args:
-        image: The source image to edit. URL (recommended), base64 data URI, or raw base64.
+        image: The source image. URL (recommended), base64 data URI, or raw base64.
         prompt: Edit instruction. Be specific about what to change.
-                E.g. "Add a red hat on the person", "Remove the person in the background",
-                "Extend the sky upward to make it taller".
-        mask: Optional mask image (URL or base64). White pixels = area to edit,
-              black pixels = area to preserve. Provides precise spatial control.
+        mask: Optional mask image (URL or base64). White = edit region, black = preserve.
               If omitted, the model uses automatic segmentation based on your prompt.
-        edit_mode: Edit operation type:
-                   - "inpaint-insertion" (default): Add or replace content in the masked/detected area
-                   - "inpaint-removal": Remove content and fill naturally
-                   - "outpaint": Extend/expand the image canvas
-        aspect_ratio: Output aspect ratio (mainly useful for outpaint). Default: same as input.
-        count: Number of edit candidates (1–4). Default: 1
+        edit_mode: "inpaint-insertion" (add/replace), "inpaint-removal" (remove + fill),
+                   "outpaint" (extend canvas). Default: inpaint-insertion
+        aspect_ratio: Output aspect ratio (useful for outpaint). Default: same as input.
+        count: Number of candidates (1–4). Default: 1
+        output: "base64" (default) or "gcs" (upload to GCS, return URL).
 
     Returns:
-        JSON with base64 JPEG data URI(s) of the edited image.
+        JSON with edited image data (base64 or URL).
     """
     from google.genai import types
 
@@ -475,6 +548,10 @@ def edit_image(
     }
     if edit_mode not in edit_modes:
         return json.dumps({"error": f"Unknown edit_mode '{edit_mode}'.", "available": list(edit_modes.keys())})
+    if output not in ("base64", "gcs"):
+        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["base64", "gcs"]})
+    if output == "gcs" and not GCS_BUCKET:
+        return json.dumps({"error": "GCS output requested but GCS_BUCKET env var is not set on the server. Use output='base64' instead."})
 
     count = max(1, min(count, 4))
 
@@ -483,13 +560,11 @@ def edit_image(
     except RuntimeError as e:
         return json.dumps({"error": str(e)})
 
-    # Decode source image — capped at 2048px for quality + manageability
     try:
         img_bytes, img_mime = _decode_source(image)
     except Exception as e:
         return json.dumps({"error": str(e)})
 
-    # Build reference images for the edit API
     ref_images = [
         types.RawReferenceImage(
             reference_id=1,
@@ -497,7 +572,6 @@ def edit_image(
         )
     ]
 
-    # Add mask — user-provided or automatic segmentation
     if mask:
         try:
             mask_bytes, mask_mime = _decode_mask(mask)
@@ -513,7 +587,6 @@ def edit_image(
         except Exception as e:
             return json.dumps({"error": f"Failed to decode mask image: {e}"})
     elif edit_mode != "outpaint":
-        # Use semantic segmentation — let the model figure out the region
         ref_images.append(
             types.MaskReferenceImage(
                 reference_id=2,
@@ -547,7 +620,8 @@ def edit_image(
             img_data = gen_img.image
             raw = img_data.image_bytes if img_data.image_bytes else None
             if raw:
-                entry = _image_to_data_uri(raw)
+                jpeg_bytes = _to_jpeg(raw)
+                entry = _format_image_output(jpeg_bytes, output, prefix="edit")
                 entry["index"] = i + 1
                 images.append(entry)
 
@@ -557,7 +631,110 @@ def edit_image(
     result = {"edit_mode": edit_mode, "prompt": prompt}
     if len(images) == 1:
         result.update(images[0])
-        del result["index"]
+        result.pop("index", None)
+    else:
+        result["images"] = images
+
+    return json.dumps(result)
+
+
+@mcp.tool()
+def swap_background(
+    image: str,
+    background: str,
+    aspect_ratio: str | None = None,
+    count: int = 1,
+    output: str = "base64",
+) -> str:
+    """Replace the background of an image while keeping the foreground subject intact.
+
+    Automatically segments the foreground (person, product, object) and generates
+    a new background based on your description. Much simpler than manual edit_image
+    with masks for this common use case. Uses the Imagen 3 editing model.
+
+    Args:
+        image: Source image with the subject to keep. URL (recommended) or base64.
+        background: Description of the new background. Be specific.
+                    E.g. "tropical beach at sunset with palm trees",
+                    "clean white studio with soft shadows",
+                    "busy Tokyo street at night with neon signs".
+        aspect_ratio: Output aspect ratio. Default: same as input.
+        count: Number of candidates (1–4). Default: 1
+        output: "base64" (default) or "gcs".
+
+    Returns:
+        JSON with the composited image data (base64 or URL).
+    """
+    from google.genai import types
+
+    if output not in ("base64", "gcs"):
+        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["base64", "gcs"]})
+    if output == "gcs" and not GCS_BUCKET:
+        return json.dumps({"error": "GCS output requested but GCS_BUCKET env var is not set on the server. Use output='base64' instead."})
+
+    count = max(1, min(count, 4))
+
+    try:
+        client = _get_client()
+    except RuntimeError as e:
+        return json.dumps({"error": str(e)})
+
+    try:
+        img_bytes, img_mime = _decode_source(image)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+    # Use Imagen edit with background mask + inpaint-insertion for the new background
+    ref_images = [
+        types.RawReferenceImage(
+            reference_id=1,
+            reference_image=types.Image(image_bytes=img_bytes, mime_type=img_mime),
+        ),
+        types.MaskReferenceImage(
+            reference_id=2,
+            config=types.MaskReferenceConfig(
+                mask_mode="MASK_MODE_BACKGROUND",
+                mask_dilation=0.03,
+            ),
+        ),
+    ]
+
+    config = types.EditImageConfig(
+        edit_mode="EDIT_MODE_INPAINT_INSERTION",
+        number_of_images=count,
+    )
+    if aspect_ratio:
+        config.aspect_ratio = aspect_ratio
+
+    prompt = f"Replace the background with: {background}"
+
+    try:
+        response = client.models.edit_image(
+            model="imagen-3.0-capability-001",
+            prompt=prompt,
+            reference_images=ref_images,
+            config=config,
+        )
+    except Exception as e:
+        return json.dumps({"error": f"Background swap failed: {e}"})
+
+    images = []
+    if response.generated_images:
+        for i, gen_img in enumerate(response.generated_images):
+            raw = gen_img.image.image_bytes if gen_img.image.image_bytes else None
+            if raw:
+                jpeg_bytes = _to_jpeg(raw)
+                entry = _format_image_output(jpeg_bytes, output, prefix="bgswap")
+                entry["index"] = i + 1
+                images.append(entry)
+
+    if not images:
+        return json.dumps({"error": "Background swap produced no output images."})
+
+    result = {"background": background}
+    if len(images) == 1:
+        result.update(images[0])
+        result.pop("index", None)
     else:
         result["images"] = images
 
@@ -573,28 +750,28 @@ def create_variations(
     resolution: str = "1K",
     quality: str = "default",
     count: int = 3,
+    qa: bool = False,
+    output: str = "base64",
 ) -> str:
     """Generate variations of an existing image.
 
-    Takes a source image and produces creative variations, preserving the core
-    subject while exploring different compositions, lighting, or styling.
-    Pass the source image as a URL (recommended) or base64.
+    Preserves the core subject while exploring different compositions, lighting,
+    or styling. Pass the source image as a URL (recommended) or base64.
 
     Args:
         image: Source image. URL (recommended), base64 data URI, or raw base64.
-        prompt: Optional guidance for variations. E.g. "same product but on a beach",
-                "warmer color palette", "more dramatic lighting". If omitted, the model
-                generates free variations.
-        variation_strength: How much to diverge from the original.
-                            "subtle" = minor tweaks, "medium" = noticeable changes,
-                            "strong" = significant creative departures. Default: medium
+        prompt: Optional guidance. E.g. "same product but on a beach",
+                "warmer color palette", "more dramatic lighting".
+        variation_strength: "subtle", "medium", or "strong". Default: medium
         aspect_ratio: Output aspect ratio. Default: 4:5
         resolution: Output resolution: 0.5K, 1K, 2K, 4K. Default: 1K
-        quality: "default" (fast) or "pro" (higher quality). Default: default
+        quality: "default" or "pro". Default: default
         count: Number of variations (1–4). Default: 3
+        qa: Score each variation and rank by quality. Default: false
+        output: "base64" (default) or "gcs".
 
     Returns:
-        JSON with base64 JPEG data URIs of all variations.
+        JSON with variation image data, ranked by QA score if qa=true.
     """
     from google.genai import types
 
@@ -602,6 +779,10 @@ def create_variations(
         return json.dumps({"error": f"Unsupported aspect ratio '{aspect_ratio}'.", "supported": sorted(SUPPORTED_RATIOS)})
     if resolution not in RESOLUTIONS:
         return json.dumps({"error": f"Unsupported resolution '{resolution}'.", "supported": sorted(RESOLUTIONS)})
+    if output not in ("base64", "gcs"):
+        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["base64", "gcs"]})
+    if output == "gcs" and not GCS_BUCKET:
+        return json.dumps({"error": "GCS output requested but GCS_BUCKET env var is not set on the server. Use output='base64' instead."})
 
     strength_prompts = {
         "subtle": "Create a subtle variation of this image, keeping the composition and style very close to the original with only minor differences in details. ",
@@ -618,18 +799,15 @@ def create_variations(
     except RuntimeError as e:
         return json.dumps({"error": str(e)})
 
-    # Decode source image — capped at 2048px
     try:
         img_bytes, img_mime = _decode_source(image)
     except Exception as e:
         return json.dumps({"error": str(e)})
 
-    # Build prompt
     variation_prompt = strength_prompts[variation_strength]
     if prompt:
         variation_prompt += prompt
 
-    # Build parts: source image + variation prompt
     parts = [
         types.Part.from_bytes(data=img_bytes, mime_type=img_mime),
         types.Part.from_text(text=variation_prompt),
@@ -654,7 +832,10 @@ def create_variations(
             )
             raw = _extract_image(response)
             if raw:
-                entry = _image_to_data_uri(raw)
+                jpeg_bytes = _to_jpeg(raw)
+                entry = _format_image_output(jpeg_bytes, output, prefix="var")
+                if qa:
+                    entry["qa"] = _score_image(client, jpeg_bytes, variation_prompt)
                 entry["index"] = i + 1
                 images.append(entry)
             else:
@@ -664,6 +845,11 @@ def create_variations(
 
     if not images:
         return json.dumps({"error": "All variation attempts failed.", "details": errors})
+
+    if qa and len(images) > 1:
+        images.sort(key=lambda x: x.get("qa", {}).get("total", 0), reverse=True)
+        for i, img in enumerate(images):
+            img["rank"] = i + 1
 
     result = {
         "model": model_name,
@@ -682,11 +868,107 @@ def create_variations(
 
 
 @mcp.tool()
+def analyze_image(
+    image: str,
+    focus: str = "general",
+) -> str:
+    """Analyze an image using Gemini vision — describe, tag, or assess quality.
+
+    Useful for understanding uploaded references, generating SEO alt text,
+    verifying a generation matched intent, or extracting visual details.
+
+    Args:
+        image: Image to analyze. URL (recommended), base64 data URI, or raw base64.
+        focus: Analysis focus. Options:
+               - "general" (default): Comprehensive description of content, style, mood
+               - "tags": Keyword tags for search/SEO (returns a list)
+               - "alt-text": Concise accessible alt text (1-2 sentences)
+               - "quality": Technical quality assessment (sharpness, lighting, composition)
+               - "brand": Brand/marketing analysis (target audience, mood, messaging)
+
+    Returns:
+        JSON with the analysis result.
+    """
+    from google.genai import types
+
+    focus_prompts = {
+        "general": (
+            "Describe this image comprehensively. Include: subject matter, style, "
+            "composition, lighting, color palette, mood, and any notable details. "
+            "Be specific and detailed. Return as JSON: "
+            '{"description": "...", "style": "...", "mood": "...", "colors": ["..."], "details": ["..."]}'
+        ),
+        "tags": (
+            "Generate keyword tags for this image suitable for search engines and "
+            "asset management. Include tags for subject, style, mood, colors, setting, "
+            "and technical aspects. Return as JSON: "
+            '{"tags": ["tag1", "tag2", ...], "primary_subject": "..."}'
+        ),
+        "alt-text": (
+            "Write concise, accessible alt text for this image (1-2 sentences). "
+            "Describe what is shown, not the style. Be specific enough for someone "
+            "who cannot see the image. Return as JSON: "
+            '{"alt_text": "...", "short": "..."}'
+        ),
+        "quality": (
+            "Assess the technical quality of this image. Score each from 1-10: "
+            "sharpness, exposure, composition, color balance, noise level. "
+            "Note any artifacts, blur, or quality issues. Return as JSON: "
+            '{"sharpness": {"score": N, "note": "..."}, "exposure": {"score": N, "note": "..."}, '
+            '"composition": {"score": N, "note": "..."}, "color_balance": {"score": N, "note": "..."}, '
+            '"noise": {"score": N, "note": "..."}, "issues": ["..."], "total": N}'
+        ),
+        "brand": (
+            "Analyze this image from a marketing/brand perspective. Identify: "
+            "target audience, emotional tone, brand positioning, visual messaging, "
+            "and suggested use cases (social media, hero banner, product page, etc). "
+            "Return as JSON: "
+            '{"target_audience": "...", "tone": "...", "positioning": "...", '
+            '"messaging": "...", "use_cases": ["..."], "strengths": ["..."], "suggestions": ["..."]}'
+        ),
+    }
+
+    if focus not in focus_prompts:
+        return json.dumps({"error": f"Unknown focus '{focus}'.", "available": list(focus_prompts.keys())})
+
+    try:
+        client = _get_client()
+    except RuntimeError as e:
+        return json.dumps({"error": str(e)})
+
+    # Use higher resolution for quality analysis to detect real defects
+    try:
+        if focus == "quality":
+            img_bytes, img_mime = _decode_source(image)
+        else:
+            img_bytes, img_mime = _decode_reference(image)
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+    try:
+        resp = client.models.generate_content(
+            model=MODEL_TEXT,
+            contents=[
+                types.Part.from_bytes(data=img_bytes, mime_type=img_mime),
+                types.Part.from_text(text=focus_prompts[focus]),
+            ],
+            config={"response_mime_type": "application/json"},
+        )
+        analysis = json.loads(resp.text)
+        analysis["focus"] = focus
+        return json.dumps(analysis)
+    except json.JSONDecodeError:
+        return json.dumps({"focus": focus, "raw_response": resp.text if resp.text else "No response"})
+    except Exception as e:
+        return json.dumps({"error": f"Analysis failed: {e}"})
+
+
+@mcp.tool()
 def list_styles() -> str:
     """List available style presets for generate_image.
 
     Returns:
-        JSON with style names and their prompt prefixes.
+        JSON with style names and descriptions.
     """
     styles = []
     for name, prefix in sorted(STYLE_PRESETS.items()):
