@@ -224,16 +224,30 @@ mcp = FastMCP(
     "nanobanana",
     instructions=(
         "NanoBanana image generation server. Powered by Gemini.\n\n"
-        "Upload page: {upload_url}/upload\n\n"
-        "## How to handle images — FOLLOW THESE RULES EXACTLY:\n"
-        "1. If the user provides a URL (http/https): pass it directly to the tool.\n"
-        "2. If a previous tool returned a nanobanana:// URL: pass that URL.\n"
-        "3. If the user pastes/uploads an image with NO URL:\n"
-        "   → Do NOT call any tool. Do NOT pass base64, data URIs, or empty strings.\n"
-        "   → IMMEDIATELY tell the user to open {upload_url}/upload, drop the image\n"
-        "     there, and paste the returned URL back into the chat.\n"
-        "   → Once you have the URL, proceed with the tool call.\n\n"
+        "## How to handle images — FOLLOW THESE RULES EXACTLY:\n\n"
+        "### User provides a URL (http/https)\n"
+        "Pass it directly to any tool.\n\n"
+        "### A previous tool returned a nanobanana:// URL or https://.../images/ URL\n"
+        "Pass that URL directly to the next tool.\n\n"
+        "### User pastes/uploads an image (you have it as a local file, no URL)\n"
+        "Upload it to the NanoBanana server first to get a URL, then use that URL.\n\n"
+        "**Preferred method — curl:**\n"
+        "```\n"
+        "curl -s -F 'file=@/path/to/image.png' {upload_url}/upload\n"
+        "```\n"
+        "This returns JSON with a `url` field. Use that URL in subsequent tool calls.\n\n"
+        "**Fallback — upload_image tool:**\n"
+        "If curl is unavailable, read the file and pass a data URI "
+        "(e.g. `data:image/png;base64,...`) to the `upload_image` tool. "
+        "It returns a nanobanana:// URL you can use in other tools.\n\n"
+        "**Manual fallback:**\n"
+        "If neither works, ask the user to open {upload_url}/upload, "
+        "drop the image there, and paste the returned URL.\n\n"
+        "### IMPORTANT\n"
+        "For all tools EXCEPT upload_image: only pass URLs. "
+        "Never pass base64 or data URIs to generate_image, edit_image, etc.\n\n"
         "## Tools:\n"
+        "upload_image — upload a local image to get a URL for other tools\n"
         "generate_image — text-to-image, optional reference image URLs, style presets\n"
         "edit_image — edit an image (inpaint, remove, outpaint), supports reference images\n"
         "swap_background — replace background, keep foreground subject\n"
@@ -852,13 +866,14 @@ async def upload_image(
 ) -> str:
     """Store an image on the server and get back a URL for other tools.
 
-    IMPORTANT: Only pass URLs (http/https or nanobanana://). NEVER pass base64 data —
-    it will consume the entire context window and likely get truncated.
+    Use this when the user pastes/uploads an image and you need a URL.
+    Accepts: http/https URLs, nanobanana:// URLs, or data URIs (data:image/...;base64,...).
 
-    If the user has no URL, direct them to the /upload page to get one.
+    Prefer using curl to upload via the /upload HTTP endpoint when possible
+    (less context usage). Use this tool with a data URI as a fallback.
 
     Args:
-        image: Image URL (http/https) or nanobanana:// URL.
+        image: Image URL, nanobanana:// URL, or data URI (data:image/png;base64,...).
 
     Returns:
         JSON with a nanobanana:// URL to use in other tools, plus image dimensions.
