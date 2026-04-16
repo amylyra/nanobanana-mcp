@@ -10,15 +10,14 @@ Tools:
   - analyze_image:     Describe/tag an image using Gemini vision.
   - list_styles:       List available style presets.
 
-Features:
-  - Server-side image store: upload once, reference by URL in all subsequent calls
-  - Image QA: optional AI scoring of generated images (composition, clarity, etc.)
-  - GCS output: optionally save images to Google Cloud Storage and return URLs
-  - Background swap: one-step foreground preservation + background replacement
+HTTP endpoints (outside MCP — for direct image upload):
+  - POST /upload:      Upload an image directly, get back a URL to paste into Claude.
+  - GET /images/{id}:  Retrieve a stored image by ID.
 
 Deployment: Cloud Run with Streamable HTTP transport.
 """
 
+import asyncio
 import base64
 import json
 import os
@@ -28,8 +27,18 @@ import uuid
 from io import BytesIO
 from urllib.parse import urlparse
 
+# Load .env file if python-dotenv is installed (optional convenience)
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
+
 import httpx
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import FastMCP, Context, Image
+from mcp.server.elicitation import AcceptedUrlElicitation
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, JSONResponse, Response
 
 # ---------------------------------------------------------------------------
 # Models
@@ -42,7 +51,7 @@ SUPPORTED_RATIOS = {
     "1:1", "2:3", "3:2", "3:4", "4:3", "4:5",
     "5:4", "9:16", "16:9", "21:9",
 }
-RESOLUTIONS = {"0.5K", "1K", "2K", "4K"}
+RESOLUTIONS = {"1K", "2K", "4K"}
 
 # ---------------------------------------------------------------------------
 # Image size limits (max dimension in pixels)
@@ -51,26 +60,34 @@ REF_MAX_DIM = 1024    # Reference images — preserves logo/label detail
 SOURCE_MAX_DIM = 2048  # Source images for edit/variations — high quality but bounded
 
 # ---------------------------------------------------------------------------
-# GCS config (optional — set GCS_BUCKET env var to enable)
+# Cloud storage config (optional — set bucket env var to enable)
 # ---------------------------------------------------------------------------
 GCS_BUCKET = os.environ.get("GCS_BUCKET")  # e.g. "my-nanobanana-images"
+S3_BUCKET = os.environ.get("S3_BUCKET")    # e.g. "claude-image-cache"
+S3_REGION = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+DEFAULT_OUTPUT = os.environ.get("DEFAULT_OUTPUT", "base64")  # "base64", "cloud", "s3", "gcs"
 
 # ---------------------------------------------------------------------------
-# Server-side image store — upload once, reference by nanobanana:// URL
+# Server-side image store — upload once, reference by URL in all subsequent calls.
 # Images expire after 1 hour to prevent unbounded memory growth.
 # ---------------------------------------------------------------------------
 _IMAGE_STORE: dict[str, tuple[bytes, str, float]] = {}  # id -> (bytes, mime, timestamp)
 _STORE_LOCK = threading.Lock()
-_STORE_TTL = 3600  # 1 hour
+_STORE_TTL = int(os.environ.get("STORE_TTL", 3600))  # 1 hour default
+_STORE_MAX_ITEMS = int(os.environ.get("STORE_MAX_ITEMS", 100))  # configurable
 
 
 def _store_image(img_bytes: bytes, mime: str) -> str:
-    """Store image bytes and return a nanobanana:// URL."""
+    """Store image bytes and return the image ID."""
     _gc_store()
     img_id = uuid.uuid4().hex[:12]
     with _STORE_LOCK:
+        # Evict oldest entries if store is full
+        while len(_IMAGE_STORE) >= _STORE_MAX_ITEMS:
+            oldest_key = min(_IMAGE_STORE, key=lambda k: _IMAGE_STORE[k][2])
+            del _IMAGE_STORE[oldest_key]
         _IMAGE_STORE[img_id] = (img_bytes, mime, time.time())
-    return f"nanobanana://{img_id}"
+    return img_id
 
 
 def _fetch_from_store(img_id: str) -> tuple[bytes, str]:
@@ -92,6 +109,55 @@ def _gc_store():
         expired = [k for k, (_, _, ts) in _IMAGE_STORE.items() if now - ts > _STORE_TTL]
         for k in expired:
             del _IMAGE_STORE[k]
+
+
+# ---------------------------------------------------------------------------
+# Session-based upload tracking — links elicitation sessions to uploaded images
+# ---------------------------------------------------------------------------
+_UPLOAD_SESSIONS: dict[str, str | None] = {}  # session_id -> image_id or None (pending)
+_SESSION_LOCK = threading.Lock()
+_SESSION_TTL = 300  # 5 min — user has this long to complete the upload
+
+
+def _create_upload_session() -> str:
+    """Create a pending upload session and return its ID."""
+    _gc_sessions()
+    session_id = uuid.uuid4().hex  # 128-bit — not guessable
+    with _SESSION_LOCK:
+        _UPLOAD_SESSIONS[session_id] = (None, time.time())  # (image_id, created_at)
+    return session_id
+
+
+def _complete_upload_session(session_id: str, img_id: str) -> None:
+    """Mark a session as complete with the uploaded image ID."""
+    with _SESSION_LOCK:
+        entry = _UPLOAD_SESSIONS.get(session_id)
+        if entry is not None:
+            _UPLOAD_SESSIONS[session_id] = (img_id, entry[1])
+
+
+def _poll_upload_session(session_id: str) -> str | None:
+    """Check if a session has a completed upload. Returns image_id or None."""
+    with _SESSION_LOCK:
+        entry = _UPLOAD_SESSIONS.get(session_id)
+        if entry is None:
+            return None
+        return entry[0]
+
+
+def _cleanup_session(session_id: str) -> None:
+    """Remove a completed or expired session."""
+    with _SESSION_LOCK:
+        _UPLOAD_SESSIONS.pop(session_id, None)
+
+
+def _gc_sessions():
+    """Remove expired upload sessions."""
+    now = time.time()
+    with _SESSION_LOCK:
+        expired = [k for k, (_, ts) in _UPLOAD_SESSIONS.items() if now - ts > _SESSION_TTL]
+        for k in expired:
+            del _UPLOAD_SESSIONS[k]
 
 # ---------------------------------------------------------------------------
 # Style presets — tuned prompt prefixes
@@ -137,19 +203,173 @@ STYLE_PRESETS = {
 mcp = FastMCP(
     "nanobanana",
     instructions=(
-        "NanoBanana image generation server powered by Gemini. "
-        "WORKFLOW: When a user provides/uploads an image, ALWAYS call upload_image FIRST "
-        "to store it server-side and get a nanobanana:// URL. Then pass that URL to "
-        "other tools (edit_image, swap_background, create_variations, analyze_image, "
-        "generate_image reference_images). This avoids base64 truncation issues. "
-        "Tools: upload_image, generate_image, edit_image, swap_background, "
-        "create_variations, analyze_image, list_styles. "
-        "Default aspect ratio 4:5, resolution 1K. "
-        "Set output='gcs' to return URLs instead of base64 (requires GCS_BUCKET env var)."
+        "NanoBanana image generation server. Powered by Gemini.\n\n"
+        "## RULE #1 — NEVER pass base64 image data to any tool.\n"
+        "Do NOT encode, re-encode, resize, or convert images to base64 for tool parameters.\n"
+        "Do NOT use data: URIs. Do NOT read image files and pass their contents.\n"
+        "Base64 strings consume the entire context window and get truncated. It WILL fail.\n\n"
+        "## How to handle images:\n"
+        "- If the user provides a URL (http/https): pass it directly to the tool.\n"
+        "- If a previous tool returned a nanobanana:// or S3 URL: pass that URL.\n"
+        "- If the user pastes or uploads an image with NO URL: call the tool with\n"
+        "  image=\"\" (empty string). The server will automatically open an upload\n"
+        "  dialog for the user to provide the image. Do NOT try to extract, encode,\n"
+        "  resize, or convert the pasted image yourself. Just call the tool immediately.\n"
+        "- The same applies to reference images: if the user pasted reference images,\n"
+        "  first call upload_image with image=\"\" for each one to get nanobanana:// URLs,\n"
+        "  then pass those URLs to generate_image's reference_images parameter.\n\n"
+        "## Tools:\n"
+        "generate_image, edit_image, swap_background, create_variations, "
+        "analyze_image, upload_image, list_styles.\n"
+        "Default aspect ratio 4:5, resolution 1K."
     ),
     host=os.environ.get("HOST", "0.0.0.0"),
     port=int(os.environ.get("PORT", 8080)),
 )
+
+
+# ---------------------------------------------------------------------------
+# HTTP endpoints — direct image upload/serving (outside MCP protocol)
+# ---------------------------------------------------------------------------
+_UPLOAD_HTML = """<!DOCTYPE html>
+<html><head><title>NanoBanana — Upload Image</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; }
+  h1 { font-size: 1.4em; }
+  .drop-zone { border: 2px dashed #ccc; border-radius: 8px; padding: 40px; text-align: center;
+    cursor: pointer; transition: border-color 0.2s; margin: 20px 0; }
+  .drop-zone:hover, .drop-zone.drag-over { border-color: #f5a623; background: #fffbf0; }
+  input[type="file"] { display: none; }
+  #result { margin-top: 20px; padding: 12px; background: #f0f0f0; border-radius: 6px;
+    word-break: break-all; display: none; }
+  #result.success { background: #e8f5e9; }
+  #result.error { background: #fce4ec; }
+  code { background: #e8e8e8; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }
+</style></head>
+<body>
+  <h1>NanoBanana — Upload Image</h1>
+  <p id="instructions">Upload an image to get a URL you can paste into Claude.</p>
+  <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
+    Drop an image here or click to browse
+  </div>
+  <input type="file" id="fileInput" accept="image/*">
+  <div id="result"></div>
+  <script>
+    const dropZone = document.getElementById('dropZone');
+    const fileInput = document.getElementById('fileInput');
+    const result = document.getElementById('result');
+
+    dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+    dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+    dropZone.addEventListener('drop', e => {
+      e.preventDefault(); dropZone.classList.remove('drag-over');
+      if (e.dataTransfer.files.length) upload(e.dataTransfer.files[0]);
+    });
+    fileInput.addEventListener('change', () => { if (fileInput.files.length) upload(fileInput.files[0]); });
+
+    async function upload(file) {
+      dropZone.textContent = 'Uploading...';
+      result.style.display = 'none';
+      const form = new FormData();
+      form.append('file', file);
+      // Forward session param if present (for elicitation-triggered uploads)
+      const params = new URLSearchParams(window.location.search);
+      const session = params.get('session');
+      const uploadUrl = session ? '/upload?session=' + session : '/upload';
+      if (session) {
+        document.getElementById('instructions').textContent =
+          'Drop your image here — the tool waiting in Claude will pick it up automatically.';
+      }
+      try {
+        const resp = await fetch(uploadUrl, { method: 'POST', body: form });
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error);
+        result.className = 'success';
+        if (session) {
+          result.innerHTML = '<strong>Image received!</strong> You can close this tab — ' +
+            'the tool in Claude will continue automatically.';
+        } else {
+          result.innerHTML = '<strong>Image URL (paste this into Claude):</strong><br><br>' +
+            '<code>' + data.url + '</code>';
+          navigator.clipboard.writeText(data.url).catch(() => {});
+        }
+        result.style.display = 'block';
+        dropZone.textContent = 'Upload another image';
+      } catch (err) {
+        result.className = 'error';
+        result.textContent = 'Upload failed: ' + err.message;
+        result.style.display = 'block';
+        dropZone.textContent = 'Drop an image here or click to browse';
+      }
+    }
+  </script>
+</body></html>"""
+
+
+@mcp.custom_route("/upload", methods=["GET"])
+async def upload_form(request: Request) -> Response:
+    """Serve a simple HTML form for uploading images."""
+    return HTMLResponse(_UPLOAD_HTML)
+
+
+@mcp.custom_route("/upload", methods=["POST"])
+async def http_upload(request: Request) -> Response:
+    """Accept an image upload and return a URL for use in MCP tools."""
+    from PIL import Image as PILImage
+
+    content_type = request.headers.get("content-type", "")
+
+    if "multipart/form-data" in content_type:
+        form = await request.form()
+        file = form.get("file") or form.get("image")
+        if file is None:
+            return JSONResponse({"error": "No 'file' field in form data"}, status_code=400)
+        raw = await file.read()
+        await form.close()
+    else:
+        raw = await request.body()
+        if not raw:
+            return JSONResponse({"error": "Empty request body"}, status_code=400)
+
+    try:
+        normalized, mime = _normalize_image(raw, max_dim=SOURCE_MAX_DIM, quality=92)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    img = PILImage.open(BytesIO(normalized))
+    w, h = img.size
+
+    img_id = _store_image(normalized, mime)
+
+    # Link to upload session if present (for elicitation flow)
+    session_id = request.query_params.get("session")
+    if session_id:
+        _complete_upload_session(session_id, img_id)
+
+    # Build the full URL using the request's Host header
+    scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
+    host = request.headers.get("host", request.url.netloc)
+    image_url = f"{scheme}://{host}/images/{img_id}"
+
+    return JSONResponse({
+        "url": image_url,
+        "width": w,
+        "height": h,
+        "size_kb": len(normalized) // 1024,
+        "expires_in": "1 hour",
+        "usage": "Paste this URL into Claude to use with any image tool",
+    }, status_code=201)
+
+
+@mcp.custom_route("/images/{img_id}", methods=["GET"])
+async def http_get_image(request: Request) -> Response:
+    """Serve a stored image by ID."""
+    img_id = request.path_params["img_id"]
+    try:
+        img_bytes, mime = _fetch_from_store(img_id)
+    except ValueError:
+        return JSONResponse({"error": "Image not found or expired"}, status_code=404)
+    return Response(content=img_bytes, media_type=mime)
 
 
 # ---------------------------------------------------------------------------
@@ -179,8 +399,31 @@ def _is_url(s: str) -> bool:
 
 
 def _fetch_url(url: str) -> tuple[bytes, str]:
-    resp = httpx.get(url, follow_redirects=True, timeout=30)
-    resp.raise_for_status()
+    # Block requests to cloud metadata endpoints and private networks (SSRF protection)
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+    _BLOCKED_HOSTS = {
+        "metadata.google.internal",
+        "169.254.169.254",  # AWS/GCP metadata
+        "100.100.100.200",  # Alibaba metadata
+    }
+    if hostname in _BLOCKED_HOSTS or hostname.startswith("169.254."):
+        raise ValueError(f"Blocked request to internal address: {hostname}")
+    if hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+        raise ValueError(f"Blocked request to localhost: {hostname}")
+
+    try:
+        resp = httpx.get(url, follow_redirects=True, timeout=30)
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code in (403, 404):
+            raise ValueError(
+                f"Image URL returned {e.response.status_code}. "
+                "The image may have been deleted or expired. Please re-upload."
+            )
+        raise ValueError(f"Failed to fetch image from URL: {e}")
+    except httpx.TimeoutException:
+        raise ValueError(f"Timed out fetching image from URL: {url}")
     content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
     return resp.content, content_type
 
@@ -202,14 +445,14 @@ def _normalize_image(img_bytes: bytes, max_dim: int, quality: int = 85,
     except Exception:
         raise ValueError(
             "Could not decode image data. The image may have been truncated in transit. "
-            "Try passing an image URL instead of base64 for reliable results."
+            "Try uploading via the /upload page or passing an image URL."
         )
 
     w, h = img.size
     if w < 1 or h < 1:
         raise ValueError(
             "Image has invalid dimensions. The data may be corrupted or truncated. "
-            "Try passing an image URL instead of base64."
+            "Try uploading via the /upload page or passing an image URL."
         )
 
     if output_format == "JPEG":
@@ -234,15 +477,26 @@ def _normalize_image(img_bytes: bytes, max_dim: int, quality: int = 85,
 
 
 def _decode_raw(ref: str) -> tuple[bytes, str]:
+    # Internal store reference (nanobanana://id)
     if ref.startswith("nanobanana://"):
-        img_id = ref.replace("nanobanana://", "")
+        img_id = ref.removeprefix("nanobanana://")
         return _fetch_from_store(img_id)
+    # HTTP URL — check if it's our own /images/ endpoint first
     if _is_url(ref):
+        parsed = urlparse(ref)
+        if parsed.path.startswith("/images/"):
+            img_id = parsed.path.removeprefix("/images/")
+            try:
+                return _fetch_from_store(img_id)
+            except ValueError:
+                pass  # not in store — fall through to HTTP fetch
         return _fetch_url(ref)
+    # Base64 data URI
     if ref.startswith("data:"):
         header, data = ref.split(",", 1)
         mime = header.split(";")[0].split(":")[1]
         return base64.b64decode(_fix_base64_padding(data)), mime
+    # Raw base64
     return base64.b64decode(_fix_base64_padding(ref)), "image/jpeg"
 
 
@@ -259,6 +513,103 @@ def _decode_source(ref: str) -> tuple[bytes, str]:
 def _decode_mask(ref: str) -> tuple[bytes, str]:
     raw, _ = _decode_raw(ref)
     return _normalize_image(raw, max_dim=SOURCE_MAX_DIM, output_format="PNG")
+
+
+async def _acquire_image(
+    image: str | None,
+    ctx: Context,
+    max_dim: int = SOURCE_MAX_DIM,
+    quality: int = 92,
+    purpose: str = "image",
+) -> tuple[bytes, str]:
+    """Decode an image from a string ref, with elicitation fallback.
+
+    If the image can't be decoded (truncated base64, missing, etc.) and the client
+    supports elicitation, opens the upload page in the user's browser and waits
+    for them to upload. Returns (normalized_bytes, mime_type).
+
+    Raises ValueError with a user-friendly message if all approaches fail.
+    """
+    # First, try direct decode if we have an image string
+    if image:
+        try:
+            raw, _ = _decode_raw(image)
+            return _normalize_image(raw, max_dim=max_dim, quality=quality)
+        except Exception as decode_err:
+            # If it looks like a URL or nanobanana ref, the error is real (not truncation)
+            if _is_url(image) or image.startswith("nanobanana://"):
+                raise ValueError(str(decode_err))
+            # Likely truncated base64 — fall through to elicitation
+            first_error = str(decode_err)
+    else:
+        first_error = f"No {purpose} provided"
+
+    # Try elicitation: open the upload page in the user's browser
+    session_id = _create_upload_session()
+    try:
+        # Build upload URL — we need the server's external URL
+        # On Cloud Run, K_SERVICE is set automatically; construct URL from it
+        base_url = os.environ.get("PUBLIC_URL")
+        if not base_url:
+            k_service = os.environ.get("K_SERVICE")
+            k_region = os.environ.get("CLOUD_RUN_REGION") or os.environ.get("GOOGLE_CLOUD_REGION")
+            gcp_project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+            if k_service and k_region:
+                base_url = f"https://{k_service}-{gcp_project}.{k_region}.run.app" if gcp_project else f"https://{k_service}.run.app"
+            else:
+                port = int(os.environ.get("PORT", 8080))
+                base_url = f"http://localhost:{port}"
+        upload_url = f"{base_url}/upload?session={session_id}"
+
+        result = await ctx.elicit_url(
+            message=(
+                f"I need you to upload the {purpose} directly. "
+                f"Please drop your image on the upload page that just opened. "
+                f"I'll continue automatically once you upload."
+            ),
+            url=upload_url,
+            elicitation_id=f"upload-{session_id}",
+        )
+
+        if not isinstance(result, AcceptedUrlElicitation):
+            _cleanup_session(session_id)
+            raise ValueError(
+                f"Image upload was declined. Please provide a URL to the {purpose} instead."
+            )
+
+        # Poll for the upload to complete (user needs time to find file & drag-drop)
+        img_id = None
+        for _ in range(120):  # wait up to 2 minutes
+            img_id = _poll_upload_session(session_id)
+            if img_id is not None:
+                break
+            await asyncio.sleep(1)
+
+        _cleanup_session(session_id)
+
+        if img_id is None:
+            raise ValueError(
+                "Upload timed out after 2 minutes. Please try again or provide an image URL."
+            )
+
+        # Image was already normalized during upload — return as-is
+        return _fetch_from_store(img_id)
+
+    except ValueError:
+        # Re-raise ValueErrors from our own code (declined, timed out, etc.)
+        _cleanup_session(session_id)
+        raise
+    except Exception as e:
+        _cleanup_session(session_id)
+        # If elicitation isn't supported by the client, fall back to a helpful error
+        err_name = type(e).__name__
+        if err_name in ("NotImplementedError", "McpError") or "not supported" in str(e).lower():
+            raise ValueError(
+                f"Could not decode the {purpose} ({first_error}). "
+                f"Large images can't be passed reliably through tool parameters. "
+                f"Please upload the image at {base_url}/upload and paste the URL here."
+            )
+        raise ValueError(str(e))
 
 
 def _to_jpeg(img_bytes: bytes) -> bytes:
@@ -294,20 +645,23 @@ def _build_ref_parts(reference_images: list | None) -> list:
     parts = []
     if not reference_images:
         return parts
-    for ref in reference_images:
+    for i, ref in enumerate(reference_images):
+        if not ref or not ref.strip():
+            raise ValueError(
+                f"Reference image {i + 1} is empty. "
+                "Upload each reference image first using upload_image to get a "
+                "nanobanana:// URL, then pass those URLs here."
+            )
         img_bytes, mime = _decode_reference(ref)
         parts.append(types.Part.from_bytes(data=img_bytes, mime_type=mime))
     return parts
 
 
 # ---------------------------------------------------------------------------
-# Helpers — GCS output
+# Helpers — cloud storage upload
 # ---------------------------------------------------------------------------
 def _upload_to_gcs(jpeg_bytes: bytes, prefix: str = "gen") -> str:
-    """Upload JPEG bytes to GCS and return a public URL.
-
-    Requires GCS_BUCKET env var and appropriate service account permissions.
-    """
+    """Upload JPEG bytes to GCS and return a public URL."""
     from google.cloud import storage
 
     client = storage.Client()
@@ -319,25 +673,96 @@ def _upload_to_gcs(jpeg_bytes: bytes, prefix: str = "gen") -> str:
     return blob.public_url
 
 
-def _format_image_output(jpeg_bytes: bytes, output_mode: str, prefix: str = "gen") -> dict:
-    """Format a JPEG image as either base64 data URI or GCS URL.
+_s3_client = None
+_s3_client_lock = threading.Lock()
 
-    Expects pre-converted JPEG bytes — does NOT re-encode.
+
+def _get_s3_client():
+    """Get or create a cached boto3 S3 client."""
+    global _s3_client
+    if _s3_client is None:
+        with _s3_client_lock:
+            if _s3_client is None:
+                import boto3
+                _s3_client = boto3.client("s3", region_name=S3_REGION)
+    return _s3_client
+
+
+def _upload_to_s3(jpeg_bytes: bytes, prefix: str = "gen") -> str:
+    """Upload JPEG bytes to S3 and return a public URL."""
+    s3 = _get_s3_client()
+    key = f"{prefix}/{uuid.uuid4().hex}.jpg"
+    try:
+        s3.put_object(
+            Bucket=S3_BUCKET,
+            Key=key,
+            Body=jpeg_bytes,
+            ContentType="image/jpeg",
+        )
+    except Exception as e:
+        raise ValueError(
+            f"S3 upload failed: {e}. Check AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, "
+            f"and that the IAM user has s3:PutObject on {S3_BUCKET}."
+        )
+    return f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{key}"
+
+
+def _upload_to_cloud(jpeg_bytes: bytes, prefix: str = "gen") -> str:
+    """Upload to whichever cloud storage is configured (S3 preferred, then GCS)."""
+    if S3_BUCKET:
+        return _upload_to_s3(jpeg_bytes, prefix=prefix)
+    if GCS_BUCKET:
+        return _upload_to_gcs(jpeg_bytes, prefix=prefix)
+    raise ValueError(
+        "No cloud storage configured. Set S3_BUCKET or GCS_BUCKET env var, "
+        "or use output='base64' instead."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helpers — image output formatting
+# ---------------------------------------------------------------------------
+def _build_image_response(
+    result: dict,
+    generated: list[tuple[bytes, dict]],
+    output_mode: str,
+    prefix: str = "gen",
+) -> list | str:
+    """Build a tool response with metadata + images.
+
+    generated: list of (jpeg_bytes, per_image_metadata) tuples.
+
+    base64 mode: returns [json_metadata, Image, Image, ...]
+        Images render natively in Claude. Metadata includes stored URLs for re-use.
+    cloud mode (gcs/s3): returns json_metadata string with public URLs.
     """
-    if output_mode == "gcs":
-        if not GCS_BUCKET:
-            raise ValueError(
-                "GCS output requested but GCS_BUCKET env var is not set. "
-                "Use output='base64' or configure GCS_BUCKET on the server."
-            )
-        url = _upload_to_gcs(jpeg_bytes, prefix=prefix)
-        return {"url": url, "size_kb": len(jpeg_bytes) // 1024}
+    if output_mode in ("gcs", "s3", "cloud"):
+        for jpeg_bytes, meta in generated:
+            cloud_url = _upload_to_cloud(jpeg_bytes, prefix=prefix)
+            meta["image_url"] = cloud_url  # consistent key across all output modes
+            meta["size_kb"] = len(jpeg_bytes) // 1024
+        if len(generated) == 1:
+            result.update(generated[0][1])
+            result.pop("index", None)
+        else:
+            result["images"] = [meta for _, meta in generated]
+        return json.dumps(result)
     else:
-        b64 = base64.b64encode(jpeg_bytes).decode("utf-8")
-        return {
-            "data_uri": f"data:image/jpeg;base64,{b64}",
-            "size_kb": len(jpeg_bytes) // 1024,
-        }
+        # Store images server-side so they can be referenced by URL in later tool calls
+        for jpeg_bytes, meta in generated:
+            img_id = _store_image(jpeg_bytes, "image/jpeg")
+            meta["image_url"] = f"nanobanana://{img_id}"
+            meta["size_kb"] = len(jpeg_bytes) // 1024
+        if len(generated) == 1:
+            result.update(generated[0][1])
+            result.pop("index", None)
+        else:
+            result["images"] = [meta for _, meta in generated]
+        # Return metadata text + native Image content blocks
+        return [json.dumps(result)] + [
+            Image(data=jpeg_bytes, format="jpeg")
+            for jpeg_bytes, _ in generated
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -412,48 +837,38 @@ def _score_image(client, img_bytes: bytes, prompt: str) -> dict:
 # Tools
 # ---------------------------------------------------------------------------
 @mcp.tool()
-def upload_image(
-    image: str,
+async def upload_image(
+    ctx: Context,
+    image: str = "",
 ) -> str:
-    """Upload an image to the server and get back a nanobanana:// URL.
+    """Store an image on the server and get back a URL for other tools.
 
-    Use this FIRST when working with user-uploaded images. The returned URL
-    can be passed to any other tool (edit_image, swap_background,
-    create_variations, analyze_image, or generate_image reference_images).
+    IMPORTANT: Only pass URLs (http/https or nanobanana://). NEVER pass base64 data —
+    it will consume the entire context window and likely get truncated.
 
-    This avoids base64 truncation issues — the image is stored server-side
-    and other tools fetch it instantly by URL.
-
-    The image is downscaled to 2048px max dimension and stored for 1 hour.
+    If the user pasted an image with no URL, call this with image="" — the server will
+    open an upload dialog for the user automatically.
 
     Args:
-        image: The image to upload. Base64 data URI, raw base64 string, or URL.
-               For user-uploaded images in Claude, pass the base64 data here.
+        image: Image URL (http/https) or nanobanana:// URL. Leave empty to trigger upload dialog.
 
     Returns:
-        JSON with the nanobanana:// URL to use in other tools, plus image dimensions.
+        JSON with a nanobanana:// URL to use in other tools, plus image dimensions.
     """
     from PIL import Image as PILImage
 
     try:
-        raw, mime = _decode_raw(image)
-    except Exception as e:
-        return json.dumps({"error": f"Failed to decode image: {e}"})
-
-    # Normalize and store
-    try:
-        normalized, norm_mime = _normalize_image(raw, max_dim=SOURCE_MAX_DIM, quality=92)
-    except Exception as e:
+        normalized, norm_mime = await _acquire_image(image, ctx, purpose="image")
+    except ValueError as e:
         return json.dumps({"error": str(e)})
 
-    # Get dimensions for feedback
     img = PILImage.open(BytesIO(normalized))
     w, h = img.size
 
-    url = _store_image(normalized, norm_mime)
+    img_id = _store_image(normalized, norm_mime)
 
     return json.dumps({
-        "url": url,
+        "url": f"nanobanana://{img_id}",
         "width": w,
         "height": h,
         "size_kb": len(normalized) // 1024,
@@ -463,7 +878,7 @@ def upload_image(
 
 
 @mcp.tool()
-def generate_image(
+async def generate_image(
     prompt: str,
     reference_images: list[str] | None = None,
     style: str | None = None,
@@ -473,37 +888,28 @@ def generate_image(
     quality: str = "default",
     count: int = 1,
     qa: bool = False,
-    output: str = "base64",
-) -> str:
+    output: str = DEFAULT_OUTPUT,
+) -> list | str:
     """Generate an image from a text prompt with optional reference images and style presets.
 
     Reference images guide the model on style, subject appearance, or composition.
-    URLs are strongly recommended over base64 — the server fetches them directly,
-    avoiding truncation issues with large inline data.
+    ONLY pass URLs — never base64.
 
     Args:
         prompt: What to generate. Describe subject, style, lighting, mood, etc.
-        reference_images: Optional list of reference images. Accepts:
-                          - Image URLs (recommended — fetched server-side, most reliable)
-                          - Base64 data URIs (data:image/jpeg;base64,...)
-                          - Raw base64 strings
-                          Multiple references supported for combining style + subject cues.
+        reference_images: Optional list of image URLs (http/https or nanobanana://). NEVER base64.
         style: Optional style preset. Available: cinematic, product-photography,
                editorial, watercolor, flat-illustration, neon-noir, minimalist, vintage-film.
         enhance_prompt: If true, AI expands your prompt into a detailed generation prompt.
-                        Great for short prompts. Default: false
         aspect_ratio: Output aspect ratio. Default: 4:5
-        resolution: Output resolution: 0.5K, 1K, 2K, 4K. Default: 1K
+        resolution: Output resolution: 1K, 2K, 4K. Default: 1K
         quality: "default" (fast) or "pro" (higher quality). Default: default
         count: Number of images to generate (1–4). Default: 1
-        qa: If true, each image is scored by AI on composition, clarity, lighting,
-            color, and prompt adherence (1-10 each). When count > 1, images are
-            ranked by total score with the best first. Default: false
-        output: "base64" returns data URIs (default). "gcs" uploads to Google Cloud
-                Storage and returns public URLs (requires GCS_BUCKET env var on server).
+        qa: If true, AI-score each image. When count > 1, ranks by total score.
+        output: "base64" returns inline images (default). "cloud"/"s3"/"gcs" uploads to cloud storage and returns URLs.
 
     Returns:
-        JSON with image data (base64 or URL), metadata, QA scores (if qa=true).
+        Metadata JSON + inline images (base64 mode) or metadata with URLs (cloud mode).
     """
     from google.genai import types
 
@@ -513,10 +919,10 @@ def generate_image(
         return json.dumps({"error": f"Unsupported resolution '{resolution}'.", "supported": sorted(RESOLUTIONS)})
     if style and style not in STYLE_PRESETS:
         return json.dumps({"error": f"Unknown style '{style}'.", "available": sorted(STYLE_PRESETS.keys())})
-    if output not in ("base64", "gcs"):
-        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["base64", "gcs"]})
-    if output == "gcs" and not GCS_BUCKET:
-        return json.dumps({"error": "GCS output requested but GCS_BUCKET env var is not set on the server. Use output='base64' instead."})
+    if output not in ("base64", "gcs", "s3", "cloud"):
+        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["base64", "gcs", "s3", "cloud"]})
+    if output in ("gcs", "s3", "cloud") and not S3_BUCKET and not GCS_BUCKET:
+        return json.dumps({"error": "Cloud output requested but no storage configured. Set S3_BUCKET or GCS_BUCKET env var, or use output='base64'."})
 
     count = max(1, min(count, 4))
 
@@ -535,15 +941,16 @@ def generate_image(
         except Exception as e:
             return json.dumps({"error": f"Prompt enhancement failed: {e}"})
 
-    # Build content parts
+    # Build content parts (run in thread pool to avoid blocking on HTTP fetches)
     try:
-        parts = _build_ref_parts(reference_images)
+        loop = asyncio.get_event_loop()
+        parts = await loop.run_in_executor(None, _build_ref_parts, reference_images)
     except Exception as e:
         return json.dumps({"error": f"Failed to process reference image: {e}"})
     parts.append(types.Part.from_text(text=final_prompt))
 
     model_name = _pick_model(quality)
-    images = []
+    generated = []  # (jpeg_bytes, metadata_dict)
     errors = []
 
     for i in range(count):
@@ -562,24 +969,23 @@ def generate_image(
             img_bytes = _extract_image(response)
             if img_bytes:
                 jpeg_bytes = _to_jpeg(img_bytes)
-                entry = _format_image_output(jpeg_bytes, output, prefix="gen")
+                meta = {"index": i + 1}
                 if qa:
-                    entry["qa"] = _score_image(client, jpeg_bytes, final_prompt)
-                entry["index"] = i + 1
-                images.append(entry)
+                    meta["qa"] = _score_image(client, jpeg_bytes, final_prompt)
+                generated.append((jpeg_bytes, meta))
             else:
                 errors.append(f"Image {i + 1}: no image in response")
         except Exception as e:
             errors.append(f"Image {i + 1}: {e}")
 
-    if not images:
+    if not generated:
         return json.dumps({"error": "All generation attempts failed.", "details": errors})
 
     # Rank by QA score if scoring was enabled
-    if qa and len(images) > 1:
-        images.sort(key=lambda x: x.get("qa", {}).get("total", 0), reverse=True)
-        for i, img in enumerate(images):
-            img["rank"] = i + 1
+    if qa and len(generated) > 1:
+        generated.sort(key=lambda x: x[1].get("qa", {}).get("total", 0), reverse=True)
+        for i, (_, meta) in enumerate(generated):
+            meta["rank"] = i + 1
 
     result = {
         "model": model_name,
@@ -593,60 +999,54 @@ def generate_image(
         result["style"] = style
     if reference_images:
         result["reference_count"] = len(reference_images)
+    if errors:
+        result["errors"] = errors
 
-    if count == 1:
-        result.update(images[0])
-        result.pop("index", None)
-    else:
-        result["images"] = images
-        if errors:
-            result["errors"] = errors
-
-    return json.dumps(result)
+    return _build_image_response(result, generated, output, prefix="gen")
 
 
 @mcp.tool()
-def edit_image(
-    image: str,
+async def edit_image(
     prompt: str,
+    ctx: Context,
+    image: str = "",
+    reference_images: list[str] | None = None,
     mask: str | None = None,
     edit_mode: str = "inpaint-insertion",
     aspect_ratio: str | None = None,
     count: int = 1,
-    output: str = "base64",
-) -> str:
+    output: str = DEFAULT_OUTPUT,
+) -> list | str:
     """Edit an existing image — add objects, remove objects, or extend the canvas.
 
-    Pass the source image as a URL (recommended) or base64.
-    Provide a mask for precise control, or let the model infer the edit region.
+    Pass the source image as a URL (http/https or nanobanana://). NEVER pass base64.
+    If the user pasted an image, call with image="" to trigger the upload dialog.
 
     Args:
-        image: The source image. URL (recommended), base64 data URI, or raw base64.
+        image: Source image URL or nanobanana:// URL. Leave empty to trigger upload dialog.
         prompt: Edit instruction. Be specific about what to change.
-        mask: Optional mask image (URL or base64). White = edit region, black = preserve.
-              If omitted, the model uses automatic segmentation based on your prompt.
+        reference_images: Optional list of reference image URLs (nanobanana:// or http).
+            Use when the edit involves replacing or adding content based on another image
+            (e.g. "replace bottle A with bottle B" — pass bottle B as a reference).
+        mask: Optional mask image (URL). White = edit region, black = preserve.
         edit_mode: "inpaint-insertion" (add/replace), "inpaint-removal" (remove + fill),
                    "outpaint" (extend canvas). Default: inpaint-insertion
         aspect_ratio: Output aspect ratio (useful for outpaint). Default: same as input.
         count: Number of candidates (1–4). Default: 1
-        output: "base64" (default) or "gcs" (upload to GCS, return URL).
+        output: "base64" (default), "s3", "gcs", or "cloud".
 
     Returns:
-        JSON with edited image data (base64 or URL).
+        Metadata JSON + inline images (base64 mode) or metadata with URLs (gcs mode).
     """
     from google.genai import types
 
-    edit_modes = {
-        "inpaint-insertion": "EDIT_MODE_INPAINT_INSERTION",
-        "inpaint-removal": "EDIT_MODE_INPAINT_REMOVAL",
-        "outpaint": "EDIT_MODE_OUTPAINT",
-    }
-    if edit_mode not in edit_modes:
-        return json.dumps({"error": f"Unknown edit_mode '{edit_mode}'.", "available": list(edit_modes.keys())})
-    if output not in ("base64", "gcs"):
-        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["base64", "gcs"]})
-    if output == "gcs" and not GCS_BUCKET:
-        return json.dumps({"error": "GCS output requested but GCS_BUCKET env var is not set on the server. Use output='base64' instead."})
+    valid_edit_modes = {"inpaint-insertion", "inpaint-removal", "outpaint"}
+    if edit_mode not in valid_edit_modes:
+        return json.dumps({"error": f"Unknown edit_mode '{edit_mode}'.", "available": sorted(valid_edit_modes)})
+    if output not in ("base64", "gcs", "s3", "cloud"):
+        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["base64", "gcs", "s3", "cloud"]})
+    if output in ("gcs", "s3", "cloud") and not S3_BUCKET and not GCS_BUCKET:
+        return json.dumps({"error": "Cloud output requested but no storage configured. Set S3_BUCKET or GCS_BUCKET env var, or use output='base64'."})
 
     count = max(1, min(count, 4))
 
@@ -656,116 +1056,103 @@ def edit_image(
         return json.dumps({"error": str(e)})
 
     try:
-        img_bytes, img_mime = _decode_source(image)
-    except Exception as e:
+        img_bytes, img_mime = await _acquire_image(image, ctx, purpose="source image")
+    except ValueError as e:
         return json.dumps({"error": str(e)})
 
-    ref_images = [
-        types.RawReferenceImage(
-            reference_id=1,
-            reference_image=types.Image(image_bytes=img_bytes, mime_type=img_mime),
-        )
-    ]
+    # Build edit prompt with mode context
+    mode_instructions = {
+        "inpaint-insertion": f"Edit this image: {prompt}",
+        "inpaint-removal": f"Remove the following from this image and fill naturally: {prompt}",
+        "outpaint": f"Extend this image beyond its current borders: {prompt}",
+    }
+    edit_prompt = mode_instructions[edit_mode]
+
+    # Build content parts: source image + optional references + optional mask + prompt
+    parts = [types.Part.from_bytes(data=img_bytes, mime_type=img_mime)]
+
+    if reference_images:
+        try:
+            ref_parts = _build_ref_parts(reference_images)
+            parts.extend(ref_parts)
+            edit_prompt += (
+                " Use the provided reference image(s) to guide what the result should look like."
+            )
+        except Exception as e:
+            return json.dumps({"error": f"Failed to process reference image: {e}"})
 
     if mask:
         try:
             mask_bytes, mask_mime = _decode_mask(mask)
-            ref_images.append(
-                types.MaskReferenceImage(
-                    reference_id=2,
-                    config=types.MaskReferenceConfig(
-                        mask_mode="MASK_MODE_USER_PROVIDED",
-                        mask_image=types.Image(image_bytes=mask_bytes, mime_type=mask_mime),
-                    ),
-                )
-            )
+            parts.append(types.Part.from_bytes(data=mask_bytes, mime_type=mask_mime))
+            edit_prompt += " Use the provided mask: white areas should be edited, black areas preserved."
         except Exception as e:
             return json.dumps({"error": f"Failed to decode mask image: {e}"})
-    elif edit_mode != "outpaint":
-        ref_images.append(
-            types.MaskReferenceImage(
-                reference_id=2,
-                config=types.MaskReferenceConfig(
-                    mask_mode="MASK_MODE_SEMANTIC",
-                    mask_dilation=0.03,
+
+    parts.append(types.Part.from_text(text=edit_prompt))
+
+    generated = []
+    errors = []
+    for i in range(count):
+        try:
+            response = client.models.generate_content(
+                model=MODEL_FLASH,
+                contents=parts,
+                config=types.GenerateContentConfig(
+                    response_modalities=["IMAGE", "TEXT"],
                 ),
             )
-        )
-
-    config = types.EditImageConfig(
-        edit_mode=edit_modes[edit_mode],
-        number_of_images=count,
-    )
-    if aspect_ratio:
-        config.aspect_ratio = aspect_ratio
-
-    try:
-        response = client.models.edit_image(
-            model="imagen-3.0-capability-001",
-            prompt=prompt,
-            reference_images=ref_images,
-            config=config,
-        )
-    except Exception as e:
-        return json.dumps({"error": f"Edit failed: {e}"})
-
-    images = []
-    if response.generated_images:
-        for i, gen_img in enumerate(response.generated_images):
-            img_data = gen_img.image
-            raw = img_data.image_bytes if img_data.image_bytes else None
+            raw = _extract_image(response)
             if raw:
                 jpeg_bytes = _to_jpeg(raw)
-                entry = _format_image_output(jpeg_bytes, output, prefix="edit")
-                entry["index"] = i + 1
-                images.append(entry)
+                generated.append((jpeg_bytes, {"index": i + 1}))
+            else:
+                errors.append(f"Edit {i + 1}: no image in response")
+        except Exception as e:
+            errors.append(f"Edit {i + 1}: {e}")
 
-    if not images:
-        return json.dumps({"error": "Edit produced no output images."})
+    if not generated:
+        return json.dumps({"error": "Edit produced no output images.", "details": errors})
 
     result = {"edit_mode": edit_mode, "prompt": prompt}
-    if len(images) == 1:
-        result.update(images[0])
-        result.pop("index", None)
-    else:
-        result["images"] = images
-
-    return json.dumps(result)
+    if reference_images:
+        result["reference_count"] = len(reference_images)
+    if errors:
+        result["errors"] = errors
+    return _build_image_response(result, generated, output, prefix="edit")
 
 
 @mcp.tool()
-def swap_background(
-    image: str,
+async def swap_background(
     background: str,
+    ctx: Context,
+    image: str = "",
     aspect_ratio: str | None = None,
     count: int = 1,
-    output: str = "base64",
-) -> str:
+    output: str = DEFAULT_OUTPUT,
+) -> list | str:
     """Replace the background of an image while keeping the foreground subject intact.
 
-    Automatically segments the foreground (person, product, object) and generates
-    a new background based on your description. Much simpler than manual edit_image
-    with masks for this common use case. Uses the Imagen 3 editing model.
+    Automatically segments the foreground and generates a new background.
+    NEVER pass base64 — only URLs.
+    If the user pasted an image, call with image="" to trigger the upload dialog.
 
     Args:
-        image: Source image with the subject to keep. URL (recommended) or base64.
+        image: Source image URL or nanobanana:// URL. Leave empty to trigger upload dialog.
         background: Description of the new background. Be specific.
-                    E.g. "tropical beach at sunset with palm trees",
-                    "clean white studio with soft shadows",
-                    "busy Tokyo street at night with neon signs".
         aspect_ratio: Output aspect ratio. Default: same as input.
         count: Number of candidates (1–4). Default: 1
-        output: "base64" (default) or "gcs".
+        output: "base64" (default), "s3", "gcs", or "cloud".
 
     Returns:
-        JSON with the composited image data (base64 or URL).
+        Metadata JSON + inline images (base64 mode) or metadata with URLs (gcs mode).
     """
     from google.genai import types
 
-    if output not in ("base64", "gcs"):
-        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["base64", "gcs"]})
-    if output == "gcs" and not GCS_BUCKET:
-        return json.dumps({"error": "GCS output requested but GCS_BUCKET env var is not set on the server. Use output='base64' instead."})
+    if output not in ("base64", "gcs", "s3", "cloud"):
+        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["base64", "gcs", "s3", "cloud"]})
+    if output in ("gcs", "s3", "cloud") and not S3_BUCKET and not GCS_BUCKET:
+        return json.dumps({"error": "Cloud output requested but no storage configured. Set S3_BUCKET or GCS_BUCKET env var, or use output='base64'."})
 
     count = max(1, min(count, 4))
 
@@ -775,70 +1162,53 @@ def swap_background(
         return json.dumps({"error": str(e)})
 
     try:
-        img_bytes, img_mime = _decode_source(image)
-    except Exception as e:
+        img_bytes, img_mime = await _acquire_image(image, ctx, purpose="source image")
+    except ValueError as e:
         return json.dumps({"error": str(e)})
 
-    # Use Imagen edit with background mask + inpaint-insertion for the new background
-    ref_images = [
-        types.RawReferenceImage(
-            reference_id=1,
-            reference_image=types.Image(image_bytes=img_bytes, mime_type=img_mime),
-        ),
-        types.MaskReferenceImage(
-            reference_id=2,
-            config=types.MaskReferenceConfig(
-                mask_mode="MASK_MODE_BACKGROUND",
-                mask_dilation=0.03,
-            ),
-        ),
+    swap_prompt = (
+        f"Keep the foreground subject exactly as it is, but completely replace the background with: {background}. "
+        "The subject should look naturally placed in the new background with appropriate lighting and shadows."
+    )
+
+    parts = [
+        types.Part.from_bytes(data=img_bytes, mime_type=img_mime),
+        types.Part.from_text(text=swap_prompt),
     ]
 
-    config = types.EditImageConfig(
-        edit_mode="EDIT_MODE_INPAINT_INSERTION",
-        number_of_images=count,
-    )
-    if aspect_ratio:
-        config.aspect_ratio = aspect_ratio
-
-    prompt = f"Replace the background with: {background}"
-
-    try:
-        response = client.models.edit_image(
-            model="imagen-3.0-capability-001",
-            prompt=prompt,
-            reference_images=ref_images,
-            config=config,
-        )
-    except Exception as e:
-        return json.dumps({"error": f"Background swap failed: {e}"})
-
-    images = []
-    if response.generated_images:
-        for i, gen_img in enumerate(response.generated_images):
-            raw = gen_img.image.image_bytes if gen_img.image.image_bytes else None
+    generated = []
+    errors = []
+    for i in range(count):
+        try:
+            response = client.models.generate_content(
+                model=MODEL_FLASH,
+                contents=parts,
+                config=types.GenerateContentConfig(
+                    response_modalities=["IMAGE", "TEXT"],
+                ),
+            )
+            raw = _extract_image(response)
             if raw:
                 jpeg_bytes = _to_jpeg(raw)
-                entry = _format_image_output(jpeg_bytes, output, prefix="bgswap")
-                entry["index"] = i + 1
-                images.append(entry)
+                generated.append((jpeg_bytes, {"index": i + 1}))
+            else:
+                errors.append(f"Swap {i + 1}: no image in response")
+        except Exception as e:
+            errors.append(f"Swap {i + 1}: {e}")
 
-    if not images:
-        return json.dumps({"error": "Background swap produced no output images."})
+    if not generated:
+        return json.dumps({"error": "Background swap produced no output images.", "details": errors})
 
     result = {"background": background}
-    if len(images) == 1:
-        result.update(images[0])
-        result.pop("index", None)
-    else:
-        result["images"] = images
-
-    return json.dumps(result)
+    if errors:
+        result["errors"] = errors
+    return _build_image_response(result, generated, output, prefix="bgswap")
 
 
 @mcp.tool()
-def create_variations(
-    image: str,
+async def create_variations(
+    ctx: Context,
+    image: str = "",
     prompt: str | None = None,
     variation_strength: str = "medium",
     aspect_ratio: str = "4:5",
@@ -846,27 +1216,28 @@ def create_variations(
     quality: str = "default",
     count: int = 3,
     qa: bool = False,
-    output: str = "base64",
-) -> str:
+    output: str = DEFAULT_OUTPUT,
+) -> list | str:
     """Generate variations of an existing image.
 
     Preserves the core subject while exploring different compositions, lighting,
-    or styling. Pass the source image as a URL (recommended) or base64.
+    or styling. Pass the source image as a URL.
+    NEVER pass base64 — only URLs.
+    If the user pasted an image, call with image="" to trigger the upload dialog.
 
     Args:
-        image: Source image. URL (recommended), base64 data URI, or raw base64.
-        prompt: Optional guidance. E.g. "same product but on a beach",
-                "warmer color palette", "more dramatic lighting".
+        image: Source image URL or nanobanana:// URL. Leave empty to trigger upload dialog.
+        prompt: Optional guidance for variations.
         variation_strength: "subtle", "medium", or "strong". Default: medium
         aspect_ratio: Output aspect ratio. Default: 4:5
-        resolution: Output resolution: 0.5K, 1K, 2K, 4K. Default: 1K
+        resolution: Output resolution: 1K, 2K, 4K. Default: 1K
         quality: "default" or "pro". Default: default
         count: Number of variations (1–4). Default: 3
         qa: Score each variation and rank by quality. Default: false
-        output: "base64" (default) or "gcs".
+        output: "base64" (default), "s3", "gcs", or "cloud".
 
     Returns:
-        JSON with variation image data, ranked by QA score if qa=true.
+        Metadata JSON + inline images (base64 mode) or metadata with URLs (gcs mode).
     """
     from google.genai import types
 
@@ -874,10 +1245,10 @@ def create_variations(
         return json.dumps({"error": f"Unsupported aspect ratio '{aspect_ratio}'.", "supported": sorted(SUPPORTED_RATIOS)})
     if resolution not in RESOLUTIONS:
         return json.dumps({"error": f"Unsupported resolution '{resolution}'.", "supported": sorted(RESOLUTIONS)})
-    if output not in ("base64", "gcs"):
-        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["base64", "gcs"]})
-    if output == "gcs" and not GCS_BUCKET:
-        return json.dumps({"error": "GCS output requested but GCS_BUCKET env var is not set on the server. Use output='base64' instead."})
+    if output not in ("base64", "gcs", "s3", "cloud"):
+        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["base64", "gcs", "s3", "cloud"]})
+    if output in ("gcs", "s3", "cloud") and not S3_BUCKET and not GCS_BUCKET:
+        return json.dumps({"error": "Cloud output requested but no storage configured. Set S3_BUCKET or GCS_BUCKET env var, or use output='base64'."})
 
     strength_prompts = {
         "subtle": "Create a subtle variation of this image, keeping the composition and style very close to the original with only minor differences in details. ",
@@ -895,7 +1266,7 @@ def create_variations(
         return json.dumps({"error": str(e)})
 
     try:
-        img_bytes, img_mime = _decode_source(image)
+        img_bytes, img_mime = await _acquire_image(image, ctx, purpose="source image")
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -909,7 +1280,7 @@ def create_variations(
     ]
 
     model_name = _pick_model(quality)
-    images = []
+    generated = []
     errors = []
 
     for i in range(count):
@@ -928,58 +1299,51 @@ def create_variations(
             raw = _extract_image(response)
             if raw:
                 jpeg_bytes = _to_jpeg(raw)
-                entry = _format_image_output(jpeg_bytes, output, prefix="var")
+                meta = {"index": i + 1}
                 if qa:
-                    entry["qa"] = _score_image(client, jpeg_bytes, variation_prompt)
-                entry["index"] = i + 1
-                images.append(entry)
+                    meta["qa"] = _score_image(client, jpeg_bytes, variation_prompt)
+                generated.append((jpeg_bytes, meta))
             else:
                 errors.append(f"Variation {i + 1}: no image in response")
         except Exception as e:
             errors.append(f"Variation {i + 1}: {e}")
 
-    if not images:
+    if not generated:
         return json.dumps({"error": "All variation attempts failed.", "details": errors})
 
-    if qa and len(images) > 1:
-        images.sort(key=lambda x: x.get("qa", {}).get("total", 0), reverse=True)
-        for i, img in enumerate(images):
-            img["rank"] = i + 1
+    if qa and len(generated) > 1:
+        generated.sort(key=lambda x: x[1].get("qa", {}).get("total", 0), reverse=True)
+        for i, (_, meta) in enumerate(generated):
+            meta["rank"] = i + 1
 
     result = {
         "model": model_name,
         "variation_strength": variation_strength,
         "aspect_ratio": aspect_ratio,
         "resolution": resolution,
-        "count": len(images),
-        "images": images,
     }
     if errors:
         result["errors"] = errors
     if prompt:
         result["guidance"] = prompt
 
-    return json.dumps(result)
+    return _build_image_response(result, generated, output, prefix="var")
 
 
 @mcp.tool()
-def analyze_image(
-    image: str,
+async def analyze_image(
+    ctx: Context,
+    image: str = "",
     focus: str = "general",
 ) -> str:
     """Analyze an image using Gemini vision — describe, tag, or assess quality.
 
-    Useful for understanding uploaded references, generating SEO alt text,
-    verifying a generation matched intent, or extracting visual details.
+    NEVER pass base64 — only URLs.
+    If the user pasted an image, call with image="" to trigger the upload dialog.
 
     Args:
-        image: Image to analyze. URL (recommended), base64 data URI, or raw base64.
-        focus: Analysis focus. Options:
-               - "general" (default): Comprehensive description of content, style, mood
-               - "tags": Keyword tags for search/SEO (returns a list)
-               - "alt-text": Concise accessible alt text (1-2 sentences)
-               - "quality": Technical quality assessment (sharpness, lighting, composition)
-               - "brand": Brand/marketing analysis (target audience, mood, messaging)
+        image: Image URL or nanobanana:// URL. Leave empty to trigger upload dialog.
+        focus: Analysis focus: "general", "tags", "alt-text", "quality", "brand"
 
     Returns:
         JSON with the analysis result.
@@ -1031,13 +1395,14 @@ def analyze_image(
     except RuntimeError as e:
         return json.dumps({"error": str(e)})
 
-    # Use higher resolution for quality analysis to detect real defects
     try:
         if focus == "quality":
-            img_bytes, img_mime = _decode_source(image)
+            img_bytes, img_mime = await _acquire_image(image, ctx, purpose="image to analyze")
         else:
-            img_bytes, img_mime = _decode_reference(image)
-    except Exception as e:
+            img_bytes, img_mime = await _acquire_image(
+                image, ctx, max_dim=REF_MAX_DIM, quality=85, purpose="image to analyze"
+            )
+    except ValueError as e:
         return json.dumps({"error": str(e)})
 
     try:
@@ -1075,4 +1440,32 @@ def list_styles() -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http")
+    import sys
+
+    # Validate API key at startup so users get a clear error immediately
+    api_key = os.environ.get("GOOGLE_AI_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        sys.stderr.write(
+            "\n ERROR: No API key found.\n"
+            "  Set GEMINI_API_KEY or GOOGLE_AI_API_KEY environment variable.\n"
+            "  Get a key at: https://aistudio.google.com/apikey\n\n"
+        )
+        raise SystemExit(1)
+
+    transport = os.environ.get("MCP_TRANSPORT", "streamable-http")
+
+    # In stdio mode, stdout is the MCP protocol channel — all logging must go to stderr
+    log = sys.stderr.write
+
+    if transport == "streamable-http":
+        log(f"Starting NanoBanana MCP server on {mcp.settings.host}:{mcp.settings.port}\n")
+        log(f"  Upload page: http://localhost:{mcp.settings.port}/upload\n")
+    else:
+        log(f"Starting NanoBanana MCP server ({transport} transport)\n")
+    if GCS_BUCKET:
+        log(f"  GCS output enabled: gs://{GCS_BUCKET}\n")
+    else:
+        log("  GCS output disabled (set GCS_BUCKET to enable)\n")
+    log("\n")
+
+    mcp.run(transport=transport)

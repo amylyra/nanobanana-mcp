@@ -6,6 +6,9 @@ startCommand:
       geminiApiKey:
         type: string
         description: "Google AI API key with Gemini image generation access"
+      gcsBucket:
+        type: string
+        description: "Optional GCS bucket name for URL output instead of base64"
     required:
       - geminiApiKey
   commandFunction: |-
@@ -13,6 +16,8 @@ startCommand:
       command: 'python',
       args: ['server.py'],
       env: {
-        GEMINI_API_KEY: config.geminiApiKey
+        GEMINI_API_KEY: config.geminiApiKey,
+        MCP_TRANSPORT: 'stdio',
+        ...(config.gcsBucket ? { GCS_BUCKET: config.gcsBucket } : {})
       }
     })
