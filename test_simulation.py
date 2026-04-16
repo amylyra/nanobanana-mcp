@@ -860,96 +860,52 @@ class TestModelSelection:
 
 
 # ---------------------------------------------------------------------------
-# 17. Empty-string image triggers elicitation (pasted image UX fix)
+# 17. Empty image returns upload instructions (no connection crash)
 # ---------------------------------------------------------------------------
 
-class TestEmptyImageElicitation:
-    """When user pastes an image in Claude, the AI should call tools with image="".
-    This triggers _acquire_image's elicitation flow instead of trying to pass base64."""
+class TestEmptyImageUploadInstructions:
+    """When image="" is passed (no image available), _acquire_image should
+    return a helpful error with the upload URL — NOT attempt elicitation
+    which crashes the MCP connection on clients that don't support it."""
 
     @pytest.mark.asyncio
-    async def test_upload_image_empty_triggers_elicitation(self):
-        """upload_image with image="" should call _acquire_image which tries elicitation."""
+    async def test_upload_image_empty_returns_upload_url(self):
+        """upload_image with image="" should return error with upload URL."""
         mock_ctx = MagicMock()
-
-        # Mock _acquire_image to simulate elicitation failure (no browser in test)
-        async def mock_acquire(image, ctx, **kwargs):
-            assert image == ""  # Key: empty string was passed
-            raise ValueError("Image upload was declined.")
-
-        with patch.object(server, "_acquire_image", mock_acquire):
-            result = await server.upload_image(ctx=mock_ctx, image="")
-
+        result = await server.upload_image(ctx=mock_ctx, image="")
         data = json.loads(result)
         assert "error" in data
-        assert "declined" in data["error"].lower()
+        assert "/upload" in data["error"]
 
     @pytest.mark.asyncio
-    async def test_edit_image_empty_triggers_elicitation(self):
-        """edit_image with image="" should trigger elicitation for the source image."""
+    async def test_edit_image_empty_returns_upload_url(self):
+        """edit_image with image="" should return error with upload URL."""
         mock_ctx = MagicMock()
-
-        acquired = False
-
-        async def mock_acquire(image, ctx, **kwargs):
-            nonlocal acquired
-            assert image == ""
-            acquired = True
-            # Simulate successful upload via elicitation
-            test_img = _make_test_image(200, 200)
-            return server._normalize_image(test_img, max_dim=2048)
-
-        test_img = _make_test_image(512, 512)
-        mock_part = MagicMock()
-        mock_part.inline_data = MagicMock()
-        mock_part.inline_data.mime_type = "image/png"
-        mock_part.inline_data.data = test_img
-        mock_candidate = MagicMock()
-        mock_candidate.content.parts = [mock_part]
-        mock_response = MagicMock()
-        mock_response.candidates = [mock_candidate]
         mock_client = MagicMock()
-        mock_client.models.generate_content.return_value = mock_response
-
-        with patch.object(server, "_acquire_image", mock_acquire), \
-             patch.object(server, "_get_client", return_value=mock_client):
+        with patch.object(server, "_get_client", return_value=mock_client):
             result = await server.edit_image(prompt="add a hat", ctx=mock_ctx, image="")
-
-        assert acquired, "_acquire_image was not called"
-        metadata = json.loads(result[0])
-        assert "edit_mode" in metadata
+        data = json.loads(result)
+        assert "error" in data
+        assert "/upload" in data["error"]
 
     @pytest.mark.asyncio
-    async def test_analyze_image_empty_triggers_elicitation(self):
-        """analyze_image with image="" should trigger elicitation."""
+    async def test_analyze_image_empty_returns_upload_url(self):
+        """analyze_image with image="" should return error with upload URL."""
         mock_ctx = MagicMock()
-
-        async def mock_acquire(image, ctx, **kwargs):
-            assert image == ""
-            test_img = _make_test_image(200, 200)
-            return server._normalize_image(test_img, max_dim=kwargs.get("max_dim", 2048))
-
-        mock_response = MagicMock()
-        mock_response.text = json.dumps({
-            "description": "test", "style": "test", "mood": "test",
-            "colors": ["red"], "details": ["detail"],
-        })
         mock_client = MagicMock()
-        mock_client.models.generate_content.return_value = mock_response
-
-        with patch.object(server, "_acquire_image", mock_acquire), \
-             patch.object(server, "_get_client", return_value=mock_client):
+        with patch.object(server, "_get_client", return_value=mock_client):
             result = await server.analyze_image(ctx=mock_ctx, image="", focus="general")
-
         data = json.loads(result)
-        assert "description" in data
+        assert "error" in data
+        assert "/upload" in data["error"]
 
-    def test_acquire_image_empty_goes_to_elicitation_branch(self):
-        """_acquire_image with empty string should NOT try _decode_raw,
-        should go straight to the elicitation branch."""
-        import inspect
-        source = inspect.getsource(server._acquire_image)
-        assert "if image:" in source
+    @pytest.mark.asyncio
+    async def test_acquire_image_empty_does_not_elicit(self):
+        """_acquire_image with empty string raises ValueError immediately,
+        no elicitation attempt that could crash the connection."""
+        mock_ctx = MagicMock()
+        with pytest.raises(ValueError, match="/upload"):
+            await server._acquire_image("", mock_ctx, purpose="test image")
 
 
 # ---------------------------------------------------------------------------

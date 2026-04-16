@@ -36,7 +36,6 @@ except ImportError:
 
 import httpx
 from mcp.server.fastmcp import FastMCP, Context, Image
-from mcp.server.elicitation import AcceptedUrlElicitation
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 
@@ -198,6 +197,27 @@ STYLE_PRESETS = {
 }
 
 # ---------------------------------------------------------------------------
+# Helpers — URL construction
+# ---------------------------------------------------------------------------
+def _get_upload_base_url() -> str:
+    """Get the server's external base URL for building upload links."""
+    base_url = os.environ.get("PUBLIC_URL")
+    if base_url:
+        return base_url
+    k_service = os.environ.get("K_SERVICE")
+    k_region = os.environ.get("CLOUD_RUN_REGION") or os.environ.get("GOOGLE_CLOUD_REGION")
+    gcp_project = os.environ.get("GOOGLE_CLOUD_PROJECT")
+    if k_service and k_region:
+        return (
+            f"https://{k_service}-{gcp_project}.{k_region}.run.app"
+            if gcp_project
+            else f"https://{k_service}.run.app"
+        )
+    port = int(os.environ.get("PORT", 8080))
+    return f"http://localhost:{port}"
+
+
+# ---------------------------------------------------------------------------
 # Server
 # ---------------------------------------------------------------------------
 mcp = FastMCP(
@@ -210,19 +230,16 @@ mcp = FastMCP(
         "Base64 strings consume the entire context window and get truncated. It WILL fail.\n\n"
         "## How to handle images:\n"
         "- If the user provides a URL (http/https): pass it directly to the tool.\n"
-        "- If a previous tool returned a nanobanana:// or S3 URL: pass that URL.\n"
-        "- If the user pastes or uploads an image with NO URL: call the tool with\n"
-        "  image=\"\" (empty string). The server will automatically open an upload\n"
-        "  dialog for the user to provide the image. Do NOT try to extract, encode,\n"
-        "  resize, or convert the pasted image yourself. Just call the tool immediately.\n"
-        "- The same applies to reference images: if the user pasted reference images,\n"
-        "  first call upload_image with image=\"\" for each one to get nanobanana:// URLs,\n"
-        "  then pass those URLs to generate_image's reference_images parameter.\n\n"
+        "- If a previous tool returned a nanobanana:// URL: pass that URL.\n"
+        "- If the user pastes/uploads an image with NO URL: tell them to open\n"
+        "  {upload_url}/upload in their browser, drop the image there, and paste\n"
+        "  the returned URL back into the chat. Then pass that URL to the tool.\n"
+        "  Do NOT attempt to extract, encode, or forward the image data yourself.\n\n"
         "## Tools:\n"
         "generate_image, edit_image, swap_background, create_variations, "
         "analyze_image, upload_image, list_styles.\n"
         "Default aspect ratio 4:5, resolution 1K."
-    ),
+    ).format(upload_url=_get_upload_base_url()),
     host=os.environ.get("HOST", "0.0.0.0"),
     port=int(os.environ.get("PORT", 8080)),
 )
@@ -522,94 +539,31 @@ async def _acquire_image(
     quality: int = 92,
     purpose: str = "image",
 ) -> tuple[bytes, str]:
-    """Decode an image from a string ref, with elicitation fallback.
+    """Decode an image from a string ref, or raise with upload instructions.
 
-    If the image can't be decoded (truncated base64, missing, etc.) and the client
-    supports elicitation, opens the upload page in the user's browser and waits
-    for them to upload. Returns (normalized_bytes, mime_type).
-
-    Raises ValueError with a user-friendly message if all approaches fail.
+    Returns (normalized_bytes, mime_type).
+    Raises ValueError with a user-friendly message if decoding fails.
     """
-    # First, try direct decode if we have an image string
+    # Try direct decode if we have a non-empty image string
     if image:
         try:
             raw, _ = _decode_raw(image)
             return _normalize_image(raw, max_dim=max_dim, quality=quality)
         except Exception as decode_err:
-            # If it looks like a URL or nanobanana ref, the error is real (not truncation)
+            # If it looks like a URL or nanobanana ref, the error is real
             if _is_url(image) or image.startswith("nanobanana://"):
                 raise ValueError(str(decode_err))
-            # Likely truncated base64 — fall through to elicitation
+            # Likely truncated base64 — give upload instructions
             first_error = str(decode_err)
     else:
         first_error = f"No {purpose} provided"
 
-    # Try elicitation: open the upload page in the user's browser
-    session_id = _create_upload_session()
-    try:
-        # Build upload URL — we need the server's external URL
-        # On Cloud Run, K_SERVICE is set automatically; construct URL from it
-        base_url = os.environ.get("PUBLIC_URL")
-        if not base_url:
-            k_service = os.environ.get("K_SERVICE")
-            k_region = os.environ.get("CLOUD_RUN_REGION") or os.environ.get("GOOGLE_CLOUD_REGION")
-            gcp_project = os.environ.get("GOOGLE_CLOUD_PROJECT")
-            if k_service and k_region:
-                base_url = f"https://{k_service}-{gcp_project}.{k_region}.run.app" if gcp_project else f"https://{k_service}.run.app"
-            else:
-                port = int(os.environ.get("PORT", 8080))
-                base_url = f"http://localhost:{port}"
-        upload_url = f"{base_url}/upload?session={session_id}"
-
-        result = await ctx.elicit_url(
-            message=(
-                f"I need you to upload the {purpose} directly. "
-                f"Please drop your image on the upload page that just opened. "
-                f"I'll continue automatically once you upload."
-            ),
-            url=upload_url,
-            elicitation_id=f"upload-{session_id}",
-        )
-
-        if not isinstance(result, AcceptedUrlElicitation):
-            _cleanup_session(session_id)
-            raise ValueError(
-                f"Image upload was declined. Please provide a URL to the {purpose} instead."
-            )
-
-        # Poll for the upload to complete (user needs time to find file & drag-drop)
-        img_id = None
-        for _ in range(120):  # wait up to 2 minutes
-            img_id = _poll_upload_session(session_id)
-            if img_id is not None:
-                break
-            await asyncio.sleep(1)
-
-        _cleanup_session(session_id)
-
-        if img_id is None:
-            raise ValueError(
-                "Upload timed out after 2 minutes. Please try again or provide an image URL."
-            )
-
-        # Image was already normalized during upload — return as-is
-        return _fetch_from_store(img_id)
-
-    except ValueError:
-        # Re-raise ValueErrors from our own code (declined, timed out, etc.)
-        _cleanup_session(session_id)
-        raise
-    except Exception as e:
-        _cleanup_session(session_id)
-        # If elicitation isn't supported by the client, fall back to a helpful error
-        err_name = type(e).__name__
-        if err_name in ("NotImplementedError", "McpError") or "not supported" in str(e).lower():
-            raise ValueError(
-                f"Could not decode the {purpose} ({first_error}). "
-                f"Large images can't be passed reliably through tool parameters. "
-                f"Please upload the image at {base_url}/upload and paste the URL here."
-            )
-        raise ValueError(str(e))
+    # No usable image — direct user to the upload page
+    base_url = _get_upload_base_url()
+    raise ValueError(
+        f"{first_error}. "
+        f"Please upload the image at {base_url}/upload and paste the returned URL here."
+    )
 
 
 def _to_jpeg(img_bytes: bytes) -> bytes:
@@ -846,11 +800,10 @@ async def upload_image(
     IMPORTANT: Only pass URLs (http/https or nanobanana://). NEVER pass base64 data —
     it will consume the entire context window and likely get truncated.
 
-    If the user pasted an image with no URL, call this with image="" — the server will
-    open an upload dialog for the user automatically.
+    If the user has no URL, direct them to the /upload page to get one.
 
     Args:
-        image: Image URL (http/https) or nanobanana:// URL. Leave empty to trigger upload dialog.
+        image: Image URL (http/https) or nanobanana:// URL.
 
     Returns:
         JSON with a nanobanana:// URL to use in other tools, plus image dimensions.
@@ -1020,10 +973,10 @@ async def edit_image(
     """Edit an existing image — add objects, remove objects, or extend the canvas.
 
     Pass the source image as a URL (http/https or nanobanana://). NEVER pass base64.
-    If the user pasted an image, call with image="" to trigger the upload dialog.
+    If the user has no URL, direct them to the /upload page first.
 
     Args:
-        image: Source image URL or nanobanana:// URL. Leave empty to trigger upload dialog.
+        image: Source image URL or nanobanana:// URL.
         prompt: Edit instruction. Be specific about what to change.
         reference_images: Optional list of reference image URLs (nanobanana:// or http).
             Use when the edit involves replacing or adding content based on another image
@@ -1135,10 +1088,10 @@ async def swap_background(
 
     Automatically segments the foreground and generates a new background.
     NEVER pass base64 — only URLs.
-    If the user pasted an image, call with image="" to trigger the upload dialog.
+    If the user has no URL, direct them to the /upload page first.
 
     Args:
-        image: Source image URL or nanobanana:// URL. Leave empty to trigger upload dialog.
+        image: Source image URL or nanobanana:// URL.
         background: Description of the new background. Be specific.
         aspect_ratio: Output aspect ratio. Default: same as input.
         count: Number of candidates (1–4). Default: 1
@@ -1223,10 +1176,10 @@ async def create_variations(
     Preserves the core subject while exploring different compositions, lighting,
     or styling. Pass the source image as a URL.
     NEVER pass base64 — only URLs.
-    If the user pasted an image, call with image="" to trigger the upload dialog.
+    If the user has no URL, direct them to the /upload page first.
 
     Args:
-        image: Source image URL or nanobanana:// URL. Leave empty to trigger upload dialog.
+        image: Source image URL or nanobanana:// URL.
         prompt: Optional guidance for variations.
         variation_strength: "subtle", "medium", or "strong". Default: medium
         aspect_ratio: Output aspect ratio. Default: 4:5
@@ -1339,10 +1292,10 @@ async def analyze_image(
     """Analyze an image using Gemini vision — describe, tag, or assess quality.
 
     NEVER pass base64 — only URLs.
-    If the user pasted an image, call with image="" to trigger the upload dialog.
+    If the user has no URL, direct them to the /upload page first.
 
     Args:
-        image: Image URL or nanobanana:// URL. Leave empty to trigger upload dialog.
+        image: Image URL or nanobanana:// URL.
         focus: Analysis focus: "general", "tags", "alt-text", "quality", "brand"
 
     Returns:
