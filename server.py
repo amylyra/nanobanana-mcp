@@ -184,13 +184,16 @@ mcp = FastMCP(
         "## How to handle images\n\n"
         "1. **User provides a URL (http/https):** pass it directly to any tool.\n"
         "2. **A previous tool returned a URL:** pass that URL to the next tool.\n"
-        "3. **User pastes/uploads an image (local file, no URL):**\n"
-        "   Call `upload_image` with a data URI (`data:image/png;base64,...`).\n"
-        "   It uploads to cloud storage and returns a durable URL.\n"
-        "   Use that URL in subsequent tool calls.\n\n"
-        "For all tools EXCEPT upload_image: only pass URLs, never base64.\n\n"
+        "3. **User pastes/uploads an image (no URL available):**\n"
+        "   You CANNOT extract image bytes from pasted images directly.\n"
+        "   Tell the user to upload their image(s) at:\n"
+        "   {upload_url}/upload\n"
+        "   That page returns a URL they can paste back into the chat.\n"
+        "   Then use that URL in the tool call.\n\n"
+        "IMPORTANT: Never pass non-image URLs (API endpoints, web pages, MCP URLs, etc.) "
+        "to any tool. If you don't have a real image URL, ask the user to upload first.\n\n"
         "## Tools\n"
-        "- upload_image — upload an image, get back a durable URL for other tools\n"
+        "- upload_image — convert an image URL into a durable cloud storage URL\n"
         "- generate_image — text-to-image, optional reference image URLs, style presets\n"
         "- edit_image — edit an image (inpaint, remove, outpaint), supports reference images\n"
         "- swap_background — replace background, keep foreground subject\n"
@@ -198,7 +201,7 @@ mcp = FastMCP(
         "- analyze_image — describe, tag, or assess quality of an image\n"
         "- list_styles — list available style presets\n\n"
         "Default aspect ratio 4:5, resolution 1K."
-    ),
+    ).format(upload_url=_get_upload_base_url()),
     host=os.environ.get("HOST", "0.0.0.0"),
     port=int(os.environ.get("PORT", 8080)),
 )
