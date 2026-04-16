@@ -1,115 +1,49 @@
 ---
 name: mcp-s3-companion
-description: Bridges pasted/uploaded images to NanoBanana MCP image tools via S3. Use this skill whenever a user shares, pastes, drags, or uploads an image in the conversation and then wants to edit it, swap its background, create variations, analyze it, or use it as a reference for generation — any workflow involving NanoBanana image tools and a user-provided image. Also use this if a user asks "why can't you see my image" or an image tool returns an error about missing/invalid URLs.
+description: Handles user image uploads for NanoBanana MCP image tools. Use this skill whenever a user shares, pastes, drags, or uploads an image and wants to edit it, swap its background, create variations, analyze it, or use it as a reference — any workflow involving NanoBanana tools and a user-provided image. Also trigger this if a user asks "why can't you see my image" or a tool call fails with an invalid/missing URL.
 ---
 
 # MCP S3 Companion
 
-## Why this exists
+## The situation
 
-MCP tool parameters are JSON strings with a size limit — passing large images as base64 data URIs fails. Instead, this skill uses the Analysis tool to POST image bytes directly to the NanoBanana server's `/upload` HTTP endpoint, which returns a short S3 URL. Only the URL flows back into the conversation, keeping everything well within limits.
+Claude.ai can see pasted images visually, but MCP tool parameters only accept text (URLs, strings). There is no way to pass image bytes directly into a tool call — this is a known gap in the MCP protocol with no client-side workaround. The reliable solution is the NanoBanana upload page, which accepts the image and returns a durable S3 URL.
 
 ## When you don't need this
 
-- The user already gave you an **http/https URL** — pass it straight to the tool.
-- A previous NanoBanana tool already returned a URL — reuse it, no re-upload needed.
-- The user only wants text-to-image generation with no input image.
+- User gave you an **http/https URL** → pass it directly to the tool.
+- A previous NanoBanana tool already returned a URL → reuse it.
+- User wants text-to-image with no input image.
 
-## The pipeline
+## When a user shares an image
 
-### Step 1 — Find the server URL
+Tell them immediately — don't attempt any other approach first:
 
-Look at the NanoBanana MCP server instructions — they contain the upload page URL in the form `https://.../upload`. The base URL is everything before `/upload`.
+> I can see your image! To use it with the NanoBanana tools, I need a URL for it.
+> Please upload it at: **[SERVER_URL]/upload**
+> It only takes a second — drag your image onto that page and you'll get a URL to paste back here.
 
-### Step 2 — Upload each image via HTTP
+Replace `[SERVER_URL]` with the base URL from the NanoBanana MCP server instructions (the URL that appears before `/upload` in the instructions).
 
-Claude.ai stores uploaded files at `/mnt/user-data/uploads/`. Use the code execution tool (Analysis) to POST each image directly to the server's `/upload` endpoint. Run this as a **single code block**:
+**For multiple images:** ask the user to upload each one and collect all the URLs before proceeding.
 
-```python
-import os, requests
-from io import BytesIO
+## After the user pastes the URL(s)
 
-SERVER_URL = "https://REPLACE-WITH-SERVER-URL-FROM-MCP-INSTRUCTIONS"
-UPLOAD_URL = f"{SERVER_URL}/upload"
+Use the S3 URL(s) with whichever tool fits the request:
 
-uploads = "/mnt/user-data/uploads"
-image_exts = (".png", ".jpg", ".jpeg", ".webp", ".gif")
-
-if not os.path.isdir(uploads):
-    print("ERROR: uploads directory not found — see fallback instructions below")
-else:
-    files = sorted(
-        [f for f in os.listdir(uploads) if f.lower().endswith(image_exts)],
-        key=lambda f: os.path.getmtime(os.path.join(uploads, f)),
-        reverse=True,
-    )
-
-    def upload_file(filepath):
-        """Optionally compress, then POST raw bytes to /upload. Returns S3 URL."""
-        with open(filepath, "rb") as f:
-            raw = f.read()
-
-        # Compress if PIL is available and image is large
-        try:
-            from PIL import Image
-            img = Image.open(BytesIO(raw))
-            w, h = img.size
-            if max(w, h) > 1536:
-                scale = 1536 / max(w, h)
-                img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-            has_alpha = img.mode in ("RGBA", "LA", "PA") or "transparency" in img.info
-            buf = BytesIO()
-            if has_alpha:
-                img.convert("RGBA").save(buf, format="PNG", optimize=True)
-            else:
-                img.convert("RGB").save(buf, format="JPEG", quality=85)
-            raw = buf.getvalue()
-        except Exception:
-            pass  # send as-is if PIL unavailable or fails
-
-        resp = requests.post(UPLOAD_URL, data=raw, timeout=30)
-        resp.raise_for_status()
-        url = resp.json()["url"]
-        print(f"  {os.path.basename(filepath)} -> {url}")
-        return url
-
-    if not files:
-        print("No image files found — see fallback instructions below")
-    else:
-        s3_urls = []
-        for fname in files:
-            url = upload_file(os.path.join(uploads, fname))
-            s3_urls.append(url)
-
-        print(f"\n{len(s3_urls)} image(s) uploaded.")
-        for i, url in enumerate(s3_urls):
-            print(f"  [{i}] {files[i]}: {url}")
-```
-
-### Step 3 — Use the S3 URLs
-
-The Analysis output contains the S3 URLs. Pass them to whichever NanoBanana tool the user asked for:
-
-| Tool | What it does | Which URL goes where |
+| Tool | What it does | Key params |
 |---|---|---|
-| `edit_image` | Inpaint, remove objects, outpaint | `image` = source to edit; `reference_images` = optional guides |
-| `swap_background` | Keep subject, replace background | `image` = source; describe new background in prompt |
+| `edit_image` | Inpaint, remove objects, outpaint | `image` = source; `prompt` = what to change |
+| `swap_background` | Keep subject, replace background | `image` = source; `prompt` = new background description |
 | `create_variations` | Style/composition variations | `image` = source |
 | `analyze_image` | Describe, tag, assess quality | `image` = source |
-| `generate_image` | Text-to-image with references | `reference_images` = style/subject guides |
+| `generate_image` | Text-to-image with style/subject guidance | `reference_images` = list of URLs |
 
-Default aspect ratio is 4:5, default resolution is 1K.
+Default aspect ratio 4:5, resolution 1K.
 
-### Fallback — if the sandbox can't reach the server
+## What not to do
 
-If `requests.post` fails with a connection error, the Analysis sandbox doesn't have outbound network access. Tell the user:
-
-> The sandbox can't reach the server directly. Please upload your image at:
-> **[upload page URL from server instructions]**
-> That page returns an S3 URL — paste it back here and I'll continue.
-
-## Common failure modes
-
-- **Fabricated URLs** — never invent S3 or GCS paths. If you don't have a URL from an actual upload, you don't have a URL.
-- **Wrong SERVER_URL** — replace the placeholder with the actual URL from the MCP server instructions before running the code.
-- **Passing non-image URLs** (API endpoints, web pages, MCP service URLs) to image parameters will fail.
+- Don't try to read the image from the Analysis sandbox and POST it to the server — the sandbox network is blocked and this doesn't work reliably.
+- Don't try to pass a base64 data URI as a tool parameter — too large, will fail.
+- Don't fabricate or guess S3/GCS URLs.
+- Don't pass non-image URLs (API endpoints, web pages, MCP service URLs) to image parameters.
