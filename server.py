@@ -251,7 +251,7 @@ mcp = FastMCP(
 # HTTP endpoints — direct image upload/serving (outside MCP protocol)
 # ---------------------------------------------------------------------------
 _UPLOAD_HTML = """<!DOCTYPE html>
-<html><head><title>NanoBanana — Upload Image</title>
+<html><head><title>NanoBanana — Upload Images</title>
 <style>
   body { font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; }
   h1 { font-size: 1.4em; }
@@ -259,68 +259,75 @@ _UPLOAD_HTML = """<!DOCTYPE html>
     cursor: pointer; transition: border-color 0.2s; margin: 20px 0; }
   .drop-zone:hover, .drop-zone.drag-over { border-color: #f5a623; background: #fffbf0; }
   input[type="file"] { display: none; }
-  #result { margin-top: 20px; padding: 12px; background: #f0f0f0; border-radius: 6px;
-    word-break: break-all; display: none; }
-  #result.success { background: #e8f5e9; }
-  #result.error { background: #fce4ec; }
-  code { background: #e8e8e8; padding: 2px 6px; border-radius: 3px; font-size: 0.9em; }
+  #urls { margin-top: 20px; }
+  .url-row { display: flex; align-items: center; gap: 8px; margin: 8px 0; padding: 10px;
+    background: #e8f5e9; border-radius: 6px; word-break: break-all; }
+  .url-row code { flex: 1; background: #d0e8d0; padding: 4px 8px; border-radius: 3px; font-size: 0.85em; }
+  .url-row button { flex-shrink: 0; padding: 4px 10px; border: none; background: #4caf50;
+    color: white; border-radius: 4px; cursor: pointer; font-size: 0.85em; }
+  .url-row button:hover { background: #388e3c; }
+  #copyAll { display: none; margin-top: 12px; padding: 8px 16px; border: none; background: #f5a623;
+    color: white; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 0.95em; }
+  #copyAll:hover { background: #e09500; }
+  .error { margin: 8px 0; padding: 10px; background: #fce4ec; border-radius: 6px; }
 </style></head>
 <body>
-  <h1>NanoBanana — Upload Image</h1>
-  <p id="instructions">Upload an image to get a URL you can paste into Claude.</p>
+  <h1>NanoBanana — Upload Images</h1>
+  <p>Drop one or more images to get URLs you can paste into Claude.</p>
   <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
-    Drop an image here or click to browse
+    Drop images here or click to browse
   </div>
-  <input type="file" id="fileInput" accept="image/*">
-  <div id="result"></div>
+  <input type="file" id="fileInput" accept="image/*" multiple>
+  <div id="urls"></div>
+  <button id="copyAll">Copy all URLs</button>
   <script>
     const dropZone = document.getElementById('dropZone');
     const fileInput = document.getElementById('fileInput');
-    const result = document.getElementById('result');
+    const urlsDiv = document.getElementById('urls');
+    const copyAllBtn = document.getElementById('copyAll');
+    const allUrls = [];
 
     dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
     dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
     dropZone.addEventListener('drop', e => {
       e.preventDefault(); dropZone.classList.remove('drag-over');
-      if (e.dataTransfer.files.length) upload(e.dataTransfer.files[0]);
+      uploadAll(e.dataTransfer.files);
     });
-    fileInput.addEventListener('change', () => { if (fileInput.files.length) upload(fileInput.files[0]); });
+    fileInput.addEventListener('change', () => { uploadAll(fileInput.files); fileInput.value = ''; });
 
-    async function upload(file) {
-      dropZone.textContent = 'Uploading...';
-      result.style.display = 'none';
-      const form = new FormData();
-      form.append('file', file);
-      // Forward session param if present (for elicitation-triggered uploads)
-      const params = new URLSearchParams(window.location.search);
-      const session = params.get('session');
-      const uploadUrl = session ? '/upload?session=' + session : '/upload';
-      if (session) {
-        document.getElementById('instructions').textContent =
-          'Drop your image here — the tool waiting in Claude will pick it up automatically.';
-      }
-      try {
-        const resp = await fetch(uploadUrl, { method: 'POST', body: form });
-        const data = await resp.json();
-        if (data.error) throw new Error(data.error);
-        result.className = 'success';
-        if (session) {
-          result.innerHTML = '<strong>Image received!</strong> You can close this tab — ' +
-            'the tool in Claude will continue automatically.';
-        } else {
-          result.innerHTML = '<strong>Image URL (paste this into Claude):</strong><br><br>' +
-            '<code>' + data.url + '</code>';
-          navigator.clipboard.writeText(data.url).catch(() => {});
-        }
-        result.style.display = 'block';
-        dropZone.textContent = 'Upload another image';
-      } catch (err) {
-        result.className = 'error';
-        result.textContent = 'Upload failed: ' + err.message;
-        result.style.display = 'block';
-        dropZone.textContent = 'Drop an image here or click to browse';
+    function uploadAll(files) {
+      for (const file of files) {
+        if (file.type.startsWith('image/')) upload(file);
       }
     }
+
+    async function upload(file) {
+      const row = document.createElement('div');
+      row.className = 'url-row';
+      row.innerHTML = '<code>Uploading ' + file.name + '...</code>';
+      urlsDiv.appendChild(row);
+      const form = new FormData();
+      form.append('file', file);
+      try {
+        const resp = await fetch('/upload', { method: 'POST', body: form });
+        const data = await resp.json();
+        if (data.error) throw new Error(data.error);
+        allUrls.push(data.url);
+        row.innerHTML = '<code>' + data.url + '</code>' +
+          '<button onclick="navigator.clipboard.writeText(\\'' + data.url + '\\')">Copy</button>';
+        copyAllBtn.style.display = allUrls.length > 1 ? 'inline-block' : 'none';
+        if (allUrls.length === 1) navigator.clipboard.writeText(data.url).catch(() => {});
+      } catch (err) {
+        row.className = 'error';
+        row.textContent = file.name + ': ' + err.message;
+      }
+    }
+
+    copyAllBtn.addEventListener('click', () => {
+      navigator.clipboard.writeText(allUrls.join('\\n')).catch(() => {});
+      copyAllBtn.textContent = 'Copied!';
+      setTimeout(() => { copyAllBtn.textContent = 'Copy all URLs'; }, 1500);
+    });
   </script>
 </body></html>"""
 
@@ -549,8 +556,8 @@ async def _acquire_image(
     # Try direct decode if we have a non-empty image string
     if image:
         try:
-            raw, _ = _decode_raw(image)
-            return _normalize_image(raw, max_dim=max_dim, quality=quality)
+            raw, _ = await _run_in_thread(_decode_raw, image)
+            return await _run_in_thread(_normalize_image, raw, max_dim=max_dim, quality=quality)
         except Exception as decode_err:
             # If it looks like a URL or nanobanana ref, the error is real
             if _is_url(image) or image.startswith("nanobanana://"):
@@ -593,6 +600,52 @@ def _extract_image(response) -> bytes | None:
             if part.inline_data and part.inline_data.mime_type.startswith("image/"):
                 return part.inline_data.data
     return None
+
+
+# ---------------------------------------------------------------------------
+# Helpers — async wrappers for blocking operations
+# ---------------------------------------------------------------------------
+async def _call_gemini(client, **kwargs):
+    """Run a Gemini API call in a thread so it doesn't block the event loop.
+
+    This is critical on Cloud Run: blocking the event loop for 10-30s during
+    image generation causes health check failures and dropped MCP connections.
+    """
+    return await asyncio.to_thread(client.models.generate_content, **kwargs)
+
+
+async def _run_in_thread(fn, *args, **kwargs):
+    """Run any blocking function (PIL, HTTP fetch, cloud upload) in a thread."""
+    import functools
+    call = functools.partial(fn, *args, **kwargs)
+    return await asyncio.get_event_loop().run_in_executor(None, call)
+
+
+def _generate_loop(client, model, parts, config, count, label, qa_prompt=None):
+    """Synchronous generation loop — meant to be called via _run_in_thread.
+
+    Runs count Gemini calls, extracts images, converts to JPEG, optionally scores.
+    Returns (generated, errors) where generated is [(jpeg_bytes, meta_dict), ...].
+    """
+    generated = []
+    errors = []
+    for i in range(count):
+        try:
+            response = client.models.generate_content(
+                model=model, contents=parts, config=config,
+            )
+            img_bytes = _extract_image(response)
+            if img_bytes:
+                jpeg_bytes = _to_jpeg(img_bytes)
+                meta = {"index": i + 1}
+                if qa_prompt:
+                    meta["qa"] = _score_image(client, jpeg_bytes, qa_prompt)
+                generated.append((jpeg_bytes, meta))
+            else:
+                errors.append(f"{label} {i + 1}: no image in response")
+        except Exception as e:
+            errors.append(f"{label} {i + 1}: {e}")
+    return generated, errors
 
 
 def _build_ref_parts(reference_images: list | None) -> list:
@@ -892,46 +945,31 @@ async def generate_image(
         final_prompt = STYLE_PRESETS[style] + final_prompt
     if enhance_prompt:
         try:
-            final_prompt = _enhance_prompt(client, final_prompt)
+            final_prompt = await _run_in_thread(_enhance_prompt, client, final_prompt)
         except Exception as e:
             return json.dumps({"error": f"Prompt enhancement failed: {e}"})
 
-    # Build content parts (run in thread pool to avoid blocking on HTTP fetches)
+    # Build content parts (in thread — may involve HTTP fetches for reference images)
     try:
-        loop = asyncio.get_event_loop()
-        parts = await loop.run_in_executor(None, _build_ref_parts, reference_images)
+        parts = await _run_in_thread(_build_ref_parts, reference_images)
     except Exception as e:
         return json.dumps({"error": f"Failed to process reference image: {e}"})
     parts.append(types.Part.from_text(text=final_prompt))
 
     model_name = _pick_model(quality)
-    generated = []  # (jpeg_bytes, metadata_dict)
-    errors = []
+    config = types.GenerateContentConfig(
+        response_modalities=["IMAGE", "TEXT"],
+        image_config=types.ImageConfig(
+            aspect_ratio=aspect_ratio,
+            image_size=resolution,
+        ),
+    )
 
-    for i in range(count):
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=parts,
-                config=types.GenerateContentConfig(
-                    response_modalities=["IMAGE", "TEXT"],
-                    image_config=types.ImageConfig(
-                        aspect_ratio=aspect_ratio,
-                        image_size=resolution,
-                    ),
-                ),
-            )
-            img_bytes = _extract_image(response)
-            if img_bytes:
-                jpeg_bytes = _to_jpeg(img_bytes)
-                meta = {"index": i + 1}
-                if qa:
-                    meta["qa"] = _score_image(client, jpeg_bytes, final_prompt)
-                generated.append((jpeg_bytes, meta))
-            else:
-                errors.append(f"Image {i + 1}: no image in response")
-        except Exception as e:
-            errors.append(f"Image {i + 1}: {e}")
+    # Run all Gemini calls in a thread to keep the event loop responsive
+    generated, errors = await _run_in_thread(
+        _generate_loop, client, model_name, parts, config,
+        count, "Image", qa_prompt=final_prompt if qa else None,
+    )
 
     if not generated:
         return json.dumps({"error": "All generation attempts failed.", "details": errors})
@@ -957,7 +995,7 @@ async def generate_image(
     if errors:
         result["errors"] = errors
 
-    return _build_image_response(result, generated, output, prefix="gen")
+    return await _run_in_thread(_build_image_response, result, generated, output, prefix="gen")
 
 
 @mcp.tool()
@@ -1028,7 +1066,7 @@ async def edit_image(
 
     if reference_images:
         try:
-            ref_parts = _build_ref_parts(reference_images)
+            ref_parts = await _run_in_thread(_build_ref_parts, reference_images)
             parts.extend(ref_parts)
             edit_prompt += (
                 " Use the provided reference image(s) to guide what the result should look like."
@@ -1038,7 +1076,7 @@ async def edit_image(
 
     if mask:
         try:
-            mask_bytes, mask_mime = _decode_mask(mask)
+            mask_bytes, mask_mime = await _run_in_thread(_decode_mask, mask)
             parts.append(types.Part.from_bytes(data=mask_bytes, mime_type=mask_mime))
             edit_prompt += " Use the provided mask: white areas should be edited, black areas preserved."
         except Exception as e:
@@ -1046,25 +1084,10 @@ async def edit_image(
 
     parts.append(types.Part.from_text(text=edit_prompt))
 
-    generated = []
-    errors = []
-    for i in range(count):
-        try:
-            response = client.models.generate_content(
-                model=MODEL_FLASH,
-                contents=parts,
-                config=types.GenerateContentConfig(
-                    response_modalities=["IMAGE", "TEXT"],
-                ),
-            )
-            raw = _extract_image(response)
-            if raw:
-                jpeg_bytes = _to_jpeg(raw)
-                generated.append((jpeg_bytes, {"index": i + 1}))
-            else:
-                errors.append(f"Edit {i + 1}: no image in response")
-        except Exception as e:
-            errors.append(f"Edit {i + 1}: {e}")
+    config = types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"])
+    generated, errors = await _run_in_thread(
+        _generate_loop, client, MODEL_FLASH, parts, config, count, "Edit",
+    )
 
     if not generated:
         return json.dumps({"error": "Edit produced no output images.", "details": errors})
@@ -1074,7 +1097,7 @@ async def edit_image(
         result["reference_count"] = len(reference_images)
     if errors:
         result["errors"] = errors
-    return _build_image_response(result, generated, output, prefix="edit")
+    return await _run_in_thread(_build_image_response, result, generated, output, prefix="edit")
 
 
 @mcp.tool()
@@ -1131,25 +1154,10 @@ async def swap_background(
         types.Part.from_text(text=swap_prompt),
     ]
 
-    generated = []
-    errors = []
-    for i in range(count):
-        try:
-            response = client.models.generate_content(
-                model=MODEL_FLASH,
-                contents=parts,
-                config=types.GenerateContentConfig(
-                    response_modalities=["IMAGE", "TEXT"],
-                ),
-            )
-            raw = _extract_image(response)
-            if raw:
-                jpeg_bytes = _to_jpeg(raw)
-                generated.append((jpeg_bytes, {"index": i + 1}))
-            else:
-                errors.append(f"Swap {i + 1}: no image in response")
-        except Exception as e:
-            errors.append(f"Swap {i + 1}: {e}")
+    config = types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"])
+    generated, errors = await _run_in_thread(
+        _generate_loop, client, MODEL_FLASH, parts, config, count, "Swap"
+    )
 
     if not generated:
         return json.dumps({"error": "Background swap produced no output images.", "details": errors})
@@ -1157,7 +1165,7 @@ async def swap_background(
     result = {"background": background}
     if errors:
         result["errors"] = errors
-    return _build_image_response(result, generated, output, prefix="bgswap")
+    return await _run_in_thread(_build_image_response, result, generated, output, prefix="bgswap")
 
 
 @mcp.tool()
@@ -1235,33 +1243,17 @@ async def create_variations(
     ]
 
     model_name = _pick_model(quality)
-    generated = []
-    errors = []
-
-    for i in range(count):
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=parts,
-                config=types.GenerateContentConfig(
-                    response_modalities=["IMAGE", "TEXT"],
-                    image_config=types.ImageConfig(
-                        aspect_ratio=aspect_ratio,
-                        image_size=resolution,
-                    ),
-                ),
-            )
-            raw = _extract_image(response)
-            if raw:
-                jpeg_bytes = _to_jpeg(raw)
-                meta = {"index": i + 1}
-                if qa:
-                    meta["qa"] = _score_image(client, jpeg_bytes, variation_prompt)
-                generated.append((jpeg_bytes, meta))
-            else:
-                errors.append(f"Variation {i + 1}: no image in response")
-        except Exception as e:
-            errors.append(f"Variation {i + 1}: {e}")
+    config = types.GenerateContentConfig(
+        response_modalities=["IMAGE", "TEXT"],
+        image_config=types.ImageConfig(
+            aspect_ratio=aspect_ratio,
+            image_size=resolution,
+        ),
+    )
+    generated, errors = await _run_in_thread(
+        _generate_loop, client, model_name, parts, config, count, "Variation",
+        qa_prompt=variation_prompt if qa else None,
+    )
 
     if not generated:
         return json.dumps({"error": "All variation attempts failed.", "details": errors})
@@ -1282,7 +1274,7 @@ async def create_variations(
     if prompt:
         result["guidance"] = prompt
 
-    return _build_image_response(result, generated, output, prefix="var")
+    return await _run_in_thread(_build_image_response, result, generated, output, prefix="var")
 
 
 @mcp.tool()
@@ -1361,7 +1353,8 @@ async def analyze_image(
         return json.dumps({"error": str(e)})
 
     try:
-        resp = client.models.generate_content(
+        resp = await _call_gemini(
+            client,
             model=MODEL_TEXT,
             contents=[
                 types.Part.from_bytes(data=img_bytes, mime_type=img_mime),
