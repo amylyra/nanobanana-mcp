@@ -21,11 +21,14 @@ import asyncio
 import base64
 import json
 import os
+import sys
 import threading
 import time
 import uuid
 from io import BytesIO
 from urllib.parse import urlparse
+
+log = sys.stderr.write
 
 # Load .env file if python-dotenv is installed (optional convenience)
 try:
@@ -110,54 +113,6 @@ def _gc_store():
         for k in expired:
             del _IMAGE_STORE[k]
 
-
-# ---------------------------------------------------------------------------
-# Session-based upload tracking — links elicitation sessions to uploaded images
-# ---------------------------------------------------------------------------
-_UPLOAD_SESSIONS: dict[str, str | None] = {}  # session_id -> image_id or None (pending)
-_SESSION_LOCK = threading.Lock()
-_SESSION_TTL = 300  # 5 min — user has this long to complete the upload
-
-
-def _create_upload_session() -> str:
-    """Create a pending upload session and return its ID."""
-    _gc_sessions()
-    session_id = uuid.uuid4().hex  # 128-bit — not guessable
-    with _SESSION_LOCK:
-        _UPLOAD_SESSIONS[session_id] = (None, time.time())  # (image_id, created_at)
-    return session_id
-
-
-def _complete_upload_session(session_id: str, img_id: str) -> None:
-    """Mark a session as complete with the uploaded image ID."""
-    with _SESSION_LOCK:
-        entry = _UPLOAD_SESSIONS.get(session_id)
-        if entry is not None:
-            _UPLOAD_SESSIONS[session_id] = (img_id, entry[1])
-
-
-def _poll_upload_session(session_id: str) -> str | None:
-    """Check if a session has a completed upload. Returns image_id or None."""
-    with _SESSION_LOCK:
-        entry = _UPLOAD_SESSIONS.get(session_id)
-        if entry is None:
-            return None
-        return entry[0]
-
-
-def _cleanup_session(session_id: str) -> None:
-    """Remove a completed or expired session."""
-    with _SESSION_LOCK:
-        _UPLOAD_SESSIONS.pop(session_id, None)
-
-
-def _gc_sessions():
-    """Remove expired upload sessions."""
-    now = time.time()
-    with _SESSION_LOCK:
-        expired = [k for k, (_, ts) in _UPLOAD_SESSIONS.items() if now - ts > _SESSION_TTL]
-        for k in expired:
-            del _UPLOAD_SESSIONS[k]
 
 # ---------------------------------------------------------------------------
 # Style presets — tuned prompt prefixes
@@ -359,7 +314,7 @@ async def http_upload(request: Request) -> Response:
             return JSONResponse({"error": "Empty request body"}, status_code=400)
 
     try:
-        normalized, mime = _normalize_image(raw, max_dim=SOURCE_MAX_DIM, quality=92)
+        normalized, mime = await _run_in_thread(_normalize_image, raw, max_dim=SOURCE_MAX_DIM, quality=92)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
@@ -369,7 +324,7 @@ async def http_upload(request: Request) -> Response:
     # Prefer cloud storage (durable URLs); fall back to in-memory store
     if S3_BUCKET or GCS_BUCKET:
         try:
-            image_url = _upload_to_cloud(normalized, prefix="uploads")
+            image_url = await _run_in_thread(_upload_to_cloud, normalized, "uploads")
             return JSONResponse({
                 "url": image_url,
                 "width": w,
@@ -381,11 +336,6 @@ async def http_upload(request: Request) -> Response:
             log(f"Cloud upload failed, falling back to in-memory store: {e}\n")
 
     img_id = _store_image(normalized, mime)
-
-    # Link to upload session if present
-    session_id = request.query_params.get("session")
-    if session_id:
-        _complete_upload_session(session_id, img_id)
 
     scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
     host = request.headers.get("host", request.url.netloc)
@@ -485,14 +435,14 @@ def _normalize_image(img_bytes: bytes, max_dim: int, quality: int = 85,
     except Exception:
         raise ValueError(
             "Could not decode image data. The image may have been truncated in transit. "
-            "Try uploading via the /upload page or passing an image URL."
+            "Try using upload_image with a smaller image or passing an image URL."
         )
 
     w, h = img.size
     if w < 1 or h < 1:
         raise ValueError(
             "Image has invalid dimensions. The data may be corrupted or truncated. "
-            "Try uploading via the /upload page or passing an image URL."
+            "Try using upload_image with a different image or passing an image URL."
         )
 
     if output_format == "JPEG":
@@ -1419,9 +1369,6 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     transport = os.environ.get("MCP_TRANSPORT", "streamable-http")
-
-    # In stdio mode, stdout is the MCP protocol channel — all logging must go to stderr
-    log = sys.stderr.write
 
     if transport == "streamable-http":
         log(f"Starting NanoBanana MCP server on {mcp.settings.host}:{mcp.settings.port}\n")

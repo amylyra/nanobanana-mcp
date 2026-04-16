@@ -768,37 +768,7 @@ class TestListStyles:
 
 
 # ---------------------------------------------------------------------------
-# 13. Upload sessions (elicitation flow)
-# ---------------------------------------------------------------------------
-
-class TestUploadSessions:
-    def setup_method(self):
-        with server._SESSION_LOCK:
-            server._UPLOAD_SESSIONS.clear()
-
-    def test_create_and_poll(self):
-        sid = server._create_upload_session()
-        assert server._poll_upload_session(sid) is None
-        server._complete_upload_session(sid, "img123")
-        assert server._poll_upload_session(sid) == "img123"
-
-    def test_cleanup(self):
-        sid = server._create_upload_session()
-        server._cleanup_session(sid)
-        assert server._poll_upload_session(sid) is None
-
-    def test_gc_sessions(self):
-        sid = server._create_upload_session()
-        # Backdate
-        with server._SESSION_LOCK:
-            entry = server._UPLOAD_SESSIONS[sid]
-            server._UPLOAD_SESSIONS[sid] = (entry[0], time.time() - server._SESSION_TTL - 10)
-        server._gc_sessions()
-        assert server._poll_upload_session(sid) is None
-
-
-# ---------------------------------------------------------------------------
-# 14. _is_url helper
+# 13. _is_url helper
 # ---------------------------------------------------------------------------
 
 class TestIsUrl:
