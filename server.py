@@ -242,7 +242,7 @@ mcp = FastMCP(
         "- analyze_image — describe, tag, or assess quality of an image\n"
         "- list_styles — list available style presets\n\n"
         "Default aspect ratio 4:5, resolution 1K."
-    ).format(upload_url=_get_upload_base_url()),
+    ),
     host=os.environ.get("HOST", "0.0.0.0"),
     port=int(os.environ.get("PORT", 8080)),
 )
@@ -581,11 +581,9 @@ async def _acquire_image(
     else:
         first_error = f"No {purpose} provided"
 
-    # No usable image — direct user to the upload page
-    base_url = _get_upload_base_url()
     raise ValueError(
         f"{first_error}. "
-        f"Please upload the image at {base_url}/upload and paste the returned URL here."
+        "Use the upload_image tool to upload the image first, then pass the returned URL here."
     )
 
 
@@ -673,7 +671,7 @@ def _build_ref_parts(reference_images: list | None) -> list:
             raise ValueError(
                 f"Reference image {i + 1} is empty. "
                 "Upload each reference image first using upload_image to get a "
-                "nanobanana:// URL, then pass those URLs here."
+                "URL, then pass those URLs here."
             )
         img_bytes, mime = _decode_reference(ref)
         parts.append(types.Part.from_bytes(data=img_bytes, mime_type=mime))
@@ -926,11 +924,11 @@ async def generate_image(
     """Generate an image from a text prompt with optional reference images and style presets.
 
     Reference images guide the model on style, subject appearance, or composition.
-    ONLY pass URLs — never base64.
+    Only pass URLs — use upload_image first if needed.
 
     Args:
         prompt: What to generate. Describe subject, style, lighting, mood, etc.
-        reference_images: Optional list of image URLs (http/https or nanobanana://). NEVER base64.
+        reference_images: Optional list of image URLs. Use upload_image first if needed.
         style: Optional style preset. Available: cinematic, product-photography,
                editorial, watercolor, flat-illustration, neon-noir, minimalist, vintage-film.
         enhance_prompt: If true, AI expands your prompt into a detailed generation prompt.
@@ -939,7 +937,7 @@ async def generate_image(
         quality: "default" (fast) or "pro" (higher quality). Default: default
         count: Number of images to generate (1–4). Default: 1
         qa: If true, AI-score each image. When count > 1, ranks by total score.
-        output: "base64" returns inline images (default). "cloud"/"s3"/"gcs" uploads to cloud storage and returns URLs.
+        output: "cloud"/"s3"/"gcs" uploads to cloud storage and returns URLs (default when configured). "base64" returns inline images.
 
     Returns:
         Metadata JSON + inline images (base64 mode) or metadata with URLs (cloud mode).
@@ -1037,13 +1035,12 @@ async def edit_image(
 ) -> list | str:
     """Edit an existing image — add objects, remove objects, or extend the canvas.
 
-    Pass the source image as a URL (http/https or nanobanana://). NEVER pass base64.
-    If the user has no URL, direct them to the /upload page first.
+    Only pass URLs — use upload_image first if needed.
 
     Args:
-        image: Source image URL or nanobanana:// URL.
+        image: Source image URL. Use upload_image first if needed.
         prompt: Edit instruction. Be specific about what to change.
-        reference_images: Optional list of reference image URLs (nanobanana:// or http).
+        reference_images: Optional list of reference image URLs.
             Use when the edit involves replacing or adding content based on another image
             (e.g. "replace bottle A with bottle B" — pass bottle B as a reference).
         mask: Optional mask image (URL). White = edit region, black = preserve.
@@ -1051,7 +1048,7 @@ async def edit_image(
                    "outpaint" (extend canvas). Default: inpaint-insertion
         aspect_ratio: Output aspect ratio (useful for outpaint). Default: same as input.
         count: Number of candidates (1–4). Default: 1
-        output: "base64" (default), "s3", "gcs", or "cloud".
+        output: "cloud"/"s3"/"gcs" (default when storage configured), or "base64".
 
     Returns:
         Metadata JSON + inline images (base64 mode) or metadata with URLs (gcs mode).
@@ -1137,15 +1134,14 @@ async def swap_background(
     """Replace the background of an image while keeping the foreground subject intact.
 
     Automatically segments the foreground and generates a new background.
-    NEVER pass base64 — only URLs.
-    If the user has no URL, direct them to the /upload page first.
+    Only pass URLs — use upload_image first if needed.
 
     Args:
-        image: Source image URL or nanobanana:// URL.
+        image: Source image URL. Use upload_image first if needed.
         background: Description of the new background. Be specific.
         aspect_ratio: Output aspect ratio. Default: same as input.
         count: Number of candidates (1–4). Default: 1
-        output: "base64" (default), "s3", "gcs", or "cloud".
+        output: "cloud"/"s3"/"gcs" (default when storage configured), or "base64".
 
     Returns:
         Metadata JSON + inline images (base64 mode) or metadata with URLs (gcs mode).
@@ -1209,12 +1205,10 @@ async def create_variations(
     """Generate variations of an existing image.
 
     Preserves the core subject while exploring different compositions, lighting,
-    or styling. Pass the source image as a URL.
-    NEVER pass base64 — only URLs.
-    If the user has no URL, direct them to the /upload page first.
+    or styling. Only pass URLs — use upload_image first if needed.
 
     Args:
-        image: Source image URL or nanobanana:// URL.
+        image: Source image URL. Use upload_image first if needed.
         prompt: Optional guidance for variations.
         variation_strength: "subtle", "medium", or "strong". Default: medium
         aspect_ratio: Output aspect ratio. Default: 4:5
@@ -1222,7 +1216,7 @@ async def create_variations(
         quality: "default" or "pro". Default: default
         count: Number of variations (1–4). Default: 3
         qa: Score each variation and rank by quality. Default: false
-        output: "base64" (default), "s3", "gcs", or "cloud".
+        output: "cloud"/"s3"/"gcs" (default when storage configured), or "base64".
 
     Returns:
         Metadata JSON + inline images (base64 mode) or metadata with URLs (gcs mode).
@@ -1310,11 +1304,10 @@ async def analyze_image(
 ) -> str:
     """Analyze an image using Gemini vision — describe, tag, or assess quality.
 
-    NEVER pass base64 — only URLs.
-    If the user has no URL, direct them to the /upload page first.
+    Only pass URLs — use upload_image first if needed.
 
     Args:
-        image: Image URL or nanobanana:// URL.
+        image: Image URL. Use upload_image first if needed.
         focus: Analysis focus: "general", "tags", "alt-text", "quality", "brand"
 
     Returns:
@@ -1435,10 +1428,12 @@ if __name__ == "__main__":
         log(f"  Upload page: http://localhost:{mcp.settings.port}/upload\n")
     else:
         log(f"Starting NanoBanana MCP server ({transport} transport)\n")
+    if S3_BUCKET:
+        log(f"  S3 storage: s3://{S3_BUCKET} (region: {S3_REGION})\n")
     if GCS_BUCKET:
-        log(f"  GCS output enabled: gs://{GCS_BUCKET}\n")
-    else:
-        log("  GCS output disabled (set GCS_BUCKET to enable)\n")
-    log("\n")
+        log(f"  GCS storage: gs://{GCS_BUCKET}\n")
+    if not S3_BUCKET and not GCS_BUCKET:
+        log("  No cloud storage configured (set S3_BUCKET or GCS_BUCKET to enable)\n")
+    log(f"  Default output mode: {DEFAULT_OUTPUT}\n\n")
 
     mcp.run(transport=transport)

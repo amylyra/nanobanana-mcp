@@ -875,7 +875,7 @@ class TestEmptyImageUploadInstructions:
         result = await server.upload_image(ctx=mock_ctx, image="")
         data = json.loads(result)
         assert "error" in data
-        assert "/upload" in data["error"]
+        assert "upload_image" in data["error"]
 
     @pytest.mark.asyncio
     async def test_edit_image_empty_returns_upload_url(self):
@@ -886,7 +886,7 @@ class TestEmptyImageUploadInstructions:
             result = await server.edit_image(prompt="add a hat", ctx=mock_ctx, image="")
         data = json.loads(result)
         assert "error" in data
-        assert "/upload" in data["error"]
+        assert "upload_image" in data["error"]
 
     @pytest.mark.asyncio
     async def test_analyze_image_empty_returns_upload_url(self):
@@ -897,14 +897,14 @@ class TestEmptyImageUploadInstructions:
             result = await server.analyze_image(ctx=mock_ctx, image="", focus="general")
         data = json.loads(result)
         assert "error" in data
-        assert "/upload" in data["error"]
+        assert "upload_image" in data["error"]
 
     @pytest.mark.asyncio
     async def test_acquire_image_empty_does_not_elicit(self):
         """_acquire_image with empty string raises ValueError immediately,
         no elicitation attempt that could crash the connection."""
         mock_ctx = MagicMock()
-        with pytest.raises(ValueError, match="/upload"):
+        with pytest.raises(ValueError, match="upload_image"):
             await server._acquire_image("", mock_ctx, purpose="test image")
 
 
