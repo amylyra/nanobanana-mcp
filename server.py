@@ -185,8 +185,9 @@ mcp = FastMCP(
         "MCP tool parameters are text-only. Every image needs a URL.\n\n"
         "1. **Direct URL (http/https, S3, CDN)** → pass straight to the tool.\n"
         "2. **Public Google Drive link** → the server rewrites it automatically, just pass it.\n"
-        "3. **Private Google Drive file** → use the Google Drive MCP to read it, "
-        "construct `data:image/jpeg;base64,<blob>`, pass to upload_image to get an S3 URL.\n"
+        "3. **Private Google Drive file** → use the Google Drive MCP to read it; "
+        "it returns a base64 blob and a MIME type. Construct `data:<mime_type>;base64,<blob>` "
+        "and pass that to upload_image to get an S3 URL.\n"
         "4. **Pasted image (no URL)** → pasted images are vision-only with no extractable bytes, "
         "regardless of size. Direct user to {upload_url}/upload immediately — "
         "they drag the image there and paste the returned URL back.\n\n"
@@ -426,10 +427,16 @@ def _fetch_url(url: str) -> tuple[bytes, str]:
         resp = httpx.get(url, follow_redirects=True, timeout=30)
         resp.raise_for_status()
     except httpx.HTTPStatusError as e:
-        if e.response.status_code in (403, 404):
+        if e.response.status_code == 403:
+            hint = (
+                " If this is a Google Drive link, the file may not be publicly shared — "
+                "either share it with 'Anyone with the link' or upload it at the /upload page."
+            ) if "drive.google.com" in url else " The server was denied access to this URL."
+            raise ValueError(f"Image URL returned 403 (forbidden).{hint}")
+        if e.response.status_code == 404:
             raise ValueError(
-                f"Image URL returned {e.response.status_code}. "
-                "The image may have been deleted or expired. Please re-upload."
+                f"Image URL returned 404 — the image was not found. "
+                "It may have been deleted or the URL may be wrong."
             )
         raise ValueError(f"Failed to fetch image from URL: {e}")
     except httpx.TimeoutException:
