@@ -394,16 +394,19 @@ def _is_url(s: str) -> bool:
 
 def _normalize_share_url(url: str) -> str:
     """Rewrite known share-page URLs to direct download URLs."""
+    import re
     parsed = urlparse(url)
     hostname = parsed.hostname or ""
 
-    # Google Drive: /file/d/FILE_ID/view or /file/d/FILE_ID/preview
-    # → https://drive.google.com/uc?export=download&id=FILE_ID
     if hostname in ("drive.google.com", "docs.google.com"):
-        import re
-        m = re.search(r"/file/d/([^/]+)", parsed.path)
+        # /file/d/FILE_ID/view  or  /file/d/FILE_ID/preview
+        m = re.search(r"/file/d/([^/?]+)", parsed.path)
         if m:
             return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+        # /open?id=FILE_ID  (common share link format)
+        params = dict(p.split("=", 1) for p in parsed.query.split("&") if "=" in p)
+        if "id" in params:
+            return f"https://drive.google.com/uc?export=download&id={params['id']}"
 
     return url
 
