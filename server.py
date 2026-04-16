@@ -64,7 +64,8 @@ SOURCE_MAX_DIM = 2048  # Source images for edit/variations — high quality but 
 GCS_BUCKET = os.environ.get("GCS_BUCKET")  # e.g. "my-nanobanana-images"
 S3_BUCKET = os.environ.get("S3_BUCKET")    # e.g. "claude-image-cache"
 S3_REGION = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
-DEFAULT_OUTPUT = os.environ.get("DEFAULT_OUTPUT", "base64")  # "base64", "cloud", "s3", "gcs"
+_default_output_fallback = "cloud" if (os.environ.get("S3_BUCKET") or os.environ.get("GCS_BUCKET")) else "base64"
+DEFAULT_OUTPUT = os.environ.get("DEFAULT_OUTPUT", _default_output_fallback)
 
 # ---------------------------------------------------------------------------
 # Server-side image store — upload once, reference by URL in all subsequent calls.
@@ -224,36 +225,22 @@ mcp = FastMCP(
     "nanobanana",
     instructions=(
         "NanoBanana image generation server. Powered by Gemini.\n\n"
-        "## How to handle images — FOLLOW THESE RULES EXACTLY:\n\n"
-        "### User provides a URL (http/https)\n"
-        "Pass it directly to any tool.\n\n"
-        "### A previous tool returned a nanobanana:// URL or https://.../images/ URL\n"
-        "Pass that URL directly to the next tool.\n\n"
-        "### User pastes/uploads an image (you have it as a local file, no URL)\n"
-        "Upload it to the NanoBanana server first to get a URL, then use that URL.\n\n"
-        "**Preferred method — curl:**\n"
-        "```\n"
-        "curl -s -F 'file=@/path/to/image.png' {upload_url}/upload\n"
-        "```\n"
-        "This returns JSON with a `url` field. Use that URL in subsequent tool calls.\n\n"
-        "**Fallback — upload_image tool:**\n"
-        "If curl is unavailable, read the file and pass a data URI "
-        "(e.g. `data:image/png;base64,...`) to the `upload_image` tool. "
-        "It returns a nanobanana:// URL you can use in other tools.\n\n"
-        "**Manual fallback:**\n"
-        "If neither works, ask the user to open {upload_url}/upload, "
-        "drop the image there, and paste the returned URL.\n\n"
-        "### IMPORTANT\n"
-        "For all tools EXCEPT upload_image: only pass URLs. "
-        "Never pass base64 or data URIs to generate_image, edit_image, etc.\n\n"
-        "## Tools:\n"
-        "upload_image — upload a local image to get a URL for other tools\n"
-        "generate_image — text-to-image, optional reference image URLs, style presets\n"
-        "edit_image — edit an image (inpaint, remove, outpaint), supports reference images\n"
-        "swap_background — replace background, keep foreground subject\n"
-        "create_variations — generate variations of an existing image\n"
-        "analyze_image — describe, tag, or assess quality of an image\n"
-        "list_styles — list available style presets\n\n"
+        "## How to handle images\n\n"
+        "1. **User provides a URL (http/https):** pass it directly to any tool.\n"
+        "2. **A previous tool returned a URL:** pass that URL to the next tool.\n"
+        "3. **User pastes/uploads an image (local file, no URL):**\n"
+        "   Call `upload_image` with a data URI (`data:image/png;base64,...`).\n"
+        "   It uploads to cloud storage and returns a durable URL.\n"
+        "   Use that URL in subsequent tool calls.\n\n"
+        "For all tools EXCEPT upload_image: only pass URLs, never base64.\n\n"
+        "## Tools\n"
+        "- upload_image — upload an image, get back a durable URL for other tools\n"
+        "- generate_image — text-to-image, optional reference image URLs, style presets\n"
+        "- edit_image — edit an image (inpaint, remove, outpaint), supports reference images\n"
+        "- swap_background — replace background, keep foreground subject\n"
+        "- create_variations — generate variations of an existing image\n"
+        "- analyze_image — describe, tag, or assess quality of an image\n"
+        "- list_styles — list available style presets\n\n"
         "Default aspect ratio 4:5, resolution 1K."
     ).format(upload_url=_get_upload_base_url()),
     host=os.environ.get("HOST", "0.0.0.0"),
@@ -379,14 +366,27 @@ async def http_upload(request: Request) -> Response:
     img = PILImage.open(BytesIO(normalized))
     w, h = img.size
 
+    # Prefer cloud storage (durable URLs); fall back to in-memory store
+    if S3_BUCKET or GCS_BUCKET:
+        try:
+            image_url = _upload_to_cloud(normalized, prefix="uploads")
+            return JSONResponse({
+                "url": image_url,
+                "width": w,
+                "height": h,
+                "size_kb": len(normalized) // 1024,
+                "usage": "Paste this URL into Claude to use with any image tool",
+            }, status_code=201)
+        except Exception as e:
+            log(f"Cloud upload failed, falling back to in-memory store: {e}\n")
+
     img_id = _store_image(normalized, mime)
 
-    # Link to upload session if present (for elicitation flow)
+    # Link to upload session if present
     session_id = request.query_params.get("session")
     if session_id:
         _complete_upload_session(session_id, img_id)
 
-    # Build the full URL using the request's Host header
     scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
     host = request.headers.get("host", request.url.netloc)
     image_url = f"{scheme}://{host}/images/{img_id}"
@@ -864,19 +864,16 @@ async def upload_image(
     ctx: Context,
     image: str,
 ) -> str:
-    """Store an image on the server and get back a URL for other tools.
+    """Store an image and get back a durable URL for other tools.
 
     Use this when the user pastes/uploads an image and you need a URL.
     Accepts: http/https URLs, nanobanana:// URLs, or data URIs (data:image/...;base64,...).
-
-    Prefer using curl to upload via the /upload HTTP endpoint when possible
-    (less context usage). Use this tool with a data URI as a fallback.
 
     Args:
         image: Image URL, nanobanana:// URL, or data URI (data:image/png;base64,...).
 
     Returns:
-        JSON with a nanobanana:// URL to use in other tools, plus image dimensions.
+        JSON with a URL to use in other tools, plus image dimensions.
     """
     from PIL import Image as PILImage
 
@@ -888,8 +885,21 @@ async def upload_image(
     img = PILImage.open(BytesIO(normalized))
     w, h = img.size
 
-    img_id = _store_image(normalized, norm_mime)
+    # Prefer cloud storage (durable URLs); fall back to in-memory store
+    if S3_BUCKET or GCS_BUCKET:
+        try:
+            url = await _run_in_thread(_upload_to_cloud, normalized, "uploads")
+            return json.dumps({
+                "url": url,
+                "width": w,
+                "height": h,
+                "size_kb": len(normalized) // 1024,
+                "usage": "Pass this URL to any other tool's image parameter",
+            })
+        except Exception as e:
+            log(f"Cloud upload failed, falling back to in-memory store: {e}\n")
 
+    img_id = _store_image(normalized, norm_mime)
     return json.dumps({
         "url": f"nanobanana://{img_id}",
         "width": w,
