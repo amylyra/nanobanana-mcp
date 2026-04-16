@@ -19,6 +19,7 @@ Deployment: Cloud Run with Streamable HTTP transport.
 
 import asyncio
 import base64
+import functools
 import json
 import os
 import sys
@@ -495,11 +496,6 @@ def _decode_reference(ref: str) -> tuple[bytes, str]:
     return _normalize_image(raw, max_dim=REF_MAX_DIM)
 
 
-def _decode_source(ref: str) -> tuple[bytes, str]:
-    raw, _ = _decode_raw(ref)
-    return _normalize_image(raw, max_dim=SOURCE_MAX_DIM, quality=92)
-
-
 def _decode_mask(ref: str) -> tuple[bytes, str]:
     raw, _ = _decode_raw(ref)
     return _normalize_image(raw, max_dim=SOURCE_MAX_DIM, output_format="PNG")
@@ -578,9 +574,8 @@ async def _call_gemini(client, **kwargs):
 
 async def _run_in_thread(fn, *args, **kwargs):
     """Run any blocking function (PIL, HTTP fetch, cloud upload) in a thread."""
-    import functools
     call = functools.partial(fn, *args, **kwargs)
-    return await asyncio.get_event_loop().run_in_executor(None, call)
+    return await asyncio.get_running_loop().run_in_executor(None, call)
 
 
 def _generate_loop(client, model, parts, config, count, label, qa_prompt=None):
@@ -1356,8 +1351,6 @@ def list_styles() -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    import sys
-
     # Validate API key at startup so users get a clear error immediately
     api_key = os.environ.get("GOOGLE_AI_API_KEY") or os.environ.get("GEMINI_API_KEY")
     if not api_key:
