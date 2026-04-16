@@ -1351,6 +1351,46 @@ def list_styles() -> str:
 
 
 # ---------------------------------------------------------------------------
+# MCP Prompts — invocable workflows for Claude.ai
+# ---------------------------------------------------------------------------
+@mcp.prompt()
+def handle_image() -> str:
+    """Upload a user's pasted image to S3 so it can be used with NanoBanana tools."""
+    upload_url = _get_upload_base_url()
+    return (
+        "The user shared an image to use with NanoBanana tools. "
+        "Follow these steps to get it into a usable URL:\n\n"
+        "## Step 1 — Read the image from the sandbox\n"
+        "Use your code execution tool:\n"
+        "```python\n"
+        "import os, base64\n"
+        "uploads = '/mnt/user-data/uploads'\n"
+        "image_exts = ('.png', '.jpg', '.jpeg', '.webp', '.gif')\n"
+        "files = sorted(\n"
+        "    [f for f in os.listdir(uploads) if f.lower().endswith(image_exts)],\n"
+        "    key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True)\n"
+        "if files:\n"
+        "    path = os.path.join(uploads, files[0])\n"
+        "    with open(path, 'rb') as f:\n"
+        "        b64 = base64.b64encode(f.read()).decode()\n"
+        "    ext = path.rsplit('.', 1)[-1].lower()\n"
+        "    mime = {'png':'image/png','jpg':'image/jpeg','jpeg':'image/jpeg','webp':'image/webp'}[ext]\n"
+        "    data_uri = f'data:{mime};base64,{b64}'\n"
+        "    print(f'Ready: {files[0]}')\n"
+        "else:\n"
+        "    print('No images found')\n"
+        "```\n\n"
+        "## Step 2 — Upload to S3\n"
+        "Call `upload_image` with the data URI from Step 1. You'll get an S3 URL.\n\n"
+        "## Step 3 — Use the URL\n"
+        "Pass the S3 URL to the tool the user requested "
+        "(edit_image, swap_background, create_variations, analyze_image, "
+        "or as reference_images for generate_image).\n\n"
+        f"**Fallback:** If Step 1 fails, direct the user to: {upload_url}/upload"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
