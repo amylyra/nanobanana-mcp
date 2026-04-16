@@ -391,7 +391,24 @@ def _is_url(s: str) -> bool:
         return False
 
 
+def _normalize_share_url(url: str) -> str:
+    """Rewrite known share-page URLs to direct download URLs."""
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+
+    # Google Drive: /file/d/FILE_ID/view or /file/d/FILE_ID/preview
+    # → https://drive.google.com/uc?export=download&id=FILE_ID
+    if hostname in ("drive.google.com", "docs.google.com"):
+        import re
+        m = re.search(r"/file/d/([^/]+)", parsed.path)
+        if m:
+            return f"https://drive.google.com/uc?export=download&id={m.group(1)}"
+
+    return url
+
+
 def _fetch_url(url: str) -> tuple[bytes, str]:
+    url = _normalize_share_url(url)
     # Block requests to cloud metadata endpoints and private networks (SSRF protection)
     parsed = urlparse(url)
     hostname = parsed.hostname or ""
