@@ -1080,7 +1080,10 @@ async def edit_image(
 
     parts.append(types.Part.from_text(text=edit_prompt))
 
-    config = types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"])
+    config = types.GenerateContentConfig(
+        response_modalities=["IMAGE", "TEXT"],
+        image_config=types.ImageConfig(aspect_ratio=aspect_ratio) if aspect_ratio else None,
+    )
     generated, errors = await _run_in_thread(
         _generate_loop, client, MODEL_FLASH, parts, config, count, "Edit",
     )
@@ -1149,7 +1152,10 @@ async def swap_background(
         types.Part.from_text(text=swap_prompt),
     ]
 
-    config = types.GenerateContentConfig(response_modalities=["IMAGE", "TEXT"])
+    config = types.GenerateContentConfig(
+        response_modalities=["IMAGE", "TEXT"],
+        image_config=types.ImageConfig(aspect_ratio=aspect_ratio) if aspect_ratio else None,
+    )
     generated, errors = await _run_in_thread(
         _generate_loop, client, MODEL_FLASH, parts, config, count, "Swap"
     )
@@ -1381,38 +1387,23 @@ def list_styles() -> str:
 # ---------------------------------------------------------------------------
 @mcp.prompt()
 def handle_image() -> str:
-    """Upload a user's pasted image to S3 so it can be used with NanoBanana tools."""
+    """Guide the user through getting a pasted or local image into NanoBanana tools."""
     upload_url = _get_upload_base_url()
     return (
-        "The user shared an image to use with NanoBanana tools. "
-        "Follow these steps to get it into a usable URL:\n\n"
-        "## Step 1 — Read the image from the sandbox\n"
-        "Use your code execution tool:\n"
-        "```python\n"
-        "import os, base64\n"
-        "uploads = '/mnt/user-data/uploads'\n"
-        "image_exts = ('.png', '.jpg', '.jpeg', '.webp', '.gif')\n"
-        "files = sorted(\n"
-        "    [f for f in os.listdir(uploads) if f.lower().endswith(image_exts)],\n"
-        "    key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True)\n"
-        "if files:\n"
-        "    path = os.path.join(uploads, files[0])\n"
-        "    with open(path, 'rb') as f:\n"
-        "        b64 = base64.b64encode(f.read()).decode()\n"
-        "    ext = path.rsplit('.', 1)[-1].lower()\n"
-        "    mime = {'png':'image/png','jpg':'image/jpeg','jpeg':'image/jpeg','webp':'image/webp'}[ext]\n"
-        "    data_uri = f'data:{mime};base64,{b64}'\n"
-        "    print(f'Ready: {files[0]}')\n"
-        "else:\n"
-        "    print('No images found')\n"
-        "```\n\n"
-        "## Step 2 — Upload to S3\n"
-        "Call `upload_image` with the data URI from Step 1. You'll get an S3 URL.\n\n"
-        "## Step 3 — Use the URL\n"
-        "Pass the S3 URL to the tool the user requested "
-        "(edit_image, swap_background, create_variations, analyze_image, "
-        "or as reference_images for generate_image).\n\n"
-        f"**Fallback:** If Step 1 fails, direct the user to: {upload_url}/upload"
+        "The user wants to use an image with NanoBanana tools but doesn't have a URL for it. "
+        "Here's how to get one:\n\n"
+        "**Pasted or dragged image (no URL)**\n"
+        "Pasted images are vision-only — there are no extractable bytes regardless of size. "
+        "Direct the user to the upload page immediately:\n\n"
+        f"> Please upload your image at: **{upload_url}/upload**\n"
+        "> Drag it onto that page — it takes a second and gives you a URL to paste back here.\n\n"
+        "**Google Drive link**\n"
+        "Public Drive links work automatically — just pass them to the tool. "
+        "For private files, use the Google Drive MCP to read the file, then construct "
+        "`data:<mime_type>;base64,<blob>` and pass it to `upload_image` to get a URL.\n\n"
+        "**Once you have a URL**\n"
+        "Pass it to the appropriate tool: `edit_image`, `swap_background`, "
+        "`create_variations`, `analyze_image`, or as `reference_images` for `generate_image`."
     )
 
 
