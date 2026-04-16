@@ -224,20 +224,22 @@ mcp = FastMCP(
     "nanobanana",
     instructions=(
         "NanoBanana image generation server. Powered by Gemini.\n\n"
-        "## RULE #1 — NEVER pass base64 image data to any tool.\n"
-        "Do NOT encode, re-encode, resize, or convert images to base64 for tool parameters.\n"
-        "Do NOT use data: URIs. Do NOT read image files and pass their contents.\n"
-        "Base64 strings consume the entire context window and get truncated. It WILL fail.\n\n"
-        "## How to handle images:\n"
-        "- If the user provides a URL (http/https): pass it directly to the tool.\n"
-        "- If a previous tool returned a nanobanana:// URL: pass that URL.\n"
-        "- If the user pastes/uploads an image with NO URL: tell them to open\n"
-        "  {upload_url}/upload in their browser, drop the image there, and paste\n"
-        "  the returned URL back into the chat. Then pass that URL to the tool.\n"
-        "  Do NOT attempt to extract, encode, or forward the image data yourself.\n\n"
+        "Upload page: {upload_url}/upload\n\n"
+        "## How to handle images — FOLLOW THESE RULES EXACTLY:\n"
+        "1. If the user provides a URL (http/https): pass it directly to the tool.\n"
+        "2. If a previous tool returned a nanobanana:// URL: pass that URL.\n"
+        "3. If the user pastes/uploads an image with NO URL:\n"
+        "   → Do NOT call any tool. Do NOT pass base64, data URIs, or empty strings.\n"
+        "   → IMMEDIATELY tell the user to open {upload_url}/upload, drop the image\n"
+        "     there, and paste the returned URL back into the chat.\n"
+        "   → Once you have the URL, proceed with the tool call.\n\n"
         "## Tools:\n"
-        "generate_image, edit_image, swap_background, create_variations, "
-        "analyze_image, upload_image, list_styles.\n"
+        "generate_image — text-to-image, optional reference image URLs, style presets\n"
+        "edit_image — edit an image (inpaint, remove, outpaint), supports reference images\n"
+        "swap_background — replace background, keep foreground subject\n"
+        "create_variations — generate variations of an existing image\n"
+        "analyze_image — describe, tag, or assess quality of an image\n"
+        "list_styles — list available style presets\n\n"
         "Default aspect ratio 4:5, resolution 1K."
     ).format(upload_url=_get_upload_base_url()),
     host=os.environ.get("HOST", "0.0.0.0"),
@@ -793,7 +795,7 @@ def _score_image(client, img_bytes: bytes, prompt: str) -> dict:
 @mcp.tool()
 async def upload_image(
     ctx: Context,
-    image: str = "",
+    image: str,
 ) -> str:
     """Store an image on the server and get back a URL for other tools.
 
@@ -962,7 +964,7 @@ async def generate_image(
 async def edit_image(
     prompt: str,
     ctx: Context,
-    image: str = "",
+    image: str,
     reference_images: list[str] | None = None,
     mask: str | None = None,
     edit_mode: str = "inpaint-insertion",
@@ -1079,7 +1081,7 @@ async def edit_image(
 async def swap_background(
     background: str,
     ctx: Context,
-    image: str = "",
+    image: str,
     aspect_ratio: str | None = None,
     count: int = 1,
     output: str = DEFAULT_OUTPUT,
@@ -1161,7 +1163,7 @@ async def swap_background(
 @mcp.tool()
 async def create_variations(
     ctx: Context,
-    image: str = "",
+    image: str,
     prompt: str | None = None,
     variation_strength: str = "medium",
     aspect_ratio: str = "4:5",
@@ -1286,7 +1288,7 @@ async def create_variations(
 @mcp.tool()
 async def analyze_image(
     ctx: Context,
-    image: str = "",
+    image: str,
     focus: str = "general",
 ) -> str:
     """Analyze an image using Gemini vision — describe, tag, or assess quality.
