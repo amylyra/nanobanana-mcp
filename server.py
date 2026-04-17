@@ -68,8 +68,10 @@ SOURCE_MAX_DIM = 2048  # Source images for edit/variations — high quality but 
 GCS_BUCKET = os.environ.get("GCS_BUCKET")  # e.g. "my-nanobanana-images"
 S3_BUCKET = os.environ.get("S3_BUCKET")    # e.g. "claude-image-cache"
 S3_REGION = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
-_default_output_fallback = "cloud" if (os.environ.get("S3_BUCKET") or os.environ.get("GCS_BUCKET")) else "url"
-DEFAULT_OUTPUT = os.environ.get("DEFAULT_OUTPUT", _default_output_fallback)
+# Always default to "url" — cloud storage is opt-in via DEFAULT_OUTPUT env var.
+# Auto-defaulting to "cloud" when S3_BUCKET is set caused images to go to S3
+# instead of being embedded for inline display in Claude.ai.
+DEFAULT_OUTPUT = os.environ.get("DEFAULT_OUTPUT", "url")
 
 # ---------------------------------------------------------------------------
 # Server-side image store — upload once, reference by URL in all subsequent calls.
@@ -192,28 +194,37 @@ mcp = FastMCP(
     "nanobanana",
     instructions=(
         "NanoBanana image generation server. Powered by Gemini.\n\n"
-        "## Getting images into tools — 4 paths\n\n"
-        "MCP tool parameters are text-only. Every image needs a URL.\n\n"
+        "## Getting images into tools — 3 paths\n\n"
+        "All image tool parameters accept http/https URLs only.\n\n"
         "1. **Direct URL (http/https, S3, CDN)** → pass straight to the tool.\n"
-        "2. **Public Google Drive link** → the server rewrites it automatically, just pass it.\n"
-        "3. **Private Google Drive file** → use the Google Drive MCP to read it; "
-        "it returns a base64 blob and a MIME type. Construct `data:<mime_type>;base64,<blob>` "
-        "and pass that to upload_image to get an S3 URL.\n"
-        "4. **Pasted image (no URL, bash available)** → write image bytes to /tmp/nb_upload.jpg, "
-        "then: `curl -s -F file=@/tmp/nb_upload.jpg {upload_url}/upload` → parse the returned "
-        "`url` field and pass it to the tool. "
-        "Do NOT pass a large base64 string as an MCP parameter — it gets truncated. "
-        "Do NOT start a local HTTP server — background processes don't persist between bash commands. "
-        "If bash is unavailable or curl fails, direct user to {upload_url}/upload to upload manually.\n\n"
-        "Never fabricate URLs. Never pass API endpoints or web pages as image parameters.\n\n"
+        "2. **Public Google Drive link** → pass straight to the tool (auto-rewritten).\n"
+        "3. **Pasted image or local file (no URL)** → upload it first:\n"
+        "   - With bash: `curl -s -F file=@/mnt/user-data/uploads/<filename> {upload_url}/upload`"
+        " → parse the returned `url` field → pass that URL to the tool.\n"
+        "   - Without bash: direct user to {upload_url}/upload to upload manually.\n\n"
+        "Never fabricate URLs. Never pass large base64 strings as MCP parameters — they get truncated. "
+        "upload_image only accepts http/https URLs; use curl to POST to /upload for local files. "
+        "Never start a local HTTP server.\n\n"
         "## Tools\n"
-        "- upload_image — re-host any image (URL or data URI) to a server URL for use in other tools\n"
+        "- upload_image — re-host an image URL (http/https) to a server URL for use in other tools\n"
         "- generate_image — text-to-image, optional reference image URLs, style presets\n"
-        "- edit_image — edit an image (inpaint, remove, outpaint)\n"
+        "- edit_image — edit an image (inpaint, remove, outpaint); accepts multiple reference_images\n"
         "- swap_background — keep subject, replace background\n"
         "- create_variations — generate variations of an image\n"
-        "- analyze_image — describe, tag, or assess image quality\n"
+        "- analyze_image — describe/tag/assess a single image\n"
+        "- batch_analyze — analyze 2–20 images in parallel; use instead of repeated analyze_image calls\n"
+        "- compare_images — compare 2–10 images side-by-side in one call (differences, quality, style)\n"
         "- list_styles — list available style presets\n\n"
+        "## Common multi-image patterns\n"
+        "**Analyze multiple images**: use batch_analyze, not repeated analyze_image calls.\n"
+        "**Compare / diff two images**: use compare_images(focus='differences').\n"
+        "**Pick the best of N images**: use compare_images(focus='quality').\n"
+        "**Composite swap** (put object from image B into image A): "
+        "call edit_image(image=urlA, reference_images=[urlB], "
+        "prompt='replace X with the object from reference image 1').\n"
+        "**Multi-object swap** (objects from images B and C into image A): "
+        "call edit_image(image=urlA, reference_images=[urlB, urlC], "
+        "prompt='replace X with reference image 1 and Y with reference image 2').\n\n"
         "Default aspect ratio 4:5, resolution 1K."
     ).format(upload_url=_get_upload_base_url()),
     host=os.environ.get("HOST", "0.0.0.0"),
@@ -828,15 +839,13 @@ def _build_image_response(
     generated: list[tuple[bytes, dict]],
     output_mode: str,
     prefix: str = "gen",
-) -> list | str:
+) -> str:
     """Build a tool response with metadata + images.
 
     generated: list of (jpeg_bytes, per_image_metadata) tuples.
 
     url mode (default): stores images server-side, returns /images/ URLs.
         Avoids large base64 blobs that overflow Claude Code's tool result limit.
-    base64 mode: returns [json_metadata, Image, Image, ...]
-        Images render natively in Claude.ai. Avoid for large images in Claude Code.
     cloud mode (gcs/s3): uploads to cloud storage, returns durable public URLs.
     """
     if output_mode in ("gcs", "s3", "cloud"):
@@ -850,9 +859,9 @@ def _build_image_response(
         else:
             result["images"] = [{k: v for k, v in meta.items() if k != "index"} for _, meta in generated]
         return json.dumps(result)
-    elif output_mode == "url":
-        # Store server-side; return browser-accessible /images/ URLs.
-        # Safe for Claude Code (no base64 overflow) and pipelines (URLs chain between tools).
+    else:
+        # url mode (default) — also handles "base64" requests since Image type
+        # cannot serialize over HTTP/MCP proxy transport.
         base_url = _get_upload_base_url()
         for jpeg_bytes, meta in generated:
             img_id = _store_image(jpeg_bytes, "image/jpeg")
@@ -865,24 +874,6 @@ def _build_image_response(
         else:
             result["images"] = [{k: v for k, v in meta.items() if k != "index"} for _, meta in generated]
         return json.dumps(result)
-    else:
-        # base64: return inline Image blocks for visual display + HTTP URLs for chaining
-        base_url = _get_upload_base_url()
-        for jpeg_bytes, meta in generated:
-            img_id = _store_image(jpeg_bytes, "image/jpeg")
-            meta["image_url"] = f"{base_url}/images/{img_id}"
-            meta["expires_in"] = "1 hour"
-            meta["size_kb"] = len(jpeg_bytes) // 1024
-        if len(generated) == 1:
-            result.update(generated[0][1])
-            result.pop("index", None)
-        else:
-            result["images"] = [{k: v for k, v in meta.items() if k != "index"} for _, meta in generated]
-        # Return metadata text + native Image content blocks
-        return [json.dumps(result)] + [
-            Image(data=jpeg_bytes, format="jpeg")
-            for jpeg_bytes, _ in generated
-        ]
 
 
 # ---------------------------------------------------------------------------
@@ -943,11 +934,10 @@ def _score_image(client, img_bytes: bytes, prompt: str) -> dict:
             },
         )
         scores = json.loads(resp.text)
-        # Ensure total is computed
-        if "total" not in scores or not isinstance(scores["total"], (int, float)):
-            criteria = ["composition", "clarity", "lighting", "color", "prompt_adherence"]
-            total = sum(scores.get(c, {}).get("score", 0) for c in criteria)
-            scores["total"] = total
+        # Always recompute total from individual scores — Gemini sometimes returns
+        # a normalized 1-10 overall score instead of the raw sum (max 50).
+        criteria = ["composition", "clarity", "lighting", "color", "prompt_adherence"]
+        scores["total"] = sum(scores.get(c, {}).get("score", 0) for c in criteria)
         return scores
     except Exception as e:
         return {"error": f"QA scoring failed: {e}", "total": 0}
@@ -961,22 +951,34 @@ async def upload_image(
     ctx: Context,
     image: str,
 ) -> str:
-    """Store an image and get back a URL for other tools.
+    """Re-host an image URL to a server URL for use in other tools.
 
-    Use this when you have a data URI from the Drive MCP and need to convert it to a URL,
-    or to re-host an image URL to ensure server-side access.
-    Accepts: http/https URLs or data URIs (data:image/...;base64,...).
+    Accepts http/https URLs only (including Google Drive share links).
+    For pasted images or local files, use curl to POST to the /upload HTTP endpoint
+    and pass the returned URL here instead.
 
     When cloud storage (S3/GCS) is configured, the returned URL is durable (no expiry).
     Otherwise the URL expires after 1 hour — the response includes "expires_in" when applicable.
 
     Args:
-        image: Image URL or data URI (data:image/png;base64,...).
+        image: Image URL (http/https). Google Drive share links are rewritten automatically.
 
     Returns:
         JSON with a URL to use in other tools, plus image dimensions.
     """
     from PIL import Image as PILImage
+
+    upload_url = f"{_BASE_URL}/upload"
+    if not _is_url(image):
+        return json.dumps({
+            "error": (
+                "upload_image only accepts http/https URLs. "
+                "To upload a pasted or local image, run this in bash: "
+                f"curl -s -F file=@/mnt/user-data/uploads/<filename> {upload_url} "
+                "— then pass the returned 'url' field to the tool. "
+                f"Or upload manually at: {upload_url}"
+            )
+        })
 
     try:
         normalized, norm_mime = await _acquire_image(image, ctx, purpose="image")
@@ -1043,10 +1045,10 @@ async def generate_image(
         quality: "default" (fast) or "pro" (higher quality). Default: default
         count: Number of images to generate (1–4). Default: 1
         qa: If true, AI-score each image. When count > 1, ranks by total score.
-        output: "url" (default, returns /images/ URLs), "base64" (inline images), "cloud"/"s3"/"gcs" (durable cloud URLs).
+        output: "url" (default, returns /images/ URLs), "cloud"/"s3"/"gcs" (durable cloud URLs).
 
     Returns:
-        Metadata JSON + inline images (base64 mode) or metadata with URLs (cloud mode).
+        Metadata JSON with image URLs.
     """
     from google.genai import types
 
@@ -1056,10 +1058,10 @@ async def generate_image(
         return json.dumps({"error": f"Unsupported resolution '{resolution}'.", "supported": sorted(RESOLUTIONS)})
     if style and style not in STYLE_PRESETS:
         return json.dumps({"error": f"Unknown style '{style}'.", "available": sorted(STYLE_PRESETS.keys())})
-    if output not in ("url", "base64", "gcs", "s3", "cloud"):
-        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["url", "base64", "gcs", "s3", "cloud"]})
+    if output not in ("url", "base64", "gcs", "s3", "cloud"):  # base64 accepted, remapped to url
+        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["url", "cloud", "s3", "gcs"]})
     if output in ("gcs", "s3", "cloud") and not S3_BUCKET and not GCS_BUCKET:
-        return json.dumps({"error": "Cloud output requested but no storage configured. Set S3_BUCKET or GCS_BUCKET env var, or use output='base64'."})
+        return json.dumps({"error": "Cloud output requested but no storage configured. Set S3_BUCKET or GCS_BUCKET env var."})
 
     count = max(1, min(count, 4))
 
@@ -1139,9 +1141,12 @@ async def generate_image(
         result["errors"] = errors
 
     try:
-        return await _run_in_thread(_build_image_response, result, generated, output, prefix="gen")
+        json_result = await _run_in_thread(_build_image_response, result, generated, output, prefix="gen")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload generated images: {e}"})
+    # Embed images as MCP Image content so Claude.ai renders them inline.
+    # JSON metadata is still returned first for tool chaining (image_url field).
+    return [json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
 
 
 @mcp.tool()
@@ -1164,17 +1169,23 @@ async def edit_image(
         image: Source image URL. Use upload_image first if needed.
         prompt: Edit instruction. Be specific about what to change.
         reference_images: Optional list of reference image URLs.
-            Use when the edit involves replacing or adding content based on another image
-            (e.g. "replace bottle A with bottle B" — pass bottle B as a reference).
+            Use when the edit involves replacing or inserting content from other images.
+            Single ref:   "replace the bottle with the one in the reference image"
+            Multiple refs: name them by position in the prompt —
+              "replace the bottle on the left with the object from reference image 1
+               and the bottle on the right with the object from reference image 2"
+            Composite swap (e.g. user has 3 images and wants objects from 2+3 placed
+            into image 1): pass image 1 as `image`, images 2 and 3 as
+            `reference_images`, and write the prompt describing which object goes where.
         mask: Optional mask image (URL). White = edit region, black = preserve.
         edit_mode: "inpaint-insertion" (add/replace), "inpaint-removal" (remove + fill),
                    "outpaint" (extend canvas). Default: inpaint-insertion
         aspect_ratio: Output aspect ratio (useful for outpaint). Default: same as input.
         count: Number of candidates (1–4). Default: 1
-        output: "url" (default, returns /images/ URLs), "base64" (inline images), "cloud"/"s3"/"gcs" (durable cloud URLs).
+        output: "url" (default, returns /images/ URLs), "cloud"/"s3"/"gcs" (durable cloud URLs).
 
     Returns:
-        Metadata JSON + inline images (base64 mode) or metadata with URLs (gcs mode).
+        Metadata JSON with image URLs.
     """
     from google.genai import types
 
@@ -1183,10 +1194,10 @@ async def edit_image(
         return json.dumps({"error": f"Unknown edit_mode '{edit_mode}'.", "available": sorted(valid_edit_modes)})
     if aspect_ratio is not None and aspect_ratio not in SUPPORTED_RATIOS:
         return json.dumps({"error": f"Unsupported aspect ratio '{aspect_ratio}'.", "supported": sorted(SUPPORTED_RATIOS)})
-    if output not in ("url", "base64", "gcs", "s3", "cloud"):
-        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["url", "base64", "gcs", "s3", "cloud"]})
+    if output not in ("url", "base64", "gcs", "s3", "cloud"):  # base64 accepted, remapped to url
+        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["url", "cloud", "s3", "gcs"]})
     if output in ("gcs", "s3", "cloud") and not S3_BUCKET and not GCS_BUCKET:
-        return json.dumps({"error": "Cloud output requested but no storage configured. Set S3_BUCKET or GCS_BUCKET env var, or use output='base64'."})
+        return json.dumps({"error": "Cloud output requested but no storage configured. Set S3_BUCKET or GCS_BUCKET env var."})
 
     count = max(1, min(count, 4))
 
@@ -1215,9 +1226,19 @@ async def edit_image(
         try:
             ref_parts = await _run_in_thread(_build_ref_parts, reference_images)
             parts.extend(ref_parts)
-            edit_prompt += (
-                " Use the provided reference image(s) to guide what the result should look like."
-            )
+            if len(reference_images) == 1:
+                edit_prompt += " Use the provided reference image to guide the edit."
+            else:
+                # Label references by position so Gemini can match prompt intent to
+                # specific images — "first reference image", "second reference image", etc.
+                labels = ", ".join(
+                    f"reference image {i + 1}" for i in range(len(reference_images))
+                )
+                edit_prompt += (
+                    f" {len(reference_images)} reference images are provided ({labels}). "
+                    "Apply each reference to the specific part of the prompt it relates to "
+                    "(e.g. 'replace X with the object from reference image 1')."
+                )
         except Exception as e:
             return json.dumps({"error": f"Failed to process reference image: {e}"})
 
@@ -1248,9 +1269,10 @@ async def edit_image(
     if errors:
         result["errors"] = errors
     try:
-        return await _run_in_thread(_build_image_response, result, generated, output, prefix="edit")
+        json_result = await _run_in_thread(_build_image_response, result, generated, output, prefix="edit")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload edited images: {e}"})
+    return [json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
 
 
 @mcp.tool()
@@ -1272,19 +1294,19 @@ async def swap_background(
         background: Description of the new background. Be specific.
         aspect_ratio: Output aspect ratio. Default: same as input.
         count: Number of candidates (1–4). Default: 1
-        output: "url" (default, returns /images/ URLs), "base64" (inline images), "cloud"/"s3"/"gcs" (durable cloud URLs).
+        output: "url" (default, returns /images/ URLs), "cloud"/"s3"/"gcs" (durable cloud URLs).
 
     Returns:
-        Metadata JSON + inline images (base64 mode) or metadata with URLs (gcs mode).
+        Metadata JSON with image URLs.
     """
     from google.genai import types
 
     if aspect_ratio is not None and aspect_ratio not in SUPPORTED_RATIOS:
         return json.dumps({"error": f"Unsupported aspect ratio '{aspect_ratio}'.", "supported": sorted(SUPPORTED_RATIOS)})
-    if output not in ("url", "base64", "gcs", "s3", "cloud"):
-        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["url", "base64", "gcs", "s3", "cloud"]})
+    if output not in ("url", "base64", "gcs", "s3", "cloud"):  # base64 accepted, remapped to url
+        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["url", "cloud", "s3", "gcs"]})
     if output in ("gcs", "s3", "cloud") and not S3_BUCKET and not GCS_BUCKET:
-        return json.dumps({"error": "Cloud output requested but no storage configured. Set S3_BUCKET or GCS_BUCKET env var, or use output='base64'."})
+        return json.dumps({"error": "Cloud output requested but no storage configured. Set S3_BUCKET or GCS_BUCKET env var."})
 
     count = max(1, min(count, 4))
 
@@ -1323,9 +1345,10 @@ async def swap_background(
     if errors:
         result["errors"] = errors
     try:
-        return await _run_in_thread(_build_image_response, result, generated, output, prefix="bgswap")
+        json_result = await _run_in_thread(_build_image_response, result, generated, output, prefix="bgswap")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload background-swapped images: {e}"})
+    return [json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
 
 
 @mcp.tool()
@@ -1334,7 +1357,7 @@ async def create_variations(
     image: str,
     prompt: str | None = None,
     variation_strength: str = "medium",
-    aspect_ratio: str = "4:5",
+    aspect_ratio: str | None = None,
     resolution: str = "1K",
     quality: str = "default",
     count: int = 3,
@@ -1350,26 +1373,26 @@ async def create_variations(
         image: Source image URL. Use upload_image first if needed.
         prompt: Optional guidance for variations.
         variation_strength: "subtle", "medium", or "strong". Default: medium
-        aspect_ratio: Output aspect ratio. Default: 4:5
+        aspect_ratio: Output aspect ratio. Default: same as source image
         resolution: Output resolution: 1K, 2K, 4K. Default: 1K
         quality: "default" or "pro". Default: default
         count: Number of variations (1–4). Default: 3
         qa: Score each variation and rank by quality. Default: false
-        output: "url" (default, returns /images/ URLs), "base64" (inline images), "cloud"/"s3"/"gcs" (durable cloud URLs).
+        output: "url" (default, returns /images/ URLs), "cloud"/"s3"/"gcs" (durable cloud URLs).
 
     Returns:
-        Metadata JSON + inline images (base64 mode) or metadata with URLs (gcs mode).
+        Metadata JSON with image URLs.
     """
     from google.genai import types
 
-    if aspect_ratio not in SUPPORTED_RATIOS:
+    if aspect_ratio is not None and aspect_ratio not in SUPPORTED_RATIOS:
         return json.dumps({"error": f"Unsupported aspect ratio '{aspect_ratio}'.", "supported": sorted(SUPPORTED_RATIOS)})
     if resolution not in RESOLUTIONS:
         return json.dumps({"error": f"Unsupported resolution '{resolution}'.", "supported": sorted(RESOLUTIONS)})
-    if output not in ("url", "base64", "gcs", "s3", "cloud"):
-        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["url", "base64", "gcs", "s3", "cloud"]})
+    if output not in ("url", "base64", "gcs", "s3", "cloud"):  # base64 accepted, remapped to url
+        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["url", "cloud", "s3", "gcs"]})
     if output in ("gcs", "s3", "cloud") and not S3_BUCKET and not GCS_BUCKET:
-        return json.dumps({"error": "Cloud output requested but no storage configured. Set S3_BUCKET or GCS_BUCKET env var, or use output='base64'."})
+        return json.dumps({"error": "Cloud output requested but no storage configured. Set S3_BUCKET or GCS_BUCKET env var."})
 
     strength_prompts = {
         "subtle": "Create a subtle variation of this image, keeping the composition and style very close to the original with only minor differences in details. ",
@@ -1406,7 +1429,7 @@ async def create_variations(
         image_config=types.ImageConfig(
             aspect_ratio=aspect_ratio,
             image_size=resolution,
-        ),
+        ) if aspect_ratio else types.ImageConfig(image_size=resolution),
     )
     generated, errors = await _generate_images(
         client, model_name, parts, config, count, "Variation",
@@ -1424,7 +1447,6 @@ async def create_variations(
     result = {
         "model": model_name,
         "variation_strength": variation_strength,
-        "aspect_ratio": aspect_ratio,
         "resolution": resolution,
     }
     if errors:
@@ -1433,9 +1455,78 @@ async def create_variations(
         result["guidance"] = prompt
 
     try:
-        return await _run_in_thread(_build_image_response, result, generated, output, prefix="var")
+        json_result = await _run_in_thread(_build_image_response, result, generated, output, prefix="var")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload variation images: {e}"})
+    return [json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
+
+
+# ---------------------------------------------------------------------------
+# Analysis focus prompts — shared by analyze_image and batch_analyze
+# ---------------------------------------------------------------------------
+ANALYZE_FOCUS_PROMPTS: dict[str, str] = {
+    "general": (
+        "Describe this image comprehensively. Include: subject matter, style, "
+        "composition, lighting, color palette, mood, and any notable details. "
+        "Be specific and detailed. Return as JSON: "
+        '{"description": "...", "style": "...", "mood": "...", "colors": ["..."], "details": ["..."]}'
+    ),
+    "tags": (
+        "Generate keyword tags for this image suitable for search engines and "
+        "asset management. Include tags for subject, style, mood, colors, setting, "
+        "and technical aspects. Return as JSON: "
+        '{"tags": ["tag1", "tag2", ...], "primary_subject": "..."}'
+    ),
+    "alt-text": (
+        "Write concise, accessible alt text for this image (1-2 sentences). "
+        "Describe what is shown, not the style. Be specific enough for someone "
+        "who cannot see the image. Return as JSON: "
+        '{"alt_text": "...", "short": "..."}'
+    ),
+    "quality": (
+        "Assess the technical quality of this image. Score each from 1-10: "
+        "sharpness, exposure, composition, color balance, noise level. "
+        "Note any artifacts, blur, or quality issues. Return as JSON: "
+        '{"sharpness": {"score": N, "note": "..."}, "exposure": {"score": N, "note": "..."}, '
+        '"composition": {"score": N, "note": "..."}, "color_balance": {"score": N, "note": "..."}, '
+        '"noise": {"score": N, "note": "..."}, "issues": ["..."], "total": N}'
+    ),
+    "brand": (
+        "Analyze this image from a marketing/brand perspective. Identify: "
+        "target audience, emotional tone, brand positioning, visual messaging, "
+        "and suggested use cases (social media, hero banner, product page, etc). "
+        "Return as JSON: "
+        '{"target_audience": "...", "tone": "...", "positioning": "...", '
+        '"messaging": "...", "use_cases": ["..."], "strengths": ["..."], "suggestions": ["..."]}'
+    ),
+}
+
+
+async def _analyze_one(client, img_bytes: bytes, img_mime: str, focus: str) -> dict:
+    """Run a single image analysis and return the parsed result dict."""
+    from google.genai import types
+
+    resp = await _call_gemini(
+        client,
+        model=MODEL_TEXT,
+        contents=[
+            types.Part.from_bytes(data=img_bytes, mime_type=img_mime),
+            types.Part.from_text(text=ANALYZE_FOCUS_PROMPTS[focus]),
+        ],
+        config={"response_mime_type": "application/json"},
+    )
+    try:
+        analysis = json.loads(resp.text)
+    except (json.JSONDecodeError, TypeError):
+        return {"focus": focus, "raw_response": resp.text if resp.text else "No response"}
+
+    # Recompute total from individual scores — Gemini sometimes returns a
+    # normalized 1-10 overall score instead of the raw sum (max 50).
+    if focus == "quality":
+        criteria = ["sharpness", "exposure", "composition", "color_balance", "noise"]
+        analysis["total"] = sum(analysis.get(c, {}).get("score", 0) for c in criteria)
+    analysis["focus"] = focus
+    return analysis
 
 
 @mcp.tool()
@@ -1444,8 +1535,9 @@ async def analyze_image(
     image: str,
     focus: str = "general",
 ) -> str:
-    """Analyze an image using Gemini vision — describe, tag, or assess quality.
+    """Analyze a single image using Gemini vision — describe, tag, or assess quality.
 
+    For multiple images, use batch_analyze instead (runs all analyses in parallel).
     Only pass URLs — use upload_image first if needed.
 
     Args:
@@ -1455,47 +1547,8 @@ async def analyze_image(
     Returns:
         JSON with the analysis result.
     """
-    from google.genai import types
-
-    focus_prompts = {
-        "general": (
-            "Describe this image comprehensively. Include: subject matter, style, "
-            "composition, lighting, color palette, mood, and any notable details. "
-            "Be specific and detailed. Return as JSON: "
-            '{"description": "...", "style": "...", "mood": "...", "colors": ["..."], "details": ["..."]}'
-        ),
-        "tags": (
-            "Generate keyword tags for this image suitable for search engines and "
-            "asset management. Include tags for subject, style, mood, colors, setting, "
-            "and technical aspects. Return as JSON: "
-            '{"tags": ["tag1", "tag2", ...], "primary_subject": "..."}'
-        ),
-        "alt-text": (
-            "Write concise, accessible alt text for this image (1-2 sentences). "
-            "Describe what is shown, not the style. Be specific enough for someone "
-            "who cannot see the image. Return as JSON: "
-            '{"alt_text": "...", "short": "..."}'
-        ),
-        "quality": (
-            "Assess the technical quality of this image. Score each from 1-10: "
-            "sharpness, exposure, composition, color balance, noise level. "
-            "Note any artifacts, blur, or quality issues. Return as JSON: "
-            '{"sharpness": {"score": N, "note": "..."}, "exposure": {"score": N, "note": "..."}, '
-            '"composition": {"score": N, "note": "..."}, "color_balance": {"score": N, "note": "..."}, '
-            '"noise": {"score": N, "note": "..."}, "issues": ["..."], "total": N}'
-        ),
-        "brand": (
-            "Analyze this image from a marketing/brand perspective. Identify: "
-            "target audience, emotional tone, brand positioning, visual messaging, "
-            "and suggested use cases (social media, hero banner, product page, etc). "
-            "Return as JSON: "
-            '{"target_audience": "...", "tone": "...", "positioning": "...", '
-            '"messaging": "...", "use_cases": ["..."], "strengths": ["..."], "suggestions": ["..."]}'
-        ),
-    }
-
-    if focus not in focus_prompts:
-        return json.dumps({"error": f"Unknown focus '{focus}'.", "available": list(focus_prompts.keys())})
+    if focus not in ANALYZE_FOCUS_PROMPTS:
+        return json.dumps({"error": f"Unknown focus '{focus}'.", "available": list(ANALYZE_FOCUS_PROMPTS.keys())})
 
     try:
         client = _get_client()
@@ -1513,22 +1566,190 @@ async def analyze_image(
         return json.dumps({"error": str(e)})
 
     try:
+        analysis = await _analyze_one(client, img_bytes, img_mime, focus)
+        return json.dumps(analysis)
+    except Exception as e:
+        return json.dumps({"error": f"Analysis failed: {e}"})
+
+
+@mcp.tool()
+async def batch_analyze(
+    ctx: Context,
+    images: list[str],
+    focus: str = "general",
+) -> str:
+    """Analyze multiple images in parallel using Gemini vision.
+
+    Use this whenever you have 2 or more images to analyze — it runs all analyses
+    concurrently so the total time is roughly the same as analyzing one image.
+    For a single image use analyze_image instead.
+
+    Only pass URLs — use upload_image first if needed.
+
+    Args:
+        images: List of image URLs (2–20). Use upload_image first if needed.
+        focus: Analysis focus applied to every image: "general", "tags",
+               "alt-text", "quality", "brand"
+
+    Returns:
+        JSON with a "results" array in the same order as the input images.
+        Each result contains the analysis fields plus an "index" (1-based) and
+        the original "image_url" for easy cross-referencing. Failed images get
+        an "error" field instead of analysis fields.
+    """
+    if not images:
+        return json.dumps({"error": "images list is empty."})
+    if len(images) > 20:
+        return json.dumps({"error": f"Too many images ({len(images)}). Maximum is 20 per call."})
+    if focus not in ANALYZE_FOCUS_PROMPTS:
+        return json.dumps({"error": f"Unknown focus '{focus}'.", "available": list(ANALYZE_FOCUS_PROMPTS.keys())})
+
+    try:
+        client = _get_client()
+    except RuntimeError as e:
+        return json.dumps({"error": str(e)})
+
+    max_dim = SOURCE_MAX_DIM if focus == "quality" else REF_MAX_DIM
+
+    async def _analyze_indexed(index: int, image_ref: str) -> dict:
+        result = {"index": index + 1, "image_url": image_ref}
+        try:
+            img_bytes, img_mime = await _acquire_image(
+                image_ref, ctx, max_dim=max_dim, quality=85, purpose=f"image {index + 1}"
+            )
+            analysis = await _analyze_one(client, img_bytes, img_mime, focus)
+            result.update(analysis)
+        except Exception as e:
+            result["error"] = str(e)
+        return result
+
+    results = await asyncio.gather(*[_analyze_indexed(i, img) for i, img in enumerate(images)])
+    return json.dumps({"focus": focus, "count": len(images), "results": list(results)})
+
+
+# ---------------------------------------------------------------------------
+# Comparison focus prompts — all images are visible to the model in one call
+# ---------------------------------------------------------------------------
+COMPARE_FOCUS_PROMPTS: dict[str, str] = {
+    "differences": (
+        "You are shown {n} images (image 1, image 2, ...). "
+        "Identify and describe every meaningful visual difference between them. "
+        "Be specific: note changes in objects, colors, lighting, composition, text, etc. "
+        "Return as JSON: "
+        '{{"summary": "...", "differences": [{{"aspect": "...", "description": "..."}}]}}'
+    ),
+    "similarities": (
+        "You are shown {n} images. "
+        "Describe what they have in common visually: shared objects, style, palette, mood, composition. "
+        "Return as JSON: "
+        '{{"summary": "...", "similarities": [{{"aspect": "...", "description": "..."}}]}}'
+    ),
+    "quality": (
+        "You are shown {n} images. Rank them by overall technical quality (sharpness, exposure, "
+        "composition, color accuracy). State which is best and why. "
+        "Score each image 1–10. "
+        "Return as JSON: "
+        '{{"rankings": [{{"image": N, "score": N, "notes": "..."}}], "best": N, "reasoning": "..."}}'
+    ),
+    "style": (
+        "You are shown {n} images. Compare their visual style and aesthetic: "
+        "mood, color palette, photographic/illustration style, intended audience. "
+        "Return as JSON: "
+        '{{"per_image": [{{"image": N, "style": "...", "mood": "...", "palette": ["..."]}}], '
+        '"overall_comparison": "..."}}'
+    ),
+    "general": (
+        "You are shown {n} images. Provide a comprehensive side-by-side comparison: "
+        "content, style, quality, mood, notable differences and similarities. "
+        "Return as JSON: "
+        '{{"summary": "...", "per_image": [{{"image": N, "description": "..."}}], '
+        '"key_differences": ["..."], "key_similarities": ["..."]}}'
+    ),
+}
+
+
+@mcp.tool()
+async def compare_images(
+    ctx: Context,
+    images: list[str],
+    focus: str = "differences",
+) -> str:
+    """Compare 2–10 images side-by-side using Gemini vision in a single call.
+
+    Unlike batch_analyze (which analyzes each image independently), compare_images
+    sends all images to the model at once so it can reason about relationships,
+    differences, and similarities across the whole set.
+
+    Use cases:
+    - "What changed between version A and version B?"
+    - "Which of these 3 product photos looks best?"
+    - "How does image 1's style compare to image 2?"
+
+    Only pass URLs — use upload_image first if needed.
+
+    Args:
+        images: List of 2–10 image URLs.
+        focus: What to compare.
+            "differences" — what changed or differs between images (default)
+            "similarities" — what they have in common
+            "quality"      — which is highest quality and why; scores + ranking
+            "style"        — aesthetic/style comparison
+            "general"      — comprehensive side-by-side overview
+
+    Returns:
+        JSON with comparison results. Image references use 1-based index
+        (image 1, image 2, …) matching the input order.
+    """
+    if len(images) < 2:
+        return json.dumps({"error": "compare_images requires at least 2 images."})
+    if len(images) > 10:
+        return json.dumps({"error": f"Too many images ({len(images)}). Maximum is 10 per comparison."})
+    if focus not in COMPARE_FOCUS_PROMPTS:
+        return json.dumps({"error": f"Unknown focus '{focus}'.", "available": list(COMPARE_FOCUS_PROMPTS.keys())})
+
+    try:
+        client = _get_client()
+    except RuntimeError as e:
+        return json.dumps({"error": str(e)})
+
+    max_dim = SOURCE_MAX_DIM if focus == "quality" else REF_MAX_DIM
+
+    # Fetch all images concurrently
+    async def _fetch_indexed(index: int, image_ref: str):
+        return index, await _acquire_image(
+            image_ref, ctx, max_dim=max_dim, quality=85, purpose=f"image {index + 1}"
+        )
+
+    try:
+        fetched = await asyncio.gather(*[_fetch_indexed(i, img) for i, img in enumerate(images)])
+    except Exception as e:
+        return json.dumps({"error": f"Failed to load images: {e}"})
+
+    from google.genai import types
+
+    # Build parts: all images in order, then the comparison prompt
+    parts = []
+    for _, (img_bytes, img_mime) in sorted(fetched, key=lambda x: x[0]):
+        parts.append(types.Part.from_bytes(data=img_bytes, mime_type=img_mime))
+    prompt_text = COMPARE_FOCUS_PROMPTS[focus].format(n=len(images))
+    parts.append(types.Part.from_text(text=prompt_text))
+
+    try:
         resp = await _call_gemini(
             client,
             model=MODEL_TEXT,
-            contents=[
-                types.Part.from_bytes(data=img_bytes, mime_type=img_mime),
-                types.Part.from_text(text=focus_prompts[focus]),
-            ],
+            contents=parts,
             config={"response_mime_type": "application/json"},
         )
-        analysis = json.loads(resp.text)
-        analysis["focus"] = focus
-        return json.dumps(analysis)
-    except json.JSONDecodeError:
+        comparison = json.loads(resp.text)
+    except (json.JSONDecodeError, TypeError):
         return json.dumps({"focus": focus, "raw_response": resp.text if resp.text else "No response"})
     except Exception as e:
-        return json.dumps({"error": f"Analysis failed: {e}"})
+        return json.dumps({"error": f"Comparison failed: {e}"})
+
+    comparison["focus"] = focus
+    comparison["image_count"] = len(images)
+    return json.dumps(comparison)
 
 
 @mcp.tool()
@@ -1554,15 +1775,17 @@ def handle_image() -> str:
     return (
         "The user wants to use an image with NanoBanana tools but doesn't have a URL for it. "
         "Here's how to get one:\n\n"
-        "**Pasted or dragged image (no URL)**\n"
-        "Pasted images are vision-only — there are no extractable bytes regardless of size. "
-        "Direct the user to the upload page immediately:\n\n"
+        "**Pasted or local image (bash available)**\n"
+        "In claude.ai, pasted images are saved to `/mnt/user-data/uploads/<filename>`. "
+        "Run this in bash:\n\n"
+        f"```\ncurl -s -F file=@/mnt/user-data/uploads/<filename> {upload_url}/upload\n```\n\n"
+        "Parse the returned `url` field and pass it to the tool.\n\n"
+        "**Pasted image (no bash)**\n"
+        f"Direct the user to upload manually:\n\n"
         f"> Please upload your image at: **{upload_url}/upload**\n"
         "> Drag it onto that page — it takes a second and gives you a URL to paste back here.\n\n"
         "**Google Drive link**\n"
-        "Public Drive links work automatically — just pass them to the tool. "
-        "For private files, use the Google Drive MCP to read the file, then construct "
-        "`data:<mime_type>;base64,<blob>` and pass it to `upload_image` to get a URL.\n\n"
+        "Public Drive links work automatically — just pass them to the tool.\n\n"
         "**Once you have a URL**\n"
         "Pass it to the appropriate tool: `edit_image`, `swap_background`, "
         "`create_variations`, `analyze_image`, or as `reference_images` for `generate_image`."
