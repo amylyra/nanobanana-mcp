@@ -496,40 +496,44 @@ def _normalize_image(img_bytes: bytes, max_dim: int, quality: int = 85,
                      output_format: str = "JPEG") -> tuple[bytes, str]:
     from PIL import Image as PILImage
 
+    # Wrap all PIL operations — open() is lazy (reads header only), so truncated
+    # images that pass open() can still raise OSError during resize/convert/save.
     try:
         img = PILImage.open(BytesIO(img_bytes))
+
+        w, h = img.size
+        if w < 1 or h < 1:
+            raise ValueError(
+                "Image has invalid dimensions. The data may be corrupted or truncated. "
+                "Try using upload_image with a different image or passing an image URL."
+            )
+
+        if output_format == "JPEG":
+            if img.mode == "RGBA":
+                bg = PILImage.new("RGB", img.size, (255, 255, 255))
+                bg.paste(img, mask=img.split()[3])
+                img = bg
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+
+        if max(w, h) > max_dim:
+            scale = max_dim / max(w, h)
+            img = img.resize((int(w * scale), int(h * scale)), PILImage.LANCZOS)
+
+        buf = BytesIO()
+        if output_format == "PNG":
+            img.save(buf, format="PNG", optimize=True)
+            return buf.getvalue(), "image/png"
+        else:
+            img.save(buf, format="JPEG", quality=quality, optimize=True)
+            return buf.getvalue(), "image/jpeg"
+    except ValueError:
+        raise  # already a user-friendly message
     except Exception:
         raise ValueError(
-            "Could not decode image data. The image may have been truncated in transit. "
-            "Try using upload_image with a smaller image or passing an image URL."
+            "Could not decode image data. The image may be corrupt or truncated. "
+            "Try uploading the image again or using a different image URL."
         )
-
-    w, h = img.size
-    if w < 1 or h < 1:
-        raise ValueError(
-            "Image has invalid dimensions. The data may be corrupted or truncated. "
-            "Try using upload_image with a different image or passing an image URL."
-        )
-
-    if output_format == "JPEG":
-        if img.mode == "RGBA":
-            bg = PILImage.new("RGB", img.size, (255, 255, 255))
-            bg.paste(img, mask=img.split()[3])
-            img = bg
-        elif img.mode != "RGB":
-            img = img.convert("RGB")
-
-    if max(w, h) > max_dim:
-        scale = max_dim / max(w, h)
-        img = img.resize((int(w * scale), int(h * scale)), PILImage.LANCZOS)
-
-    buf = BytesIO()
-    if output_format == "PNG":
-        img.save(buf, format="PNG", optimize=True)
-        return buf.getvalue(), "image/png"
-    else:
-        img.save(buf, format="JPEG", quality=quality, optimize=True)
-        return buf.getvalue(), "image/jpeg"
 
 
 def _decode_raw(ref: str) -> tuple[bytes, str]:
@@ -545,13 +549,33 @@ def _decode_raw(ref: str) -> tuple[bytes, str]:
             try:
                 return _fetch_from_store(img_id)
             except ValueError:
-                pass  # not in store — fall through to HTTP fetch
+                # This is our own /images/ URL. Don't fall through to _fetch_url —
+                # on localhost it hits the SSRF block; on Cloud Run multi-instance it
+                # 404s with a confusing error. Give the real diagnosis instead.
+                raise ValueError(
+                    f"Image '{img_id}' has expired or was evicted from the server store. "
+                    "Upload the image again to get a fresh URL."
+                )
         return _fetch_url(ref)
     # Base64 data URI
     if ref.startswith("data:"):
         header, data = ref.split(",", 1)
         mime = header.split(";")[0].split(":")[1]
         return base64.b64decode(_fix_base64_padding(data)), mime
+    # Catch unsupported URL schemes (gs://, s3://, ftp://, file://, etc.) before they
+    # fall through to base64 decoding and produce a confusing "truncated" error.
+    try:
+        parsed = urlparse(ref)
+        if parsed.scheme and parsed.scheme not in ("http", "https", "data") and len(parsed.scheme) > 1:
+            raise ValueError(
+                f"Unsupported URL scheme '{parsed.scheme}://'. "
+                "Pass an http/https URL, a data URI (data:image/...;base64,...), "
+                "or use upload_image to get a URL first."
+            )
+    except ValueError:
+        raise
+    except Exception:
+        pass
     # Raw base64
     return base64.b64decode(_fix_base64_padding(ref)), "image/jpeg"
 
@@ -633,8 +657,12 @@ async def _call_gemini(client, **kwargs):
 
     This is critical on Cloud Run: blocking the event loop for 10-30s during
     image generation causes health check failures and dropped MCP connections.
+
+    Uses _THREAD_POOL (32 workers) instead of asyncio.to_thread's default executor
+    (~5 workers on Cloud Run 1-vCPU) so analyze_image handles concurrent load the
+    same as generate_image and other tools.
     """
-    return await asyncio.to_thread(client.models.generate_content, **kwargs)
+    return await _run_in_thread(client.models.generate_content, **kwargs)
 
 
 import concurrent.futures as _cf
@@ -690,9 +718,10 @@ async def _generate_images(client, model, parts, config, count, label, qa_prompt
 def _build_ref_parts(reference_images: list | None) -> list:
     from google.genai import types
 
-    parts = []
     if not reference_images:
-        return parts
+        return []
+
+    # Validate all refs before fetching
     for i, ref in enumerate(reference_images):
         if not ref or not ref.strip():
             raise ValueError(
@@ -700,8 +729,29 @@ def _build_ref_parts(reference_images: list | None) -> list:
                 "Upload each reference image first using upload_image to get a "
                 "URL, then pass those URLs here."
             )
-        img_bytes, mime = _decode_reference(ref)
-        parts.append(types.Part.from_bytes(data=img_bytes, mime_type=mime))
+
+    # Fetch all reference images in parallel — sequential fetches degrade
+    # linearly with ref count (500ms × N per image fetch)
+    def _fetch_one(args):
+        i, ref = args
+        try:
+            return i, _decode_reference(ref), None
+        except Exception as e:
+            return i, None, e
+
+    with _cf.ThreadPoolExecutor(max_workers=min(len(reference_images), 8)) as pool:
+        fetch_results = list(pool.map(_fetch_one, enumerate(reference_images)))
+
+    # Re-raise first error encountered
+    for i, result, err in fetch_results:
+        if err is not None:
+            raise ValueError(f"Reference image {i + 1}: {err}") from err
+
+    # Reassemble in original order
+    parts = [None] * len(reference_images)
+    for i, result, _ in fetch_results:
+        img_bytes, mime = result
+        parts[i] = types.Part.from_bytes(data=img_bytes, mime_type=mime)
     return parts
 
 
@@ -813,10 +863,12 @@ def _build_image_response(
             result["images"] = [{k: v for k, v in meta.items() if k != "index"} for _, meta in generated]
         return json.dumps(result)
     else:
-        # base64: store server-side for chaining + return inline Image content blocks
+        # base64: return inline Image blocks for visual display + HTTP URLs for chaining
+        base_url = _get_upload_base_url()
         for jpeg_bytes, meta in generated:
             img_id = _store_image(jpeg_bytes, "image/jpeg")
-            meta["image_url"] = f"nanobanana://{img_id}"
+            meta["image_url"] = f"{base_url}/images/{img_id}"
+            meta["expires_in"] = "1 hour"
             meta["size_kb"] = len(jpeg_bytes) // 1024
         if len(generated) == 1:
             result.update(generated[0][1])
@@ -1021,18 +1073,16 @@ async def generate_image(
         final_prompt = STYLE_PRESETS[style] + final_prompt
 
     if enhance_prompt and reference_images:
-        enhance_task = asyncio.ensure_future(
-            _run_in_thread(_enhance_prompt, client, final_prompt)
+        results = await asyncio.gather(
+            _run_in_thread(_enhance_prompt, client, final_prompt),
+            _run_in_thread(_build_ref_parts, reference_images),
+            return_exceptions=True,
         )
-        refs_task = asyncio.ensure_future(
-            _run_in_thread(_build_ref_parts, reference_images)
-        )
-        await asyncio.gather(enhance_task, refs_task, return_exceptions=True)
-        if enhance_task.exception():
-            return json.dumps({"error": f"Prompt enhancement failed: {enhance_task.exception()}"})
-        if refs_task.exception():
-            return json.dumps({"error": f"Failed to process reference image: {refs_task.exception()}"})
-        final_prompt, parts = enhance_task.result(), refs_task.result()
+        if isinstance(results[0], Exception):
+            return json.dumps({"error": f"Prompt enhancement failed: {results[0]}"})
+        if isinstance(results[1], Exception):
+            return json.dumps({"error": f"Failed to process reference image: {results[1]}"})
+        final_prompt, parts = results
     elif enhance_prompt:
         try:
             final_prompt = await _run_in_thread(_enhance_prompt, client, final_prompt)
@@ -1085,7 +1135,10 @@ async def generate_image(
     if errors:
         result["errors"] = errors
 
-    return await _run_in_thread(_build_image_response, result, generated, output, prefix="gen")
+    try:
+        return await _run_in_thread(_build_image_response, result, generated, output, prefix="gen")
+    except Exception as e:
+        return json.dumps({"error": f"Failed to store/upload generated images: {e}"})
 
 
 @mcp.tool()
@@ -1191,7 +1244,10 @@ async def edit_image(
         result["reference_count"] = len(reference_images)
     if errors:
         result["errors"] = errors
-    return await _run_in_thread(_build_image_response, result, generated, output, prefix="edit")
+    try:
+        return await _run_in_thread(_build_image_response, result, generated, output, prefix="edit")
+    except Exception as e:
+        return json.dumps({"error": f"Failed to store/upload edited images: {e}"})
 
 
 @mcp.tool()
@@ -1263,7 +1319,10 @@ async def swap_background(
     result = {"background": background}
     if errors:
         result["errors"] = errors
-    return await _run_in_thread(_build_image_response, result, generated, output, prefix="bgswap")
+    try:
+        return await _run_in_thread(_build_image_response, result, generated, output, prefix="bgswap")
+    except Exception as e:
+        return json.dumps({"error": f"Failed to store/upload background-swapped images: {e}"})
 
 
 @mcp.tool()
@@ -1370,7 +1429,10 @@ async def create_variations(
     if prompt:
         result["guidance"] = prompt
 
-    return await _run_in_thread(_build_image_response, result, generated, output, prefix="var")
+    try:
+        return await _run_in_thread(_build_image_response, result, generated, output, prefix="var")
+    except Exception as e:
+        return json.dumps({"error": f"Failed to store/upload variation images: {e}"})
 
 
 @mcp.tool()
