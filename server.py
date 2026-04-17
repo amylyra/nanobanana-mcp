@@ -157,22 +157,32 @@ STYLE_PRESETS = {
 # ---------------------------------------------------------------------------
 # Helpers — URL construction
 # ---------------------------------------------------------------------------
-def _get_upload_base_url() -> str:
-    """Get the server's external base URL for building upload links."""
-    base_url = os.environ.get("PUBLIC_URL")
+def _compute_base_url() -> str:
+    """Compute the server's external base URL once at startup.
+
+    Priority:
+    1. PUBLIC_URL env var (always set this on Cloud Run — it's the only reliable source)
+    2. Localhost fallback for local dev
+
+    The Cloud Run auto-detection formula that was here previously
+    (service-project.region.run.app) does not match the actual URL format
+    Cloud Run assigns (service-hash.region.run.app). Removed to avoid silently
+    generating broken URLs. Set PUBLIC_URL instead.
+    """
+    base_url = os.environ.get("PUBLIC_URL", "").rstrip("/")
     if base_url:
         return base_url
-    k_service = os.environ.get("K_SERVICE")
-    k_region = os.environ.get("CLOUD_RUN_REGION") or os.environ.get("GOOGLE_CLOUD_REGION")
-    gcp_project = os.environ.get("GOOGLE_CLOUD_PROJECT")
-    if k_service and k_region:
-        return (
-            f"https://{k_service}-{gcp_project}.{k_region}.run.app"
-            if gcp_project
-            else f"https://{k_service}.run.app"
-        )
     port = int(os.environ.get("PORT", 8080))
     return f"http://localhost:{port}"
+
+
+# Computed once at import time — avoids repeated env reads and ensures
+# all tool responses use a consistent base URL throughout the process lifetime.
+_BASE_URL = _compute_base_url()
+
+
+def _get_upload_base_url() -> str:
+    return _BASE_URL
 
 
 # ---------------------------------------------------------------------------
@@ -614,10 +624,17 @@ async def _call_gemini(client, **kwargs):
     return await asyncio.to_thread(client.models.generate_content, **kwargs)
 
 
+import concurrent.futures as _cf
+# Explicit pool sized for I/O-bound Gemini calls. Default pool (cpu_count+4 ≈ 5 on
+# Cloud Run's 1-vCPU) would serialize concurrent requests even with asyncio.gather.
+# 32 threads handle 8 concurrent users × count=4 with headroom to spare.
+_THREAD_POOL = _cf.ThreadPoolExecutor(max_workers=32, thread_name_prefix="nb-worker")
+
+
 async def _run_in_thread(fn, *args, **kwargs):
     """Run any blocking function (PIL, HTTP fetch, cloud upload) in a thread."""
     call = functools.partial(fn, *args, **kwargs)
-    return await asyncio.get_running_loop().run_in_executor(None, call)
+    return await asyncio.get_running_loop().run_in_executor(_THREAD_POOL, call)
 
 
 async def _generate_images(client, model, parts, config, count, label, qa_prompt=None):
@@ -633,7 +650,7 @@ async def _generate_images(client, model, parts, config, count, label, qa_prompt
         try:
             response = await _run_in_thread(
                 client.models.generate_content,
-                model=model, contents=parts, config=config,
+                model=model, contents=list(parts), config=config,
             )
             img_bytes = _extract_image(response)
             if img_bytes:
@@ -780,7 +797,7 @@ def _build_image_response(
             result.update(generated[0][1])
             result.pop("index", None)
         else:
-            result["images"] = [meta for _, meta in generated]
+            result["images"] = [{k: v for k, v in meta.items() if k != "index"} for _, meta in generated]
         return json.dumps(result)
     else:
         # base64: store server-side for chaining + return inline Image content blocks
