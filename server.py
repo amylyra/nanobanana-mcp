@@ -352,9 +352,10 @@ async def http_upload(request: Request) -> Response:
 
     img_id = _store_image(normalized, mime)
 
-    scheme = request.headers.get("x-forwarded-proto", request.url.scheme)
-    host = request.headers.get("host", request.url.netloc)
-    image_url = f"{scheme}://{host}/images/{img_id}"
+    # Use _BASE_URL (from PUBLIC_URL env var) so upload URLs match MCP tool URLs.
+    # Previously used x-forwarded-proto + host headers, which produced a different
+    # hostname than MCP tool responses when PUBLIC_URL is a custom domain.
+    image_url = f"{_BASE_URL}/images/{img_id}"
 
     return JSONResponse({
         "url": image_url,
@@ -380,16 +381,28 @@ async def http_get_image(request: Request) -> Response:
 # ---------------------------------------------------------------------------
 # Helpers — client
 # ---------------------------------------------------------------------------
-def _get_client():
-    """Initialize Gemini client."""
-    from google import genai
+_gemini_client = None
+_gemini_client_lock = threading.Lock()
 
-    api_key = os.environ.get("GOOGLE_AI_API_KEY") or os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        raise RuntimeError(
-            "No API key found. Set GOOGLE_AI_API_KEY or GEMINI_API_KEY env var."
-        )
-    return genai.Client(api_key=api_key)
+
+def _get_client():
+    """Return a cached Gemini client, creating it on first call.
+
+    Creating a new client per call wastes TLS handshakes and spawns redundant
+    connection pools. The client holds no per-request state — safe to share.
+    """
+    global _gemini_client
+    if _gemini_client is None:
+        with _gemini_client_lock:
+            if _gemini_client is None:
+                api_key = os.environ.get("GOOGLE_AI_API_KEY") or os.environ.get("GEMINI_API_KEY")
+                if not api_key:
+                    raise RuntimeError(
+                        "No API key found. Set GOOGLE_AI_API_KEY or GEMINI_API_KEY env var."
+                    )
+                from google import genai
+                _gemini_client = genai.Client(api_key=api_key)
+    return _gemini_client
 
 
 # ---------------------------------------------------------------------------
@@ -933,8 +946,11 @@ async def upload_image(
             log(f"Cloud upload failed, falling back to in-memory store: {e}\n")
 
     img_id = _store_image(normalized, norm_mime)
+    # Return an HTTP URL so the image is accessible across Cloud Run instances.
+    # nanobanana:// was instance-local with no HTTP fallback — requests routed to
+    # a different instance would see "not found" even for freshly uploaded images.
     return json.dumps({
-        "url": f"nanobanana://{img_id}",
+        "url": f"{_BASE_URL}/images/{img_id}",
         "width": w,
         "height": h,
         "size_kb": len(normalized) // 1024,
@@ -997,21 +1013,38 @@ async def generate_image(
     except RuntimeError as e:
         return json.dumps({"error": str(e)})
 
-    # Build final prompt
+    # Build prompt and fetch reference images — run in parallel when both are needed
+    # since they're completely independent (prompt enhancement doesn't need the images,
+    # image fetching doesn't need the enhanced prompt).
     final_prompt = prompt
     if style:
         final_prompt = STYLE_PRESETS[style] + final_prompt
-    if enhance_prompt:
+
+    if enhance_prompt and reference_images:
+        enhance_task = asyncio.ensure_future(
+            _run_in_thread(_enhance_prompt, client, final_prompt)
+        )
+        refs_task = asyncio.ensure_future(
+            _run_in_thread(_build_ref_parts, reference_images)
+        )
+        await asyncio.gather(enhance_task, refs_task, return_exceptions=True)
+        if enhance_task.exception():
+            return json.dumps({"error": f"Prompt enhancement failed: {enhance_task.exception()}"})
+        if refs_task.exception():
+            return json.dumps({"error": f"Failed to process reference image: {refs_task.exception()}"})
+        final_prompt, parts = enhance_task.result(), refs_task.result()
+    elif enhance_prompt:
         try:
             final_prompt = await _run_in_thread(_enhance_prompt, client, final_prompt)
         except Exception as e:
             return json.dumps({"error": f"Prompt enhancement failed: {e}"})
+        parts = []
+    else:
+        try:
+            parts = await _run_in_thread(_build_ref_parts, reference_images)
+        except Exception as e:
+            return json.dumps({"error": f"Failed to process reference image: {e}"})
 
-    # Build content parts (in thread — may involve HTTP fetches for reference images)
-    try:
-        parts = await _run_in_thread(_build_ref_parts, reference_images)
-    except Exception as e:
-        return json.dumps({"error": f"Failed to process reference image: {e}"})
     parts.append(types.Part.from_text(text=final_prompt))
 
     model_name = _pick_model(quality)
