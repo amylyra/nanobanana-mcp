@@ -68,10 +68,6 @@ SOURCE_MAX_DIM = 2048  # Source images for edit/variations — high quality but 
 GCS_BUCKET = os.environ.get("GCS_BUCKET")  # e.g. "my-nanobanana-images"
 S3_BUCKET = os.environ.get("S3_BUCKET")    # e.g. "claude-image-cache"
 S3_REGION = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
-# Always default to "url" — cloud storage is opt-in via DEFAULT_OUTPUT env var.
-# Auto-defaulting to "cloud" when S3_BUCKET is set caused images to go to S3
-# instead of being embedded for inline display in Claude.ai.
-DEFAULT_OUTPUT = os.environ.get("DEFAULT_OUTPUT", "url")
 
 # ---------------------------------------------------------------------------
 # Server-side image store — upload once, reference by URL in all subsequent calls.
@@ -834,46 +830,58 @@ def _upload_to_cloud(jpeg_bytes: bytes, prefix: str = "gen") -> str:
 # ---------------------------------------------------------------------------
 # Helpers — image output formatting
 # ---------------------------------------------------------------------------
+def _save_to_folder(jpeg_bytes: bytes, folder: str, prefix: str = "gen") -> str | None:
+    """Save JPEG bytes to a local folder. Returns the saved file path, or None on failure."""
+    try:
+        os.makedirs(folder, exist_ok=True)
+        filename = f"{prefix}_{uuid.uuid4().hex[:8]}.jpg"
+        path = os.path.join(folder, filename)
+        with open(path, "wb") as f:
+            f.write(jpeg_bytes)
+        return path
+    except Exception as e:
+        log(f"[nanobanana] Warning: failed to save image to {folder}: {e}\n")
+        return None
+
+
+async def _background_s3_upload(jpeg_bytes: bytes, prefix: str = "gen") -> None:
+    """Upload to S3 in the background as a catch-all. Errors are logged, not raised."""
+    try:
+        await _run_in_thread(_upload_to_s3, jpeg_bytes, prefix)
+    except Exception as e:
+        log(f"[nanobanana] S3 catch-all upload failed (non-fatal): {e}\n")
+
+
 def _build_image_response(
     result: dict,
     generated: list[tuple[bytes, dict]],
-    output_mode: str,
+    save_folder: str | None = None,
     prefix: str = "gen",
 ) -> str:
     """Build a tool response with metadata + images.
 
     generated: list of (jpeg_bytes, per_image_metadata) tuples.
 
-    url mode (default): stores images server-side, returns /images/ URLs.
-        Avoids large base64 blobs that overflow Claude Code's tool result limit.
-    cloud mode (gcs/s3): uploads to cloud storage, returns durable public URLs.
+    Always stores images server-side for URL chaining (/images/ URLs, 1-hour TTL).
+    If save_folder is provided, also writes JPEG files there.
+    S3 catch-all upload (if S3_BUCKET is set) happens in a background task.
     """
-    if output_mode in ("gcs", "s3", "cloud"):
-        for jpeg_bytes, meta in generated:
-            cloud_url = _upload_to_cloud(jpeg_bytes, prefix=prefix)
-            meta["image_url"] = cloud_url  # consistent key across all output modes
-            meta["size_kb"] = len(jpeg_bytes) // 1024
-        if len(generated) == 1:
-            result.update(generated[0][1])
-            result.pop("index", None)
-        else:
-            result["images"] = [{k: v for k, v in meta.items() if k != "index"} for _, meta in generated]
-        return json.dumps(result)
+    base_url = _get_upload_base_url()
+    for jpeg_bytes, meta in generated:
+        img_id = _store_image(jpeg_bytes, "image/jpeg")
+        meta["image_url"] = f"{base_url}/images/{img_id}"
+        meta["expires_in"] = "1 hour"
+        meta["size_kb"] = len(jpeg_bytes) // 1024
+        if save_folder:
+            saved_path = _save_to_folder(jpeg_bytes, save_folder, prefix)
+            if saved_path:
+                meta["saved_to"] = saved_path
+    if len(generated) == 1:
+        result.update(generated[0][1])
+        result.pop("index", None)
     else:
-        # url mode (default) — also handles "base64" requests since Image type
-        # cannot serialize over HTTP/MCP proxy transport.
-        base_url = _get_upload_base_url()
-        for jpeg_bytes, meta in generated:
-            img_id = _store_image(jpeg_bytes, "image/jpeg")
-            meta["image_url"] = f"{base_url}/images/{img_id}"
-            meta["expires_in"] = "1 hour"
-            meta["size_kb"] = len(jpeg_bytes) // 1024
-        if len(generated) == 1:
-            result.update(generated[0][1])
-            result.pop("index", None)
-        else:
-            result["images"] = [{k: v for k, v in meta.items() if k != "index"} for _, meta in generated]
-        return json.dumps(result)
+        result["images"] = [{k: v for k, v in meta.items() if k != "index"} for _, meta in generated]
+    return json.dumps(result)
 
 
 # ---------------------------------------------------------------------------
@@ -1027,12 +1035,16 @@ async def generate_image(
     quality: str = "default",
     count: int = 1,
     qa: bool = False,
-    output: str = DEFAULT_OUTPUT,
+    save_folder: str | None = None,
 ) -> list | str:
     """Generate an image from a text prompt with optional reference images and style presets.
 
     Reference images guide the model on style, subject appearance, or composition.
     Only pass URLs — use upload_image first if needed.
+
+    Generated images are always displayed inline in Claude. If save_folder is provided,
+    images are also saved as JPEG files in that directory. When S3 is configured server-side,
+    images are automatically backed up to S3 in the background.
 
     Args:
         prompt: What to generate. Describe subject, style, lighting, mood, etc.
@@ -1045,10 +1057,10 @@ async def generate_image(
         quality: "default" (fast) or "pro" (higher quality). Default: default
         count: Number of images to generate (1–4). Default: 1
         qa: If true, AI-score each image. When count > 1, ranks by total score.
-        output: "url" (default, returns /images/ URLs), "cloud"/"s3"/"gcs" (durable cloud URLs).
+        save_folder: Optional local folder path to save generated JPEG files.
 
     Returns:
-        Metadata JSON with image URLs.
+        Metadata JSON with image URLs, plus inline images rendered in Claude.
     """
     from google.genai import types
 
@@ -1058,10 +1070,6 @@ async def generate_image(
         return json.dumps({"error": f"Unsupported resolution '{resolution}'.", "supported": sorted(RESOLUTIONS)})
     if style and style not in STYLE_PRESETS:
         return json.dumps({"error": f"Unknown style '{style}'.", "available": sorted(STYLE_PRESETS.keys())})
-    if output not in ("url", "base64", "gcs", "s3", "cloud"):  # base64 accepted, remapped to url
-        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["url", "cloud", "s3", "gcs"]})
-    if output in ("gcs", "s3", "cloud") and not S3_BUCKET and not GCS_BUCKET:
-        return json.dumps({"error": "Cloud output requested but no storage configured. Set S3_BUCKET or GCS_BUCKET env var."})
 
     count = max(1, min(count, 4))
 
@@ -1141,9 +1149,13 @@ async def generate_image(
         result["errors"] = errors
 
     try:
-        json_result = await _run_in_thread(_build_image_response, result, generated, output, prefix="gen")
+        json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="gen")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload generated images: {e}"})
+    # Upload to S3 in the background as a catch-all (non-blocking).
+    if S3_BUCKET:
+        for jpeg_bytes, _ in generated:
+            asyncio.ensure_future(_background_s3_upload(jpeg_bytes, "gen"))
     # Embed images as MCP Image content so Claude.ai renders them inline.
     # JSON metadata is still returned first for tool chaining (image_url field).
     return [json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
@@ -1159,11 +1171,14 @@ async def edit_image(
     edit_mode: str = "inpaint-insertion",
     aspect_ratio: str | None = None,
     count: int = 1,
-    output: str = DEFAULT_OUTPUT,
+    save_folder: str | None = None,
 ) -> list | str:
     """Edit an existing image — add objects, remove objects, or extend the canvas.
 
     Only pass URLs — use upload_image first if needed.
+
+    Edited images are always displayed inline in Claude. If save_folder is provided,
+    images are also saved as JPEG files in that directory.
 
     Args:
         image: Source image URL. Use upload_image first if needed.
@@ -1182,10 +1197,10 @@ async def edit_image(
                    "outpaint" (extend canvas). Default: inpaint-insertion
         aspect_ratio: Output aspect ratio (useful for outpaint). Default: same as input.
         count: Number of candidates (1–4). Default: 1
-        output: "url" (default, returns /images/ URLs), "cloud"/"s3"/"gcs" (durable cloud URLs).
+        save_folder: Optional local folder path to save edited JPEG files.
 
     Returns:
-        Metadata JSON with image URLs.
+        Metadata JSON with image URLs, plus inline images rendered in Claude.
     """
     from google.genai import types
 
@@ -1194,10 +1209,6 @@ async def edit_image(
         return json.dumps({"error": f"Unknown edit_mode '{edit_mode}'.", "available": sorted(valid_edit_modes)})
     if aspect_ratio is not None and aspect_ratio not in SUPPORTED_RATIOS:
         return json.dumps({"error": f"Unsupported aspect ratio '{aspect_ratio}'.", "supported": sorted(SUPPORTED_RATIOS)})
-    if output not in ("url", "base64", "gcs", "s3", "cloud"):  # base64 accepted, remapped to url
-        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["url", "cloud", "s3", "gcs"]})
-    if output in ("gcs", "s3", "cloud") and not S3_BUCKET and not GCS_BUCKET:
-        return json.dumps({"error": "Cloud output requested but no storage configured. Set S3_BUCKET or GCS_BUCKET env var."})
 
     count = max(1, min(count, 4))
 
@@ -1269,9 +1280,12 @@ async def edit_image(
     if errors:
         result["errors"] = errors
     try:
-        json_result = await _run_in_thread(_build_image_response, result, generated, output, prefix="edit")
+        json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="edit")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload edited images: {e}"})
+    if S3_BUCKET:
+        for jpeg_bytes, _ in generated:
+            asyncio.ensure_future(_background_s3_upload(jpeg_bytes, "edit"))
     return [json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
 
 
@@ -1282,31 +1296,30 @@ async def swap_background(
     image: str,
     aspect_ratio: str | None = None,
     count: int = 1,
-    output: str = DEFAULT_OUTPUT,
+    save_folder: str | None = None,
 ) -> list | str:
     """Replace the background of an image while keeping the foreground subject intact.
 
     Automatically segments the foreground and generates a new background.
     Only pass URLs — use upload_image first if needed.
 
+    Result images are always displayed inline in Claude. If save_folder is provided,
+    images are also saved as JPEG files in that directory.
+
     Args:
         image: Source image URL. Use upload_image first if needed.
         background: Description of the new background. Be specific.
         aspect_ratio: Output aspect ratio. Default: same as input.
         count: Number of candidates (1–4). Default: 1
-        output: "url" (default, returns /images/ URLs), "cloud"/"s3"/"gcs" (durable cloud URLs).
+        save_folder: Optional local folder path to save result JPEG files.
 
     Returns:
-        Metadata JSON with image URLs.
+        Metadata JSON with image URLs, plus inline images rendered in Claude.
     """
     from google.genai import types
 
     if aspect_ratio is not None and aspect_ratio not in SUPPORTED_RATIOS:
         return json.dumps({"error": f"Unsupported aspect ratio '{aspect_ratio}'.", "supported": sorted(SUPPORTED_RATIOS)})
-    if output not in ("url", "base64", "gcs", "s3", "cloud"):  # base64 accepted, remapped to url
-        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["url", "cloud", "s3", "gcs"]})
-    if output in ("gcs", "s3", "cloud") and not S3_BUCKET and not GCS_BUCKET:
-        return json.dumps({"error": "Cloud output requested but no storage configured. Set S3_BUCKET or GCS_BUCKET env var."})
 
     count = max(1, min(count, 4))
 
@@ -1345,9 +1358,12 @@ async def swap_background(
     if errors:
         result["errors"] = errors
     try:
-        json_result = await _run_in_thread(_build_image_response, result, generated, output, prefix="bgswap")
+        json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="bgswap")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload background-swapped images: {e}"})
+    if S3_BUCKET:
+        for jpeg_bytes, _ in generated:
+            asyncio.ensure_future(_background_s3_upload(jpeg_bytes, "bgswap"))
     return [json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
 
 
@@ -1362,12 +1378,15 @@ async def create_variations(
     quality: str = "default",
     count: int = 3,
     qa: bool = False,
-    output: str = DEFAULT_OUTPUT,
+    save_folder: str | None = None,
 ) -> list | str:
     """Generate variations of an existing image.
 
     Preserves the core subject while exploring different compositions, lighting,
     or styling. Only pass URLs — use upload_image first if needed.
+
+    Variations are always displayed inline in Claude. If save_folder is provided,
+    images are also saved as JPEG files in that directory.
 
     Args:
         image: Source image URL. Use upload_image first if needed.
@@ -1378,10 +1397,10 @@ async def create_variations(
         quality: "default" or "pro". Default: default
         count: Number of variations (1–4). Default: 3
         qa: Score each variation and rank by quality. Default: false
-        output: "url" (default, returns /images/ URLs), "cloud"/"s3"/"gcs" (durable cloud URLs).
+        save_folder: Optional local folder path to save variation JPEG files.
 
     Returns:
-        Metadata JSON with image URLs.
+        Metadata JSON with image URLs, plus inline images rendered in Claude.
     """
     from google.genai import types
 
@@ -1389,10 +1408,6 @@ async def create_variations(
         return json.dumps({"error": f"Unsupported aspect ratio '{aspect_ratio}'.", "supported": sorted(SUPPORTED_RATIOS)})
     if resolution not in RESOLUTIONS:
         return json.dumps({"error": f"Unsupported resolution '{resolution}'.", "supported": sorted(RESOLUTIONS)})
-    if output not in ("url", "base64", "gcs", "s3", "cloud"):  # base64 accepted, remapped to url
-        return json.dumps({"error": f"Unknown output mode '{output}'.", "available": ["url", "cloud", "s3", "gcs"]})
-    if output in ("gcs", "s3", "cloud") and not S3_BUCKET and not GCS_BUCKET:
-        return json.dumps({"error": "Cloud output requested but no storage configured. Set S3_BUCKET or GCS_BUCKET env var."})
 
     strength_prompts = {
         "subtle": "Create a subtle variation of this image, keeping the composition and style very close to the original with only minor differences in details. ",
@@ -1455,9 +1470,12 @@ async def create_variations(
         result["guidance"] = prompt
 
     try:
-        json_result = await _run_in_thread(_build_image_response, result, generated, output, prefix="var")
+        json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="var")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload variation images: {e}"})
+    if S3_BUCKET:
+        for jpeg_bytes, _ in generated:
+            asyncio.ensure_future(_background_s3_upload(jpeg_bytes, "var"))
     return [json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
 
 
@@ -1814,11 +1832,11 @@ if __name__ == "__main__":
     else:
         log(f"Starting NanoBanana MCP server ({transport} transport)\n")
     if S3_BUCKET:
-        log(f"  S3 storage: s3://{S3_BUCKET} (region: {S3_REGION})\n")
+        log(f"  S3 catch-all: s3://{S3_BUCKET} (region: {S3_REGION}) — images auto-uploaded in background\n")
     if GCS_BUCKET:
         log(f"  GCS storage: gs://{GCS_BUCKET}\n")
     if not S3_BUCKET and not GCS_BUCKET:
         log("  No cloud storage configured (set S3_BUCKET or GCS_BUCKET to enable)\n")
-    log(f"  Default output mode: {DEFAULT_OUTPUT}\n\n")
+    log("\n")
 
     mcp.run(transport=transport)

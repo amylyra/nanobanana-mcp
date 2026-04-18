@@ -256,25 +256,23 @@ class TestGenerateImageValidation:
         assert "available" in data
 
     @pytest.mark.asyncio
-    async def test_bad_output_mode(self):
-        result = await server.generate_image("test", output="ftp")
-        data = _parse_result(result)
-        assert "error" in data
+    async def test_save_folder_invalid_path_is_non_fatal(self):
+        """save_folder pointing to an unwritable path logs a warning but doesn't fail."""
+        mock_client = MagicMock()
+        test_img = _make_test_image(64, 64)
+        mock_part = MagicMock()
+        mock_part.inline_data = MagicMock(mime_type="image/png", data=test_img)
+        mock_candidate = MagicMock()
+        mock_candidate.content.parts = [mock_part]
+        mock_response = MagicMock()
+        mock_response.candidates = [mock_candidate]
+        mock_client.models.generate_content.return_value = mock_response
 
-    @pytest.mark.asyncio
-    async def test_cloud_without_bucket(self):
-        """Cloud output without configured bucket should fail early."""
-        orig_s3, orig_gcs = server.S3_BUCKET, server.GCS_BUCKET
-        server.S3_BUCKET = None
-        server.GCS_BUCKET = None
-        try:
-            result = await server.generate_image("test", output="cloud")
-            data = _parse_result(result)
-            assert "error" in data
-            assert "storage" in data["error"].lower() or "bucket" in data["error"].lower()
-        finally:
-            server.S3_BUCKET = orig_s3
-            server.GCS_BUCKET = orig_gcs
+        with patch.object(server, "_get_client", return_value=mock_client):
+            # /root/noperms should fail to create on macOS — _save_to_folder swallows it
+            result = await server.generate_image("test", save_folder="/root/noperms/nbtest")
+        # Should still return images even if folder save fails
+        assert isinstance(result, list)
 
     @pytest.mark.asyncio
     async def test_empty_reference_image_rejected(self):
@@ -296,52 +294,59 @@ class TestNoDoubleJPEG:
         with server._STORE_LOCK:
             server._IMAGE_STORE.clear()
 
-    def test_base64_output_remapped_to_url(self):
-        """base64 mode is remapped to url mode — Image type cannot serialize
-        over HTTP/MCP proxy transport, so we return a JSON string with a URL."""
+    def test_always_stores_http_url(self):
+        """Images are always stored server-side and get /images/ HTTP URLs."""
         jpeg = _make_test_image(100, 100)
         result = server._build_image_response(
             {"test": True},
             [(jpeg, {"index": 1})],
-            output_mode="base64",
         )
         assert isinstance(result, str)
-        metadata = _parse_result(result)
-        assert "image_url" in metadata
-        assert metadata["image_url"].startswith("http")
-
-    def test_base64_output_stores_http_url(self):
-        """Images should be stored and get /images/ HTTP URLs (not nanobanana://)."""
-        jpeg = _make_test_image(100, 100)
-        result = server._build_image_response(
-            {},
-            [(jpeg, {"index": 1})],
-            output_mode="base64",
-        )
         metadata = _parse_result(result)
         assert "image_url" in metadata
         assert "/images/" in metadata["image_url"]
+        assert metadata["image_url"].startswith("http")
 
-    def test_cloud_output_returns_string(self):
-        """Cloud mode should return a JSON string, not a list."""
+    def test_expires_in_set(self):
+        """Stored images include expires_in field."""
         jpeg = _make_test_image(100, 100)
-        with patch.object(server, "_upload_to_cloud", return_value="https://bucket.s3.amazonaws.com/gen/test.jpg"):
-            result = server._build_image_response(
-                {},
-                [(jpeg, {"index": 1})],
-                output_mode="cloud",
-            )
-        assert isinstance(result, str)
-        data = _parse_result(result)
-        assert "image_url" in data  # consistent key name across all output modes
+        result = server._build_image_response({}, [(jpeg, {"index": 1})])
+        metadata = _parse_result(result)
+        assert "expires_in" in metadata
 
     def test_multiple_images_structure(self):
         """Multiple images should produce an 'images' array in metadata."""
         imgs = [(_make_test_image(100, 100), {"index": i}) for i in range(3)]
-        result = server._build_image_response({}, imgs, output_mode="url")
+        result = server._build_image_response({}, imgs)
         metadata = _parse_result(result)
         assert "images" in metadata
         assert len(metadata["images"]) == 3
+
+    def test_save_folder_writes_files(self, tmp_path):
+        """When save_folder is provided, JPEG files are written there."""
+        jpeg = _make_test_image(100, 100)
+        result = server._build_image_response(
+            {}, [(jpeg, {"index": 1})], save_folder=str(tmp_path), prefix="test"
+        )
+        metadata = _parse_result(result)
+        assert "saved_to" in metadata
+        saved = metadata["saved_to"]
+        assert saved.startswith(str(tmp_path))
+        assert os.path.isfile(saved)
+        # File should be a valid JPEG
+        from PIL import Image as PILImage
+        from io import BytesIO
+        with open(saved, "rb") as f:
+            PILImage.open(f).verify()
+
+    def test_save_folder_multiple_images(self, tmp_path):
+        """Multiple images with save_folder — each gets its own file."""
+        imgs = [(_make_test_image(100, 100), {"index": i}) for i in range(3)]
+        result = server._build_image_response({}, imgs, save_folder=str(tmp_path), prefix="var")
+        metadata = _parse_result(result)
+        for img_meta in metadata["images"]:
+            assert "saved_to" in img_meta
+            assert os.path.isfile(img_meta["saved_to"])
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +457,7 @@ class TestGenerateImageFlow:
         mock_client.models.generate_content.return_value = self._mock_gemini_response()
 
         with patch.object(server, "_get_client", return_value=mock_client):
-            result = await server.generate_image("a cute cat", output="url")
+            result = await server.generate_image("a cute cat")
 
         # Tools now return [json_str, Image, ...] for inline display in Claude.ai
         assert isinstance(result, list)
@@ -910,7 +915,7 @@ class TestChaining:
 
         # Step 1: Generate
         with patch.object(server, "_get_client", return_value=mock_client):
-            gen_result = await server.generate_image("a cat", output="url")
+            gen_result = await server.generate_image("a cat")
 
         gen_meta = _parse_result(gen_result)
         cat_url = gen_meta["image_url"]
@@ -936,7 +941,7 @@ class TestChaining:
         mock_ctx = MagicMock()
 
         with patch.object(server, "_get_client", return_value=mock_client):
-            gen_result = await server.generate_image("product on white", output="url")
+            gen_result = await server.generate_image("product on white")
 
         gen_meta = _parse_result(gen_result)
         product_url = gen_meta["image_url"]
@@ -960,7 +965,7 @@ class TestChaining:
         mock_ctx = MagicMock()
 
         with patch.object(server, "_get_client", return_value=mock_client):
-            gen_result = await server.generate_image("landscape", output="url")
+            gen_result = await server.generate_image("landscape")
 
         gen_meta = _parse_result(gen_result)
         url = gen_meta["image_url"]
@@ -981,40 +986,40 @@ class TestChaining:
 # ---------------------------------------------------------------------------
 
 class TestCloudOutputKeyConsistency:
-    """Verify that image_url key is used consistently in both base64 and cloud modes."""
+    """Verify that image_url key is always present and points to /images/ URLs."""
 
-    def test_single_image_base64(self):
+    def setup_method(self):
+        with server._STORE_LOCK:
+            server._IMAGE_STORE.clear()
+
+    def test_single_image_has_image_url(self):
         jpeg = _make_test_image(100, 100)
-        result = server._build_image_response(
-            {}, [(jpeg, {"index": 1})], output_mode="base64",
-        )
+        result = server._build_image_response({}, [(jpeg, {"index": 1})])
         meta = _parse_result(result)
         assert "image_url" in meta
+        assert "/images/" in meta["image_url"]
 
-    def test_single_image_cloud(self):
+    def test_single_image_no_s3_domain(self):
+        """Default behavior never puts S3 URL in the metadata JSON."""
         jpeg = _make_test_image(100, 100)
-        with patch.object(server, "_upload_to_cloud", return_value="https://cdn.example.com/img.jpg"):
-            result = server._build_image_response(
-                {}, [(jpeg, {"index": 1})], output_mode="cloud",
-            )
+        result = server._build_image_response({}, [(jpeg, {"index": 1})])
         meta = _parse_result(result)
-        assert "image_url" in meta
-        assert meta["image_url"] == "https://cdn.example.com/img.jpg"
+        assert "amazonaws.com" not in meta["image_url"]
 
-    def test_multi_image_base64(self):
+    def test_multi_image_all_have_image_url(self):
         imgs = [(_make_test_image(100, 100), {"index": i}) for i in range(2)]
-        result = server._build_image_response({}, imgs, output_mode="base64")
+        result = server._build_image_response({}, imgs)
         meta = _parse_result(result)
         for img in meta["images"]:
             assert "image_url" in img
+            assert "/images/" in img["image_url"]
 
-    def test_multi_image_cloud(self):
-        imgs = [(_make_test_image(100, 100), {"index": i}) for i in range(2)]
-        with patch.object(server, "_upload_to_cloud", return_value="https://cdn.example.com/img.jpg"):
-            result = server._build_image_response({}, imgs, output_mode="cloud")
+    def test_size_kb_always_set(self):
+        jpeg = _make_test_image(100, 100)
+        result = server._build_image_response({}, [(jpeg, {"index": 1})])
         meta = _parse_result(result)
-        for img in meta["images"]:
-            assert "image_url" in img
+        assert "size_kb" in meta
+        assert isinstance(meta["size_kb"], int)
 
 
 # ---------------------------------------------------------------------------
@@ -1459,7 +1464,7 @@ class TestEmbeddedImageContract:
         mock_client.models.generate_content.return_value = self._mock_gemini_response()
 
         with patch.object(server, "_get_client", return_value=mock_client):
-            result = await server.generate_image("a sunset", output="url")
+            result = await server.generate_image("a sunset")
 
         assert isinstance(result, list), "Should return list, not str"
         assert len(result) == 2, f"Expected [json, image], got {len(result)} items"
@@ -1592,15 +1597,16 @@ class TestEmbeddedImageContract:
 
 
 # ---------------------------------------------------------------------------
-# 26. DEFAULT_OUTPUT env var — must not auto-enable cloud when S3_BUCKET is set
+# 26. Default image delivery — always inline + /images/ URL + optional S3 catch-all
 # ---------------------------------------------------------------------------
 
 class TestDefaultOutputBehavior:
-    """Validate DEFAULT_OUTPUT configuration contract.
+    """Validate the new default output contract:
 
-    Bug that was in production: DEFAULT_OUTPUT silently defaulted to "cloud"
-    whenever S3_BUCKET was set, routing all images to S3 instead of embedding
-    them for Claude.ai display. This test class would have caught that.
+    - Images always displayed inline in Claude (MCPImage in return list)
+    - image_url always points to /images/ (in-memory, 1-hour TTL) for chaining
+    - S3 catch-all upload fires in background when S3_BUCKET is configured
+    - save_folder writes JPEG files to disk when provided
     """
 
     def _mock_gemini_response(self):
@@ -1619,84 +1625,82 @@ class TestDefaultOutputBehavior:
         with server._STORE_LOCK:
             server._IMAGE_STORE.clear()
 
-    def test_default_output_is_url(self):
-        """DEFAULT_OUTPUT must be 'url' at module level — cloud is opt-in."""
-        assert server.DEFAULT_OUTPUT == "url", (
-            "DEFAULT_OUTPUT defaulted to something other than 'url'. "
-            "Cloud storage must be opt-in via DEFAULT_OUTPUT env var, "
-            "not auto-enabled by S3_BUCKET presence."
-        )
-
-    def test_s3_bucket_set_does_not_change_default_output(self):
-        """Setting S3_BUCKET must NOT change DEFAULT_OUTPUT to 'cloud'."""
-        original = server.DEFAULT_OUTPUT
-        original_s3 = server.S3_BUCKET
-        try:
-            server.S3_BUCKET = "some-bucket"
-            # DEFAULT_OUTPUT is determined at import time and stored as a module
-            # constant — it should not be affected by runtime S3_BUCKET changes.
-            assert server.DEFAULT_OUTPUT == "url", (
-                "S3_BUCKET being set changed DEFAULT_OUTPUT — "
-                "that's the bug that was sending all images to S3."
-            )
-        finally:
-            server.DEFAULT_OUTPUT = original
-            server.S3_BUCKET = original_s3
+    def test_images_always_stored_in_memory(self):
+        """Images always go to the in-memory store with /images/ URLs — no config needed."""
+        with server._STORE_LOCK:
+            server._IMAGE_STORE.clear()
+        jpeg = _make_test_image(100, 100)
+        result = server._build_image_response({}, [(jpeg, {"index": 1})])
+        meta = _parse_result(result)
+        assert "/images/" in meta["image_url"]
+        assert "amazonaws.com" not in meta["image_url"]
+        assert "storage.googleapis.com" not in meta["image_url"]
 
     @pytest.mark.asyncio
-    async def test_url_mode_images_served_from_server(self):
-        """url mode: image_url in JSON points to /images/ endpoint, not S3."""
+    async def test_images_served_from_server_by_default(self):
+        """generate_image always returns /images/ URLs regardless of S3 config."""
         mock_client = MagicMock()
         mock_client.models.generate_content.return_value = self._mock_gemini_response()
 
         with patch.object(server, "_get_client", return_value=mock_client):
-            result = await server.generate_image("cat", output="url")
+            result = await server.generate_image("cat")
 
         meta = _parse_result(result)
-        assert "/images/" in meta["image_url"], "url mode must return /images/ URL"
-        assert "amazonaws.com" not in meta["image_url"], "url mode must NOT go to S3"
-        assert "storage.googleapis.com" not in meta["image_url"]
+        assert "/images/" in meta["image_url"], "must return /images/ URL"
+        assert "amazonaws.com" not in meta["image_url"]
 
     @pytest.mark.asyncio
-    async def test_cloud_mode_with_s3_gives_s3_url_and_embeds(self):
-        """cloud mode: JSON has S3 URL AND image is still embedded for display."""
+    async def test_inline_images_always_embedded(self):
+        """Images are always embedded as MCPImage for inline display in Claude."""
         mock_client = MagicMock()
         mock_client.models.generate_content.return_value = self._mock_gemini_response()
 
-        fake_s3_url = "https://my-bucket.s3.us-east-1.amazonaws.com/gen/abc.jpg"
+        with patch.object(server, "_get_client", return_value=mock_client):
+            result = await server.generate_image("cat")
 
-        with patch.object(server, "_get_client", return_value=mock_client), \
-             patch.object(server, "_upload_to_cloud", return_value=fake_s3_url), \
-             patch.object(server, "S3_BUCKET", "my-bucket"), \
-             patch.object(server, "GCS_BUCKET", None):
-            result = await server.generate_image("cat", output="cloud")
-
-        # JSON must have the S3 URL for durable access
-        meta = _parse_result(result)
-        assert meta["image_url"] == fake_s3_url
-
-        # Image must STILL be embedded for clients that can render it
         assert isinstance(result, list)
         assert isinstance(result[1], MCPImage)
 
     @pytest.mark.asyncio
-    async def test_explicit_cloud_no_bucket_fails_early(self):
-        """output='cloud' with no bucket configured returns error before any API call."""
-        orig_s3, orig_gcs = server.S3_BUCKET, server.GCS_BUCKET
-        server.S3_BUCKET = None
-        server.GCS_BUCKET = None
+    async def test_s3_catch_all_fires_in_background(self):
+        """When S3_BUCKET is set, a background S3 upload is triggered (non-blocking)."""
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_gemini_response()
+
+        uploaded = []
+
+        async def fake_bg_upload(jpeg_bytes, prefix="gen"):
+            uploaded.append((prefix, len(jpeg_bytes)))
+
+        with patch.object(server, "_get_client", return_value=mock_client), \
+             patch.object(server, "S3_BUCKET", "my-bucket"), \
+             patch.object(server, "_background_s3_upload", side_effect=fake_bg_upload):
+            result = await server.generate_image("cat")
+            await asyncio.sleep(0)  # yield to let ensure_future tasks run
+
+        # Image URL is still /images/ (not S3)
+        meta = _parse_result(result)
+        assert "/images/" in meta["image_url"]
+        # Background upload was scheduled and ran
+        assert len(uploaded) == 1
+        assert uploaded[0][0] == "gen"
+
+    @pytest.mark.asyncio
+    async def test_no_s3_bucket_no_background_upload(self):
+        """When S3_BUCKET is not set, no background upload is triggered."""
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_gemini_response()
+
+        orig_s3 = server.S3_BUCKET
         try:
-            mock_client = MagicMock()
-            with patch.object(server, "_get_client", return_value=mock_client):
-                result = await server.generate_image("cat", output="cloud")
-            data = json.loads(result)  # must be str error, not list
-            assert "error" in data
-            assert "storage" in data["error"].lower() or "bucket" in data["error"].lower()
-            # Gemini must NOT have been called
-            mock_client.models.generate_content.assert_not_called()
+            server.S3_BUCKET = None
+            upload_called = []
+            with patch.object(server, "_get_client", return_value=mock_client), \
+                 patch.object(server, "_background_s3_upload", side_effect=lambda *a: upload_called.append(True)):
+                await server.generate_image("cat")
+            assert upload_called == []
         finally:
             server.S3_BUCKET = orig_s3
-            server.GCS_BUCKET = orig_gcs
 
 
 # ---------------------------------------------------------------------------
@@ -1704,13 +1708,12 @@ class TestDefaultOutputBehavior:
 # ---------------------------------------------------------------------------
 
 class TestClaudeCodeContext:
-    """Simulate a Claude Code user who has S3 configured and wants durable URLs.
+    """Simulate a Claude Code user with S3 configured for background catch-all storage.
 
-    In Claude Code:
-    - Set DEFAULT_OUTPUT=cloud (or pass output='cloud' per call)
-    - Generated images go to S3 — URL is durable (no 1-hour expiry)
-    - URL in JSON can be referenced in follow-up tool calls
-    - Embedding still present (Claude Code may not render it but doesn't break)
+    In this setup:
+    - Images are always displayed inline in Claude
+    - /images/ URLs are used for chaining (1-hour TTL)
+    - S3 upload happens in the background as an archival catch-all
     """
 
     def _mock_gemini_response(self):
@@ -1730,42 +1733,59 @@ class TestClaudeCodeContext:
             server._IMAGE_STORE.clear()
 
     @pytest.mark.asyncio
-    async def test_generate_then_edit_with_cloud_urls(self):
-        """Claude Code: generate to S3, then edit using the S3 URL."""
-        fake_s3_urls = [
-            "https://my-bucket.s3.us-east-1.amazonaws.com/gen/img1.jpg",
-            "https://my-bucket.s3.us-east-1.amazonaws.com/edit/img2.jpg",
-        ]
-        url_iter = iter(fake_s3_urls)
+    async def test_generate_then_edit_with_images_urls(self):
+        """Claude Code: generate, then edit using the returned /images/ URL."""
         mock_ctx = MagicMock()
         mock_client = MagicMock()
         mock_client.models.generate_content.return_value = self._mock_gemini_response()
 
-        with patch.object(server, "_get_client", return_value=mock_client), \
-             patch.object(server, "_upload_to_cloud", side_effect=lambda *a, **kw: next(url_iter)), \
-             patch.object(server, "S3_BUCKET", "my-bucket"), \
-             patch.object(server, "GCS_BUCKET", None):
-
-            # Step 1: Generate to S3
-            gen_result = await server.generate_image("product shot", output="cloud")
+        with patch.object(server, "_get_client", return_value=mock_client):
+            # Step 1: Generate — images go to in-memory store
+            gen_result = await server.generate_image("product shot")
             gen_meta = _parse_result(gen_result)
-            assert gen_meta["image_url"] == fake_s3_urls[0]
+            assert "/images/" in gen_meta["image_url"]
 
-            # Step 2: Edit using the S3 URL — _fetch_url will be called for the S3 URL
-            with patch.object(server, "_fetch_url",
-                               return_value=(_make_test_image(512, 512), "image/jpeg")):
-                edit_result = await server.edit_image(
-                    image=gen_meta["image_url"],
-                    prompt="add studio lighting",
-                    ctx=mock_ctx,
-                    output="cloud",
-                )
+            # Step 2: Edit using the /images/ URL from step 1
+            edit_result = await server.edit_image(
+                image=gen_meta["image_url"],
+                prompt="add studio lighting",
+                ctx=mock_ctx,
+            )
 
         edit_meta = _parse_result(edit_result)
-        assert edit_meta["image_url"] == fake_s3_urls[1]
+        assert "image_url" in edit_meta
         # Embedding present in both results
         assert isinstance(gen_result, list) and isinstance(gen_result[1], MCPImage)
         assert isinstance(edit_result, list) and isinstance(edit_result[1], MCPImage)
+
+    @pytest.mark.asyncio
+    async def test_s3_catch_all_fires_for_both_gen_and_edit(self):
+        """With S3_BUCKET set, both generate and edit trigger background S3 uploads."""
+        mock_ctx = MagicMock()
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_gemini_response()
+        uploads = []
+
+        async def fake_bg_upload(jpeg_bytes, prefix="gen"):
+            uploads.append(prefix)
+
+        with patch.object(server, "_get_client", return_value=mock_client), \
+             patch.object(server, "S3_BUCKET", "my-bucket"), \
+             patch.object(server, "_background_s3_upload", side_effect=fake_bg_upload):
+
+            gen_result = await server.generate_image("cat")
+            await asyncio.sleep(0)  # yield to let ensure_future tasks run
+            gen_meta = _parse_result(gen_result)
+
+            await server.edit_image(
+                image=gen_meta["image_url"],
+                prompt="add hat",
+                ctx=mock_ctx,
+            )
+            await asyncio.sleep(0)
+
+        assert "gen" in uploads
+        assert "edit" in uploads
 
     @pytest.mark.asyncio
     async def test_url_mode_image_expires_after_chain(self):
@@ -1775,7 +1795,7 @@ class TestClaudeCodeContext:
         mock_client.models.generate_content.return_value = self._mock_gemini_response()
 
         with patch.object(server, "_get_client", return_value=mock_client):
-            gen_result = await server.generate_image("landscape", output="url")
+            gen_result = await server.generate_image("landscape")
 
         gen_meta = _parse_result(gen_result)
         image_url = gen_meta["image_url"]
