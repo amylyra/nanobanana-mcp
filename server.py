@@ -1024,7 +1024,7 @@ async def upload_image(
     })
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def generate_image(
     prompt: str,
     reference_images: list[str] | None = None,
@@ -1161,7 +1161,7 @@ async def generate_image(
     return [json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def edit_image(
     prompt: str,
     ctx: Context,
@@ -1289,7 +1289,7 @@ async def edit_image(
     return [json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def swap_background(
     background: str,
     ctx: Context,
@@ -1367,7 +1367,7 @@ async def swap_background(
     return [json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
 
 
-@mcp.tool()
+@mcp.tool(structured_output=False)
 async def create_variations(
     ctx: Context,
     image: str,
