@@ -844,14 +844,6 @@ def _save_to_folder(jpeg_bytes: bytes, folder: str, prefix: str = "gen") -> str 
         return None
 
 
-async def _background_s3_upload(jpeg_bytes: bytes, prefix: str = "gen") -> None:
-    """Upload to S3 in the background as a catch-all. Errors are logged, not raised."""
-    try:
-        await _run_in_thread(_upload_to_s3, jpeg_bytes, prefix)
-    except Exception as e:
-        log(f"[nanobanana] S3 catch-all upload failed (non-fatal): {e}\n")
-
-
 def _build_image_response(
     result: dict,
     generated: list[tuple[bytes, dict]],
@@ -862,16 +854,27 @@ def _build_image_response(
 
     generated: list of (jpeg_bytes, per_image_metadata) tuples.
 
-    Always stores images server-side for URL chaining (/images/ URLs, 1-hour TTL).
+    Always stores images server-side (/images/ URLs, 1-hour TTL) for tool chaining.
+    If S3 is configured, also uploads to S3 and uses the durable S3 URL as image_url
+    so users have a persistent link even when inline rendering isn't available.
     If save_folder is provided, also writes JPEG files there.
-    S3 catch-all upload (if S3_BUCKET is set) happens in a background task.
     """
     base_url = _get_upload_base_url()
     for jpeg_bytes, meta in generated:
         img_id = _store_image(jpeg_bytes, "image/jpeg")
-        meta["image_url"] = f"{base_url}/images/{img_id}"
-        meta["expires_in"] = "1 hour"
+        local_url = f"{base_url}/images/{img_id}"
         meta["size_kb"] = len(jpeg_bytes) // 1024
+        if S3_BUCKET:
+            try:
+                s3_url = _upload_to_s3(jpeg_bytes, prefix=prefix)
+                meta["image_url"] = s3_url
+            except Exception as e:
+                log(f"[nanobanana] S3 upload failed, falling back to local URL: {e}\n")
+                meta["image_url"] = local_url
+                meta["expires_in"] = "1 hour"
+        else:
+            meta["image_url"] = local_url
+            meta["expires_in"] = "1 hour"
         if save_folder:
             saved_path = _save_to_folder(jpeg_bytes, save_folder, prefix)
             if saved_path:
@@ -1152,10 +1155,6 @@ async def generate_image(
         json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="gen")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload generated images: {e}"})
-    # Upload to S3 in the background as a catch-all (non-blocking).
-    if S3_BUCKET:
-        for jpeg_bytes, _ in generated:
-            asyncio.ensure_future(_background_s3_upload(jpeg_bytes, "gen"))
     # Embed images as MCP Image content so Claude.ai renders them inline.
     # JSON metadata is still returned first for tool chaining (image_url field).
     return [json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
@@ -1283,9 +1282,6 @@ async def edit_image(
         json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="edit")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload edited images: {e}"})
-    if S3_BUCKET:
-        for jpeg_bytes, _ in generated:
-            asyncio.ensure_future(_background_s3_upload(jpeg_bytes, "edit"))
     return [json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
 
 
@@ -1361,9 +1357,6 @@ async def swap_background(
         json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="bgswap")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload background-swapped images: {e}"})
-    if S3_BUCKET:
-        for jpeg_bytes, _ in generated:
-            asyncio.ensure_future(_background_s3_upload(jpeg_bytes, "bgswap"))
     return [json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
 
 
@@ -1473,9 +1466,7 @@ async def create_variations(
         json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="var")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload variation images: {e}"})
-    if S3_BUCKET:
-        for jpeg_bytes, _ in generated:
-            asyncio.ensure_future(_background_s3_upload(jpeg_bytes, "var"))
+
     return [json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
 
 

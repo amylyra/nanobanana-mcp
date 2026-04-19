@@ -999,12 +999,18 @@ class TestCloudOutputKeyConsistency:
         assert "image_url" in meta
         assert "/images/" in meta["image_url"]
 
-    def test_single_image_no_s3_domain(self):
-        """Default behavior never puts S3 URL in the metadata JSON."""
-        jpeg = _make_test_image(100, 100)
-        result = server._build_image_response({}, [(jpeg, {"index": 1})])
-        meta = _parse_result(result)
-        assert "amazonaws.com" not in meta["image_url"]
+    def test_single_image_no_s3_domain_without_bucket(self):
+        """Without S3_BUCKET, image_url is a local /images/ URL."""
+        orig_s3 = server.S3_BUCKET
+        try:
+            server.S3_BUCKET = None
+            jpeg = _make_test_image(100, 100)
+            result = server._build_image_response({}, [(jpeg, {"index": 1})])
+            meta = _parse_result(result)
+            assert "amazonaws.com" not in meta["image_url"]
+            assert "/images/" in meta["image_url"]
+        finally:
+            server.S3_BUCKET = orig_s3
 
     def test_multi_image_all_have_image_url(self):
         imgs = [(_make_test_image(100, 100), {"index": i}) for i in range(2)]
@@ -1637,17 +1643,22 @@ class TestDefaultOutputBehavior:
         assert "storage.googleapis.com" not in meta["image_url"]
 
     @pytest.mark.asyncio
-    async def test_images_served_from_server_by_default(self):
-        """generate_image always returns /images/ URLs regardless of S3 config."""
+    async def test_no_s3_returns_local_images_url(self):
+        """Without S3, generate_image returns /images/ URL with expiry."""
         mock_client = MagicMock()
         mock_client.models.generate_content.return_value = self._mock_gemini_response()
 
-        with patch.object(server, "_get_client", return_value=mock_client):
-            result = await server.generate_image("cat")
-
-        meta = _parse_result(result)
-        assert "/images/" in meta["image_url"], "must return /images/ URL"
-        assert "amazonaws.com" not in meta["image_url"]
+        orig_s3 = server.S3_BUCKET
+        try:
+            server.S3_BUCKET = None
+            with patch.object(server, "_get_client", return_value=mock_client):
+                result = await server.generate_image("cat")
+            meta = _parse_result(result)
+            assert "/images/" in meta["image_url"], "must return /images/ URL"
+            assert "amazonaws.com" not in meta["image_url"]
+            assert "expires_in" in meta
+        finally:
+            server.S3_BUCKET = orig_s3
 
     @pytest.mark.asyncio
     async def test_inline_images_always_embedded(self):
@@ -1662,43 +1673,39 @@ class TestDefaultOutputBehavior:
         assert isinstance(result[1], MCPImage)
 
     @pytest.mark.asyncio
-    async def test_s3_catch_all_fires_in_background(self):
-        """When S3_BUCKET is set, a background S3 upload is triggered (non-blocking)."""
+    async def test_s3_bucket_gives_s3_url_in_metadata(self):
+        """When S3_BUCKET is set, image_url in metadata is the durable S3 URL."""
         mock_client = MagicMock()
         mock_client.models.generate_content.return_value = self._mock_gemini_response()
 
-        uploaded = []
-
-        async def fake_bg_upload(jpeg_bytes, prefix="gen"):
-            uploaded.append((prefix, len(jpeg_bytes)))
+        fake_s3_url = "https://my-bucket.s3.us-east-1.amazonaws.com/gen/abc123.jpg"
 
         with patch.object(server, "_get_client", return_value=mock_client), \
              patch.object(server, "S3_BUCKET", "my-bucket"), \
-             patch.object(server, "_background_s3_upload", side_effect=fake_bg_upload):
+             patch.object(server, "_upload_to_s3", return_value=fake_s3_url):
             result = await server.generate_image("cat")
-            await asyncio.sleep(0)  # yield to let ensure_future tasks run
 
-        # Image URL is still /images/ (not S3)
         meta = _parse_result(result)
-        assert "/images/" in meta["image_url"]
-        # Background upload was scheduled and ran
-        assert len(uploaded) == 1
-        assert uploaded[0][0] == "gen"
+        assert meta["image_url"] == fake_s3_url, "S3 URL must be returned as image_url"
+        assert "amazonaws.com" in meta["image_url"]
+        assert "expires_in" not in meta, "S3 URLs don't expire"
+        # Inline image still embedded
+        assert isinstance(result, list) and isinstance(result[1], MCPImage)
 
     @pytest.mark.asyncio
-    async def test_no_s3_bucket_no_background_upload(self):
-        """When S3_BUCKET is not set, no background upload is triggered."""
+    async def test_no_s3_bucket_uses_local_url(self):
+        """When S3_BUCKET is not set, image_url is the /images/ endpoint."""
         mock_client = MagicMock()
         mock_client.models.generate_content.return_value = self._mock_gemini_response()
 
         orig_s3 = server.S3_BUCKET
         try:
             server.S3_BUCKET = None
-            upload_called = []
-            with patch.object(server, "_get_client", return_value=mock_client), \
-                 patch.object(server, "_background_s3_upload", side_effect=lambda *a: upload_called.append(True)):
-                await server.generate_image("cat")
-            assert upload_called == []
+            with patch.object(server, "_get_client", return_value=mock_client):
+                result = await server.generate_image("cat")
+            meta = _parse_result(result)
+            assert "/images/" in meta["image_url"]
+            assert "expires_in" in meta
         finally:
             server.S3_BUCKET = orig_s3
 
@@ -1708,12 +1715,12 @@ class TestDefaultOutputBehavior:
 # ---------------------------------------------------------------------------
 
 class TestClaudeCodeContext:
-    """Simulate a Claude Code user with S3 configured for background catch-all storage.
+    """Simulate a Claude Code user with S3 configured.
 
     In this setup:
     - Images are always displayed inline in Claude
-    - /images/ URLs are used for chaining (1-hour TTL)
-    - S3 upload happens in the background as an archival catch-all
+    - image_url in metadata is the durable S3 URL (no expiry)
+    - Images also stored locally for /images/ serving
     """
 
     def _mock_gemini_response(self):
@@ -1759,33 +1766,33 @@ class TestClaudeCodeContext:
         assert isinstance(edit_result, list) and isinstance(edit_result[1], MCPImage)
 
     @pytest.mark.asyncio
-    async def test_s3_catch_all_fires_for_both_gen_and_edit(self):
-        """With S3_BUCKET set, both generate and edit trigger background S3 uploads."""
+    async def test_s3_urls_returned_for_both_gen_and_edit(self):
+        """With S3_BUCKET set, both generate and edit return S3 URLs in metadata."""
         mock_ctx = MagicMock()
         mock_client = MagicMock()
         mock_client.models.generate_content.return_value = self._mock_gemini_response()
-        uploads = []
-
-        async def fake_bg_upload(jpeg_bytes, prefix="gen"):
-            uploads.append(prefix)
+        s3_urls = iter([
+            "https://my-bucket.s3.us-east-1.amazonaws.com/gen/img1.jpg",
+            "https://my-bucket.s3.us-east-1.amazonaws.com/edit/img2.jpg",
+        ])
 
         with patch.object(server, "_get_client", return_value=mock_client), \
              patch.object(server, "S3_BUCKET", "my-bucket"), \
-             patch.object(server, "_background_s3_upload", side_effect=fake_bg_upload):
+             patch.object(server, "_upload_to_s3", side_effect=lambda *a, **kw: next(s3_urls)):
 
             gen_result = await server.generate_image("cat")
-            await asyncio.sleep(0)  # yield to let ensure_future tasks run
             gen_meta = _parse_result(gen_result)
+            assert "amazonaws.com" in gen_meta["image_url"]
 
-            await server.edit_image(
-                image=gen_meta["image_url"],
-                prompt="add hat",
-                ctx=mock_ctx,
-            )
-            await asyncio.sleep(0)
+            # Edit using the S3 URL — fetched as external HTTP
+            with patch.object(server, "_fetch_url",
+                               return_value=(_make_test_image(512, 512), "image/jpeg")):
+                edit_result = await server.edit_image(
+                    image=gen_meta["image_url"], prompt="add hat", ctx=mock_ctx,
+                )
 
-        assert "gen" in uploads
-        assert "edit" in uploads
+        edit_meta = _parse_result(edit_result)
+        assert "amazonaws.com" in edit_meta["image_url"]
 
     @pytest.mark.asyncio
     async def test_url_mode_image_expires_after_chain(self):
