@@ -1825,7 +1825,7 @@ if __name__ == "__main__":
     else:
         log(f"Starting NanoBanana MCP server ({transport} transport)\n")
     if S3_BUCKET:
-        log(f"  S3 catch-all: s3://{S3_BUCKET} (region: {S3_REGION}) — images auto-uploaded in background\n")
+        log(f"  S3 storage: s3://{S3_BUCKET} (region: {S3_REGION}) — durable URLs returned per generation\n")
     if GCS_BUCKET:
         log(f"  GCS storage: gs://{GCS_BUCKET}\n")
     if not S3_BUCKET and not GCS_BUCKET:
