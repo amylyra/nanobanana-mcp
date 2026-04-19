@@ -1045,9 +1045,7 @@ async def generate_image(
     Reference images guide the model on style, subject appearance, or composition.
     Only pass URLs — use upload_image first if needed.
 
-    Generated images are always displayed inline in Claude. If save_folder is provided,
-    images are also saved as JPEG files in that directory. When S3 is configured server-side,
-    images are automatically backed up to S3 in the background.
+    If save_folder is provided, images are also saved as JPEG files in that directory.
 
     Args:
         prompt: What to generate. Describe subject, style, lighting, mood, etc.
@@ -1063,7 +1061,8 @@ async def generate_image(
         save_folder: Optional local folder path to save generated JPEG files.
 
     Returns:
-        Metadata JSON with image URLs, plus inline images rendered in Claude.
+        Metadata JSON with image_url. Always show the image to the user by
+        including it in your reply as: ![](image_url)
     """
     from google.genai import types
 
@@ -1199,7 +1198,8 @@ async def edit_image(
         save_folder: Optional local folder path to save edited JPEG files.
 
     Returns:
-        Metadata JSON with image URLs, plus inline images rendered in Claude.
+        Metadata JSON with image_url. Always show the image to the user by
+        including it in your reply as: ![](image_url)
     """
     from google.genai import types
 
@@ -1310,7 +1310,8 @@ async def swap_background(
         save_folder: Optional local folder path to save result JPEG files.
 
     Returns:
-        Metadata JSON with image URLs, plus inline images rendered in Claude.
+        Metadata JSON with image_url. Always show the image to the user by
+        including it in your reply as: ![](image_url)
     """
     from google.genai import types
 
@@ -1393,7 +1394,8 @@ async def create_variations(
         save_folder: Optional local folder path to save variation JPEG files.
 
     Returns:
-        Metadata JSON with image URLs, plus inline images rendered in Claude.
+        Metadata JSON with image_url. Always show the image to the user by
+        including it in your reply as: ![](image_url)
     """
     from google.genai import types
 
