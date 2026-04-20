@@ -1172,7 +1172,7 @@ async def generate_image(
     # render_md is the first text item — Claude outputs it verbatim, showing images inline.
     # json_result is the second text item — contains image_url etc. for tool chaining.
     # Image objects provide previews in the tool result block.
-    return [render_md, json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
+    return [render_md, json_result]
 
 
 @mcp.tool(structured_output=False)
@@ -1299,7 +1299,7 @@ async def edit_image(
         render_md, json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="edit")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload edited images: {e}"})
-    return [render_md, json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
+    return [render_md, json_result]
 
 
 @mcp.tool(structured_output=False)
@@ -1376,7 +1376,7 @@ async def swap_background(
         render_md, json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="bgswap")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload background-swapped images: {e}"})
-    return [render_md, json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
+    return [render_md, json_result]
 
 
 @mcp.tool(structured_output=False)
@@ -1488,7 +1488,7 @@ async def create_variations(
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload variation images: {e}"})
 
-    return [render_md, json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
+    return [render_md, json_result]
 
 
 # ---------------------------------------------------------------------------
