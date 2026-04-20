@@ -2426,22 +2426,21 @@ class TestStructuredOutputFix:
             pydantic_core.to_json({"result": ['{"test": 1}', fake_img]})
 
     def test_convert_to_content_handles_image_correctly(self):
-        """fastmcp's _convert_to_content converts Image → ImageContent without error."""
+        """fastmcp's _convert_to_content converts [json_str, Image] → [TextContent, ImageContent]."""
         from mcp.server.fastmcp.utilities.func_metadata import _convert_to_content
         from mcp.server.fastmcp.utilities.types import Image as FastMCPImage
         from mcp.types import ImageContent, TextContent
 
-        render_md = "![](https://example.com/img.jpg)"
+        # Matches what tools actually return: [json_str, MCPImage]
         json_str = '{"image_url": "https://example.com/img.jpg"}'
         img = FastMCPImage(data=_make_test_image(64, 64), format="jpeg")
-        result = _convert_to_content([render_md, json_str, img])
+        result = _convert_to_content([json_str, img])
 
-        assert len(result) == 3
+        assert len(result) == 2
         assert isinstance(result[0], TextContent)
-        assert isinstance(result[1], TextContent)
-        assert isinstance(result[2], ImageContent)
-        assert result[2].mimeType == "image/jpeg"
-        assert len(result[2].data) > 0  # base64 data present
+        assert isinstance(result[1], ImageContent)
+        assert result[1].mimeType == "image/jpeg"
+        assert len(result[1].data) > 0  # base64 data present
 
     def test_all_four_tools_have_structured_output_false(self):
         """All 4 image generation tools must have structured_output=False."""
@@ -3038,6 +3037,320 @@ class TestServerInstructions:
             instructions = getattr(server.mcp, '_instructions', "") or getattr(server.mcp.settings, 'instructions', "")
         assert "/upload" in instructions, \
             "Instructions must include /upload page URL as fallback for image uploads"
+
+
+# ---------------------------------------------------------------------------
+# 36. Unsupported URL scheme detection in _decode_raw
+# ---------------------------------------------------------------------------
+
+class TestUnsupportedUrlScheme:
+    """_decode_raw must raise a clear error for schemes like gs://, s3://, ftp://.
+
+    Previously these fell through to raw base64 decoding and produced a
+    confusing "image corrupt or truncated" error.
+    """
+
+    def test_gs_scheme_raises_clear_error(self):
+        with pytest.raises(ValueError, match="Unsupported URL scheme"):
+            server._decode_raw("gs://my-bucket/image.jpg")
+
+    def test_s3_scheme_raises_clear_error(self):
+        with pytest.raises(ValueError, match="Unsupported URL scheme"):
+            server._decode_raw("s3://my-bucket/image.jpg")
+
+    def test_ftp_scheme_raises_clear_error(self):
+        with pytest.raises(ValueError, match="Unsupported URL scheme"):
+            server._decode_raw("ftp://example.com/image.jpg")
+
+    def test_file_scheme_raises_clear_error(self):
+        with pytest.raises(ValueError, match="Unsupported URL scheme"):
+            server._decode_raw("file:///tmp/image.jpg")
+
+    def test_http_scheme_still_accepted(self):
+        """http:// should NOT be blocked — that's a valid URL (goes to _fetch_url)."""
+        # http://localhost is SSRF-blocked, not scheme-blocked — different error path
+        with pytest.raises(ValueError, match="Blocked"):
+            server._decode_raw("http://localhost/image.jpg")
+
+    def test_data_uri_still_accepted(self):
+        """data: scheme must still work — it's decoded inline."""
+        img = _make_test_image(10, 10)
+        b64 = base64.b64encode(img).decode()
+        data, mime = server._decode_raw(f"data:image/jpeg;base64,{b64}")
+        assert mime == "image/jpeg"
+
+
+# ---------------------------------------------------------------------------
+# 37. Google Drive URL normalization — _normalize_share_url
+# ---------------------------------------------------------------------------
+
+class TestNormalizeShareUrl:
+    """_normalize_share_url rewrites Drive share links to direct download URLs."""
+
+    def test_file_view_url_rewritten(self):
+        url = "https://drive.google.com/file/d/ABC123XYZ/view?usp=sharing"
+        result = server._normalize_share_url(url)
+        assert result == "https://drive.google.com/uc?export=download&id=ABC123XYZ"
+
+    def test_file_preview_url_rewritten(self):
+        url = "https://drive.google.com/file/d/ABC123XYZ/preview"
+        result = server._normalize_share_url(url)
+        assert result == "https://drive.google.com/uc?export=download&id=ABC123XYZ"
+
+    def test_open_id_url_rewritten(self):
+        url = "https://drive.google.com/open?id=ABC123XYZ"
+        result = server._normalize_share_url(url)
+        assert result == "https://drive.google.com/uc?export=download&id=ABC123XYZ"
+
+    def test_docs_google_com_rewritten(self):
+        url = "https://docs.google.com/file/d/ABC123XYZ/view"
+        result = server._normalize_share_url(url)
+        assert result == "https://drive.google.com/uc?export=download&id=ABC123XYZ"
+
+    def test_non_drive_url_unchanged(self):
+        url = "https://example.com/image.jpg"
+        assert server._normalize_share_url(url) == url
+
+    def test_s3_url_unchanged(self):
+        url = "https://bucket.s3.amazonaws.com/gen/abc.jpg"
+        assert server._normalize_share_url(url) == url
+
+    def test_already_download_url_unchanged(self):
+        """A direct download URL (uc?export=download) must NOT be double-rewritten."""
+        url = "https://drive.google.com/uc?export=download&id=ABC123XYZ"
+        result = server._normalize_share_url(url)
+        # Should return as-is (no /file/d/ path to match)
+        assert result == url
+
+
+# ---------------------------------------------------------------------------
+# 38. compare_images Gemini exception handling
+# ---------------------------------------------------------------------------
+
+class TestCompareImagesGeminiException:
+    """compare_images must catch Gemini exceptions and return JSON error."""
+
+    def setup_method(self):
+        with server._STORE_LOCK:
+            server._IMAGE_STORE.clear()
+
+    @pytest.mark.asyncio
+    async def test_gemini_raises_returns_json_error(self):
+        urls = [
+            f"nanobanana://{server._store_image(_make_test_image(100, 100), 'image/jpeg')}"
+            for _ in range(2)
+        ]
+        mock_ctx = MagicMock()
+        mock_client = MagicMock()
+        mock_client.models.generate_content.side_effect = Exception("Quota exceeded.")
+
+        with patch.object(server, "_get_client", return_value=mock_client):
+            result = await server.compare_images(ctx=mock_ctx, images=urls)
+
+        assert isinstance(result, str), "Exception must be caught — must return str not raise"
+        data = json.loads(result)
+        assert "error" in data
+
+    @pytest.mark.asyncio
+    async def test_gemini_returns_non_json_handled_gracefully(self):
+        """compare_images must handle non-JSON Gemini responses without raising."""
+        urls = [
+            f"nanobanana://{server._store_image(_make_test_image(100, 100), 'image/jpeg')}"
+            for _ in range(2)
+        ]
+        mock_ctx = MagicMock()
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = MagicMock(text="not valid json {{{")
+
+        with patch.object(server, "_get_client", return_value=mock_client):
+            result = await server.compare_images(ctx=mock_ctx, images=urls)
+
+        data = json.loads(result)
+        # Should include raw_response fallback, not crash
+        assert "raw_response" in data or "error" in data
+
+    @pytest.mark.asyncio
+    async def test_image_fetch_failure_returns_json_error(self):
+        """If an image can't be fetched, compare_images returns JSON error."""
+        mock_ctx = MagicMock()
+        mock_client = MagicMock()
+        bad_url = "http://localhost:8080/images/expiredid99"  # not in store
+
+        with patch.object(server, "_get_client", return_value=mock_client):
+            result = await server.compare_images(ctx=mock_ctx, images=[bad_url, bad_url])
+
+        data = json.loads(result)
+        assert "error" in data
+
+
+# ---------------------------------------------------------------------------
+# 39. create_variations with prompt guidance
+# ---------------------------------------------------------------------------
+
+class TestCreateVariationsPrompt:
+    """create_variations must append user prompt to the variation_strength template."""
+
+    def _mock_gemini_response(self):
+        img = _make_test_image(256, 256)
+        part = MagicMock()
+        part.inline_data = MagicMock(mime_type="image/png", data=img)
+        candidate = MagicMock()
+        candidate.content.parts = [part]
+        response = MagicMock()
+        response.candidates = [candidate]
+        return response
+
+    def setup_method(self):
+        with server._STORE_LOCK:
+            server._IMAGE_STORE.clear()
+
+    @pytest.mark.asyncio
+    async def test_prompt_appears_in_metadata(self):
+        """When prompt is provided, it appears as 'guidance' in the metadata."""
+        src_id = server._store_image(_make_test_image(200, 200), "image/jpeg")
+        mock_ctx = MagicMock()
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_gemini_response()
+
+        with patch.object(server, "_get_client", return_value=mock_client):
+            result = await server.create_variations(
+                image=f"nanobanana://{src_id}",
+                ctx=mock_ctx,
+                prompt="keep the blue color scheme",
+                count=1,
+            )
+
+        meta = _parse_result(result)
+        assert "guidance" in meta, "Prompt must be echoed as 'guidance' in metadata"
+        assert meta["guidance"] == "keep the blue color scheme"
+
+    @pytest.mark.asyncio
+    async def test_prompt_appended_to_variation_template(self):
+        """Prompt text must appear in the Gemini API call, after the strength preamble."""
+        src_id = server._store_image(_make_test_image(200, 200), "image/jpeg")
+        mock_ctx = MagicMock()
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_gemini_response()
+
+        with patch.object(server, "_get_client", return_value=mock_client):
+            await server.create_variations(
+                image=f"nanobanana://{src_id}",
+                ctx=mock_ctx,
+                prompt="warmer tones",
+                variation_strength="subtle",
+                count=1,
+            )
+
+        call_args = mock_client.models.generate_content.call_args
+        text_parts = [str(p) for p in call_args.kwargs["contents"] if hasattr(p, "text")]
+        combined = " ".join(text_parts)
+        assert "warmer tones" in combined, "User prompt must appear in Gemini call"
+        assert "subtle" in combined.lower() or "variation" in combined.lower(), \
+            "Strength preamble must also be present"
+
+    @pytest.mark.asyncio
+    async def test_no_prompt_metadata_has_no_guidance(self):
+        """Without prompt, metadata must NOT have a 'guidance' field."""
+        src_id = server._store_image(_make_test_image(200, 200), "image/jpeg")
+        mock_ctx = MagicMock()
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_gemini_response()
+
+        with patch.object(server, "_get_client", return_value=mock_client):
+            result = await server.create_variations(
+                image=f"nanobanana://{src_id}", ctx=mock_ctx, count=1
+            )
+
+        meta = _parse_result(result)
+        assert "guidance" not in meta
+
+    @pytest.mark.asyncio
+    async def test_all_variation_strengths_accepted(self):
+        """subtle, medium, and strong must all succeed — only 'extreme' (etc.) errors."""
+        src_id = server._store_image(_make_test_image(200, 200), "image/jpeg")
+        mock_ctx = MagicMock()
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_gemini_response()
+
+        for strength in ("subtle", "medium", "strong"):
+            with patch.object(server, "_get_client", return_value=mock_client):
+                result = await server.create_variations(
+                    image=f"nanobanana://{src_id}", ctx=mock_ctx,
+                    variation_strength=strength, count=1,
+                )
+            meta = _parse_result(result)
+            assert "error" not in meta, f"strength='{strength}' should be valid"
+            assert "image_url" in meta
+
+
+# ---------------------------------------------------------------------------
+# 40. batch_analyze — Gemini API failure per-image
+# ---------------------------------------------------------------------------
+
+class TestBatchAnalyzeGeminiFailure:
+    """batch_analyze must handle Gemini analysis failures per-image (not just fetch failures)."""
+
+    def setup_method(self):
+        with server._STORE_LOCK:
+            server._IMAGE_STORE.clear()
+
+    @pytest.mark.asyncio
+    async def test_gemini_failure_on_one_image_others_succeed(self):
+        """If Gemini raises for exactly one analysis call, only that result has an error.
+
+        batch_analyze runs all analyses concurrently, so call order is non-deterministic.
+        We assert aggregate counts rather than which specific index failed.
+        """
+        imgs = [server._store_image(_make_test_image(100, 100), "image/jpeg") for _ in range(3)]
+        urls = [f"nanobanana://{img_id}" for img_id in imgs]
+        mock_ctx = MagicMock()
+
+        import threading
+        call_lock = threading.Lock()
+        call_count = {"n": 0}
+
+        def side_effect(**kwargs):
+            with call_lock:
+                n = call_count["n"]
+                call_count["n"] += 1
+            if n == 1:
+                raise Exception("Content policy violation")
+            resp = MagicMock()
+            resp.text = json.dumps({
+                "description": f"Image {n}", "style": "flat",
+                "mood": "calm", "colors": ["gray"], "details": ["block"],
+            })
+            return resp
+
+        mock_client = MagicMock()
+        mock_client.models.generate_content.side_effect = side_effect
+
+        with patch.object(server, "_get_client", return_value=mock_client):
+            result = await server.batch_analyze(ctx=mock_ctx, images=urls)
+
+        data = json.loads(result)
+        results = data["results"]
+        assert len(results) == 3
+        error_count = sum(1 for r in results if "error" in r)
+        success_count = sum(1 for r in results if "error" not in r)
+        assert error_count == 1, "Exactly one image should have failed"
+        assert success_count == 2, "Other two images should have succeeded"
+
+    @pytest.mark.asyncio
+    async def test_all_gemini_failures_returns_all_errors(self):
+        """If Gemini fails for all images, all results have error fields (no crash)."""
+        imgs = [server._store_image(_make_test_image(100, 100), "image/jpeg") for _ in range(2)]
+        urls = [f"nanobanana://{img_id}" for img_id in imgs]
+        mock_ctx = MagicMock()
+        mock_client = MagicMock()
+        mock_client.models.generate_content.side_effect = Exception("API down")
+
+        with patch.object(server, "_get_client", return_value=mock_client):
+            result = await server.batch_analyze(ctx=mock_ctx, images=urls)
+
+        data = json.loads(result)
+        assert all("error" in r for r in data["results"])
+        assert data["count"] == 2
 
 
 if __name__ == "__main__":
