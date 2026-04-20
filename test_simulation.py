@@ -2661,5 +2661,186 @@ class TestSaveFolderWithS3:
         assert os.path.isfile(meta["saved_to"])
 
 
+# ---------------------------------------------------------------------------
+# 35. Gemini exception handling — "No approval received" and similar errors
+# ---------------------------------------------------------------------------
+
+class TestGeminiExceptionHandling:
+    """Gemini API exceptions must be caught and returned as JSON errors.
+
+    When Gemini raises (e.g. content moderation, quota, "No approval received"),
+    the tool must NOT let the exception escape to FastMCP — that shows a red
+    error banner with the raw exception message in claude.ai instead of a
+    structured error the model can reason about and retry.
+    """
+
+    def _mock_good_response(self):
+        test_img = _make_test_image(128, 128)
+        mock_part = MagicMock()
+        mock_part.inline_data = MagicMock(mime_type="image/jpeg", data=test_img)
+        mock_candidate = MagicMock()
+        mock_candidate.content.parts = [mock_part]
+        mock_response = MagicMock()
+        mock_response.candidates = [mock_candidate]
+        return mock_response
+
+    def setup_method(self):
+        with server._STORE_LOCK:
+            server._IMAGE_STORE.clear()
+
+    @pytest.mark.asyncio
+    async def test_generate_image_gemini_raises_returns_json_error(self):
+        """generate_image: Gemini exception → JSON error str, not raw exception."""
+        mock_client = MagicMock()
+        mock_client.models.generate_content.side_effect = Exception("No approval received.")
+
+        with patch.object(server, "_get_client", return_value=mock_client):
+            result = await server.generate_image("sunset")
+
+        assert isinstance(result, str), "Exception must be caught — tool must return str, not raise"
+        data = json.loads(result)
+        assert "error" in data
+
+    @pytest.mark.asyncio
+    async def test_edit_image_gemini_raises_returns_json_error(self):
+        """edit_image: Gemini exception → JSON error str, not raw exception."""
+        src_id = server._store_image(_make_test_image(200, 200), "image/jpeg")
+        mock_ctx = MagicMock()
+        mock_client = MagicMock()
+        mock_client.models.generate_content.side_effect = Exception("No approval received.")
+
+        with patch.object(server, "_get_client", return_value=mock_client):
+            result = await server.edit_image(
+                image=f"nanobanana://{src_id}", prompt="add hat", ctx=mock_ctx
+            )
+
+        assert isinstance(result, str), "Exception must be caught — tool must return str, not raise"
+        data = json.loads(result)
+        assert "error" in data
+
+    @pytest.mark.asyncio
+    async def test_swap_background_gemini_raises_returns_json_error(self):
+        """swap_background: Gemini exception → JSON error str, not raw exception."""
+        src_id = server._store_image(_make_test_image(200, 200), "image/jpeg")
+        mock_ctx = MagicMock()
+        mock_client = MagicMock()
+        mock_client.models.generate_content.side_effect = Exception("No approval received.")
+
+        with patch.object(server, "_get_client", return_value=mock_client):
+            result = await server.swap_background(
+                image=f"nanobanana://{src_id}", background="beach", ctx=mock_ctx
+            )
+
+        assert isinstance(result, str), "Exception must be caught — tool must return str, not raise"
+        data = json.loads(result)
+        assert "error" in data
+
+    @pytest.mark.asyncio
+    async def test_create_variations_gemini_raises_returns_json_error(self):
+        """create_variations: Gemini exception → JSON error str, not raw exception."""
+        src_id = server._store_image(_make_test_image(200, 200), "image/jpeg")
+        mock_ctx = MagicMock()
+        mock_client = MagicMock()
+        mock_client.models.generate_content.side_effect = Exception("No approval received.")
+
+        with patch.object(server, "_get_client", return_value=mock_client):
+            result = await server.create_variations(
+                image=f"nanobanana://{src_id}", ctx=mock_ctx, count=1
+            )
+
+        assert isinstance(result, str), "Exception must be caught — tool must return str, not raise"
+        data = json.loads(result)
+        assert "error" in data
+
+    @pytest.mark.asyncio
+    async def test_edit_image_count2_partial_failure_returns_successful_image(self):
+        """count=2 where one generation raises still returns the one that succeeded."""
+        src_id = server._store_image(_make_test_image(200, 200), "image/jpeg")
+        mock_ctx = MagicMock()
+
+        call_count = {"n": 0}
+        good_response = self._mock_good_response()
+
+        def side_effect(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise Exception("No approval received.")
+            return good_response
+
+        mock_client = MagicMock()
+        mock_client.models.generate_content.side_effect = side_effect
+
+        with patch.object(server, "_get_client", return_value=mock_client):
+            result = await server.edit_image(
+                image=f"nanobanana://{src_id}", prompt="add hat", ctx=mock_ctx, count=2
+            )
+
+        # Should return the one successful image, not fail entirely
+        assert isinstance(result, list), "Partial success must still return images"
+        assert isinstance(result[1], MCPImage)
+        meta = json.loads(result[0])
+        assert "errors" in meta, "Partial failure must be reported in errors field"
+
+    @pytest.mark.asyncio
+    async def test_edit_image_count2_embeds_2_images(self):
+        """edit_image count=2 returns [json, img1, img2] with images[] array in JSON."""
+        src_id = server._store_image(_make_test_image(200, 200), "image/jpeg")
+        mock_ctx = MagicMock()
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_good_response()
+
+        with patch.object(server, "_get_client", return_value=mock_client):
+            result = await server.edit_image(
+                image=f"nanobanana://{src_id}", prompt="add hat", ctx=mock_ctx, count=2
+            )
+
+        assert isinstance(result, list)
+        assert len(result) == 3, f"Expected [json, img, img], got {len(result)} items"
+        meta = json.loads(result[0])
+        assert "images" in meta, "Multi-image result must use images[] array (not top-level image_url)"
+        assert len(meta["images"]) == 2
+        assert all("image_url" in img for img in meta["images"])
+        assert all(isinstance(result[i], MCPImage) for i in range(1, 3))
+
+    @pytest.mark.asyncio
+    async def test_swap_background_count2_embeds_2_images(self):
+        """swap_background count=2 returns [json, img1, img2]."""
+        src_id = server._store_image(_make_test_image(200, 200), "image/jpeg")
+        mock_ctx = MagicMock()
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_good_response()
+
+        with patch.object(server, "_get_client", return_value=mock_client):
+            result = await server.swap_background(
+                image=f"nanobanana://{src_id}", background="beach", ctx=mock_ctx, count=2
+            )
+
+        assert isinstance(result, list)
+        assert len(result) == 3
+        meta = json.loads(result[0])
+        assert "images" in meta
+        assert len(meta["images"]) == 2
+        assert all(isinstance(result[i], MCPImage) for i in range(1, 3))
+
+    @pytest.mark.asyncio
+    async def test_edit_image_count2_all_fail_returns_json_error(self):
+        """edit_image count=2 where all generations fail returns JSON error, not raises."""
+        src_id = server._store_image(_make_test_image(200, 200), "image/jpeg")
+        mock_ctx = MagicMock()
+        mock_client = MagicMock()
+        mock_client.models.generate_content.side_effect = Exception("No approval received.")
+
+        with patch.object(server, "_get_client", return_value=mock_client):
+            result = await server.edit_image(
+                image=f"nanobanana://{src_id}", prompt="add hat", ctx=mock_ctx, count=2
+            )
+
+        assert isinstance(result, str)
+        data = json.loads(result)
+        assert "error" in data
+        assert "details" in data
+        assert len(data["details"]) == 2  # both attempts reported
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
