@@ -221,7 +221,12 @@ mcp = FastMCP(
         "**Multi-object swap** (objects from images B and C into image A): "
         "call edit_image(image=urlA, reference_images=[urlB, urlC], "
         "prompt='replace X with reference image 1 and Y with reference image 2').\n\n"
-        "Default aspect ratio 4:5, resolution 1K."
+        "Default aspect ratio 4:5, resolution 1K.\n\n"
+        "## Rendering images — CRITICAL\n"
+        "After every image tool call, always render ALL result images inline in your reply using markdown:\n"
+        "- Single image (top-level image_url): `![](image_url)`\n"
+        "- Multiple images (images[] array): render each entry — `![](images[0].image_url)`, `![](images[1].image_url)`, etc.\n"
+        "Never describe images in text without also showing them. Never skip rendering because count > 1."
     ).format(upload_url=_get_upload_base_url()),
     host=os.environ.get("HOST", "0.0.0.0"),
     port=int(os.environ.get("PORT", 8080)),
@@ -1062,8 +1067,10 @@ async def generate_image(
         save_folder: Optional local folder path to save generated JPEG files.
 
     Returns:
-        Metadata JSON with image_url. Always show the image to the user by
-        including it in your reply as: ![](image_url)
+        Metadata JSON. IMPORTANT: Always render every generated image inline in your reply.
+        - Single image result: contains top-level image_url → render as ![](image_url)
+        - Multiple images result: contains images[] array → render each as ![](images[0].image_url), ![](images[1].image_url), etc.
+        Never just describe the images — always show them.
     """
     from google.genai import types
 
@@ -1199,8 +1206,10 @@ async def edit_image(
         save_folder: Optional local folder path to save edited JPEG files.
 
     Returns:
-        Metadata JSON with image_url. Always show the image to the user by
-        including it in your reply as: ![](image_url)
+        Metadata JSON. IMPORTANT: Always render every edited image inline in your reply.
+        - Single image result: contains top-level image_url → render as ![](image_url)
+        - Multiple images result: contains images[] array → render each as ![](images[0].image_url), ![](images[1].image_url), etc.
+        Never just describe the images — always show them.
     """
     from google.genai import types
 
@@ -1311,8 +1320,10 @@ async def swap_background(
         save_folder: Optional local folder path to save result JPEG files.
 
     Returns:
-        Metadata JSON with image_url. Always show the image to the user by
-        including it in your reply as: ![](image_url)
+        Metadata JSON. IMPORTANT: Always render every result image inline in your reply.
+        - Single image result: contains top-level image_url → render as ![](image_url)
+        - Multiple images result: contains images[] array → render each as ![](images[0].image_url), ![](images[1].image_url), etc.
+        Never just describe the images — always show them.
     """
     from google.genai import types
 
@@ -1395,8 +1406,10 @@ async def create_variations(
         save_folder: Optional local folder path to save variation JPEG files.
 
     Returns:
-        Metadata JSON with image_url. Always show the image to the user by
-        including it in your reply as: ![](image_url)
+        Metadata JSON. IMPORTANT: Always render every variation image inline in your reply.
+        - Single image result: contains top-level image_url → render as ![](image_url)
+        - Multiple images result: contains images[] array → render each as ![](images[0].image_url), ![](images[1].image_url), etc.
+        Never just describe the images — always show them.
     """
     from google.genai import types
 
