@@ -1027,6 +1027,34 @@ class TestCloudOutputKeyConsistency:
         assert "size_kb" in meta
         assert isinstance(meta["size_kb"], int)
 
+    def test_single_image_render_markdown_contains_url(self):
+        """Single image response includes render_markdown with the image URL."""
+        jpeg = _make_test_image(100, 100)
+        result = server._build_image_response({}, [(jpeg, {"index": 1})])
+        meta = _parse_result(result)
+        assert "render_markdown" in meta
+        assert meta["image_url"] in meta["render_markdown"]
+        assert "![" in meta["render_markdown"]
+
+    def test_multi_image_render_markdown_contains_all_urls(self):
+        """Multi-image response includes render_markdown with all image URLs."""
+        imgs = [(_make_test_image(100, 100), {"index": i}) for i in range(3)]
+        result = server._build_image_response({}, imgs)
+        meta = _parse_result(result)
+        assert "render_markdown" in meta
+        for img in meta["images"]:
+            assert img["image_url"] in meta["render_markdown"]
+        # Should have 3 separate image markdown entries
+        assert meta["render_markdown"].count("![") == 3
+
+    def test_multi_image_render_markdown_labels_images(self):
+        """Multi-image render_markdown uses Image 1, Image 2, ... labels."""
+        imgs = [(_make_test_image(100, 100), {"index": i}) for i in range(2)]
+        result = server._build_image_response({}, imgs)
+        meta = _parse_result(result)
+        assert "Image 1" in meta["render_markdown"]
+        assert "Image 2" in meta["render_markdown"]
+
 
 # ---------------------------------------------------------------------------
 # 20. Empty reference image validation
@@ -2553,8 +2581,8 @@ class TestS3UrlCompleteness:
 class TestDocstringInstructions:
     """Verify the ![](image_url) instruction is present in all generation tools."""
 
-    def test_all_generation_tools_have_markdown_image_instruction(self):
-        """All 4 tools must instruct Claude to render images via markdown — single AND multi."""
+    def test_all_generation_tools_have_render_markdown_instruction(self):
+        """All 4 tools must instruct Claude to copy render_markdown verbatim into its reply."""
         tools = [
             server.generate_image,
             server.edit_image,
@@ -2563,19 +2591,11 @@ class TestDocstringInstructions:
         ]
         for tool in tools:
             doc = tool.__doc__ or ""
-            # Single-image rendering instruction
-            assert "![](image_url)" in doc, (
-                f"{tool.__name__} is missing '![](image_url)' in its docstring. "
-                "Without this, Claude won't render single images inline."
+            assert "render_markdown" in doc, (
+                f"{tool.__name__} docstring must mention render_markdown so Claude knows to use it."
             )
-            # Multi-image rendering instruction (the key fix for count > 1)
-            assert "images[]" in doc or "images[0]" in doc, (
-                f"{tool.__name__} is missing multi-image rendering instruction. "
-                "Without this, Claude describes multi-image results instead of rendering them."
-            )
-            # Imperative rendering instruction
-            assert "Always render" in doc or "always show" in doc.lower(), (
-                f"{tool.__name__} is missing an imperative render instruction."
+            assert "verbatim" in doc or "copy" in doc.lower(), (
+                f"{tool.__name__} docstring must tell Claude to copy render_markdown verbatim."
             )
 
 

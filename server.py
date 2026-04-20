@@ -223,10 +223,9 @@ mcp = FastMCP(
         "prompt='replace X with reference image 1 and Y with reference image 2').\n\n"
         "Default aspect ratio 4:5, resolution 1K.\n\n"
         "## Rendering images — CRITICAL\n"
-        "After every image tool call, always render ALL result images inline in your reply using markdown:\n"
-        "- Single image (top-level image_url): `![](image_url)`\n"
-        "- Multiple images (images[] array): render each entry — `![](images[0].image_url)`, `![](images[1].image_url)`, etc.\n"
-        "Never describe images in text without also showing them. Never skip rendering because count > 1."
+        "Every image tool result includes a `render_markdown` field.\n"
+        "Copy that field's value verbatim into your reply — do not paraphrase, skip, or describe the images instead.\n"
+        "Example: if render_markdown is `![](https://...)`, your reply must contain `![](https://...)`."
     ).format(upload_url=_get_upload_base_url()),
     host=os.environ.get("HOST", "0.0.0.0"),
     port=int(os.environ.get("PORT", 8080)),
@@ -888,8 +887,13 @@ def _build_image_response(
     if len(generated) == 1:
         result.update(generated[0][1])
         result.pop("index", None)
+        result["render_markdown"] = f"![]({result['image_url']})"
     else:
         result["images"] = [{k: v for k, v in meta.items() if k != "index"} for _, meta in generated]
+        result["render_markdown"] = "\n\n".join(
+            f"![Image {i + 1}]({img['image_url']})"
+            for i, img in enumerate(result["images"])
+        )
     return json.dumps(result)
 
 
@@ -1067,10 +1071,9 @@ async def generate_image(
         save_folder: Optional local folder path to save generated JPEG files.
 
     Returns:
-        Metadata JSON. IMPORTANT: Always render every generated image inline in your reply.
-        - Single image result: contains top-level image_url → render as ![](image_url)
-        - Multiple images result: contains images[] array → render each as ![](images[0].image_url), ![](images[1].image_url), etc.
-        Never just describe the images — always show them.
+        Metadata JSON with a render_markdown field. IMPORTANT: copy the render_markdown
+        value verbatim into your reply so the images display inline. Do not describe
+        the images instead of showing them.
     """
     from google.genai import types
 
@@ -1206,10 +1209,9 @@ async def edit_image(
         save_folder: Optional local folder path to save edited JPEG files.
 
     Returns:
-        Metadata JSON. IMPORTANT: Always render every edited image inline in your reply.
-        - Single image result: contains top-level image_url → render as ![](image_url)
-        - Multiple images result: contains images[] array → render each as ![](images[0].image_url), ![](images[1].image_url), etc.
-        Never just describe the images — always show them.
+        Metadata JSON with a render_markdown field. IMPORTANT: copy the render_markdown
+        value verbatim into your reply so the images display inline. Do not describe
+        the images instead of showing them.
     """
     from google.genai import types
 
@@ -1320,10 +1322,9 @@ async def swap_background(
         save_folder: Optional local folder path to save result JPEG files.
 
     Returns:
-        Metadata JSON. IMPORTANT: Always render every result image inline in your reply.
-        - Single image result: contains top-level image_url → render as ![](image_url)
-        - Multiple images result: contains images[] array → render each as ![](images[0].image_url), ![](images[1].image_url), etc.
-        Never just describe the images — always show them.
+        Metadata JSON with a render_markdown field. IMPORTANT: copy the render_markdown
+        value verbatim into your reply so the images display inline. Do not describe
+        the images instead of showing them.
     """
     from google.genai import types
 
@@ -1406,10 +1407,9 @@ async def create_variations(
         save_folder: Optional local folder path to save variation JPEG files.
 
     Returns:
-        Metadata JSON. IMPORTANT: Always render every variation image inline in your reply.
-        - Single image result: contains top-level image_url → render as ![](image_url)
-        - Multiple images result: contains images[] array → render each as ![](images[0].image_url), ![](images[1].image_url), etc.
-        Never just describe the images — always show them.
+        Metadata JSON with a render_markdown field. IMPORTANT: copy the render_markdown
+        value verbatim into your reply so the images display inline. Do not describe
+        the images instead of showing them.
     """
     from google.genai import types
 
