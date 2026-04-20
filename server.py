@@ -857,6 +857,28 @@ def _save_to_folder(jpeg_bytes: bytes, folder: str, prefix: str = "gen") -> str 
         return None
 
 
+def _make_thumbnail_data_uri(jpeg_bytes: bytes, max_dim: int = 256, quality: int = 65) -> str:
+    """Resize JPEG to a small thumbnail and return as a base64 data URI.
+
+    Data URIs render inline in claude.ai automatically — unlike HTTP URLs,
+    which show a "Show Image" button requiring a click. Using a thumbnail
+    (not the full image) keeps the data URI small enough (~10-20KB base64)
+    to fit comfortably in Claude's context window.
+    """
+    from PIL import Image as PILImage
+    img = PILImage.open(BytesIO(jpeg_bytes))
+    w, h = img.size
+    if max(w, h) > max_dim:
+        scale = max_dim / max(w, h)
+        img = img.resize((int(w * scale), int(h * scale)), PILImage.LANCZOS)
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    return f"data:image/jpeg;base64,{b64}"
+
+
 def _build_image_response(
     result: dict,
     generated: list[tuple[bytes, dict]],
@@ -868,9 +890,10 @@ def _build_image_response(
     generated: list of (jpeg_bytes, per_image_metadata) tuples.
 
     Returns (render_markdown, json_metadata):
-    - render_markdown: pure markdown string the tool should return as its first
-      text item so Claude includes it verbatim in its reply.
-    - json_metadata: JSON string for tool chaining (image_url, size_kb, etc.)
+    - render_markdown: markdown string using a base64 thumbnail data URI.
+      Data URIs auto-render inline in claude.ai without any user interaction.
+      Claude reproduces them in its response, making the image appear inline.
+    - json_metadata: JSON string for tool chaining (image_url is the full S3/local URL).
 
     Always stores images server-side (/images/ URLs, 1-hour TTL) for tool chaining.
     If S3 is configured, also uploads to S3 and uses the durable S3 URL as image_url.
@@ -892,18 +915,21 @@ def _build_image_response(
         else:
             meta["image_url"] = local_url
             meta["expires_in"] = "1 hour"
+        # Thumbnail data URI for render_md — separate from image_url (full quality for chaining)
+        meta["_thumbnail"] = _make_thumbnail_data_uri(jpeg_bytes)
         if save_folder:
             saved_path = _save_to_folder(jpeg_bytes, save_folder, prefix)
             if saved_path:
                 meta["saved_to"] = saved_path
+
     if len(generated) == 1:
         result.update(generated[0][1])
         result.pop("index", None)
-        render_md = f"![]({result['image_url']})"
+        render_md = f"![]({result.pop('_thumbnail')})"
     else:
         result["images"] = [{k: v for k, v in meta.items() if k != "index"} for _, meta in generated]
         render_md = "\n\n".join(
-            f"![Image {i + 1}]({img['image_url']})"
+            f"![Image {i + 1}]({img.pop('_thumbnail')})"
             for i, img in enumerate(result["images"])
         )
     return render_md, json.dumps(result)

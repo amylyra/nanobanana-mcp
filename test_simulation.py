@@ -1036,25 +1036,35 @@ class TestCloudOutputKeyConsistency:
         assert "size_kb" in meta
         assert isinstance(meta["size_kb"], int)
 
-    def test_single_image_render_markdown_contains_url(self):
-        """Single image response: render_markdown is the first tuple element, contains the URL."""
+    def test_single_image_render_markdown_contains_data_uri(self):
+        """Single image response: render_md uses a base64 thumbnail data URI (not HTTP URL).
+
+        Data URIs auto-render in claude.ai; HTTP URLs show 'Show Image' requiring a click.
+        """
         jpeg = _make_test_image(100, 100)
         render_md, json_str = server._build_image_response({}, [(jpeg, {"index": 1})])
         meta = json.loads(json_str)
         assert "![" in render_md
-        assert meta["image_url"] in render_md
+        assert "data:image/jpeg;base64," in render_md, (
+            "render_md must use data URI thumbnail so claude.ai auto-renders it"
+        )
+        # image_url in JSON is the full S3/local URL for tool chaining (not the data URI)
+        assert meta["image_url"].startswith("http"), "image_url must be http URL for chaining"
+        assert "data:" not in meta["image_url"], "image_url must not be a data URI"
         # render_markdown not duplicated in JSON
         assert "render_markdown" not in meta
 
-    def test_multi_image_render_markdown_contains_all_urls(self):
-        """Multi-image response: render_markdown contains all image URLs."""
+    def test_multi_image_render_markdown_contains_data_uris(self):
+        """Multi-image response: render_md contains one data URI per image."""
         imgs = [(_make_test_image(100, 100), {"index": i}) for i in range(3)]
         render_md, json_str = server._build_image_response({}, imgs)
         meta = json.loads(json_str)
-        for img in meta["images"]:
-            assert img["image_url"] in render_md
-        # Should have 3 separate image markdown entries
+        # render_md has 3 image entries, each with a data URI
         assert render_md.count("![") == 3
+        assert render_md.count("data:image/jpeg;base64,") == 3
+        # image_url in JSON metadata is the HTTP URL for tool chaining
+        for img in meta["images"]:
+            assert img["image_url"].startswith("http")
 
     def test_multi_image_render_markdown_labels_images(self):
         """Multi-image render_markdown uses Image 1, Image 2, ... labels."""
@@ -2890,8 +2900,13 @@ class TestRenderMdUrlValidity:
         return response
 
     @pytest.mark.asyncio
-    async def test_render_md_url_is_http(self):
-        """render_md URL must start with http — never empty, never relative."""
+    async def test_render_md_uses_data_uri(self):
+        """render_md must use a base64 data URI, not an HTTP URL.
+
+        Data URIs auto-render inline in claude.ai. HTTP URLs (even plain .jpg)
+        show a 'Show Image' button requiring a click; Claude also doesn't
+        reliably copy HTTP URL image markdown into its responses.
+        """
         mock_client = MagicMock()
         mock_client.models.generate_content.return_value = self._mock_gemini_response()
 
@@ -2900,17 +2915,14 @@ class TestRenderMdUrlValidity:
 
         assert isinstance(result, list)
         render_md = result[0]
-        # Extract URL from ![](url)
-        assert render_md.startswith("![")
-        url_start = render_md.index("(") + 1
-        url_end = render_md.rindex(")")
-        url = render_md[url_start:url_end]
-        assert url.startswith("http"), f"render_md URL must be http(s), got: {url!r}"
-        assert len(url) > 10, f"render_md URL is suspiciously short: {url!r}"
+        assert render_md.startswith("!["), "render_md must be markdown image syntax"
+        assert "data:image/jpeg;base64," in render_md, (
+            "render_md must use a data URI thumbnail for auto-rendering in claude.ai"
+        )
 
     @pytest.mark.asyncio
-    async def test_render_md_url_matches_image_url_in_metadata(self):
-        """The URL in render_md must match image_url in the JSON metadata."""
+    async def test_render_md_data_uri_is_non_empty(self):
+        """The base64 payload in render_md must be non-empty (real image data)."""
         mock_client = MagicMock()
         mock_client.models.generate_content.return_value = self._mock_gemini_response()
 
@@ -2918,15 +2930,31 @@ class TestRenderMdUrlValidity:
             result = await server.generate_image("cat")
 
         render_md = result[0]
-        meta = _parse_result(result)
-        image_url = meta["image_url"]
-        assert image_url in render_md, (
-            f"image_url {image_url!r} not found in render_md {render_md!r}"
-        )
+        prefix = "data:image/jpeg;base64,"
+        b64_start = render_md.index(prefix) + len(prefix)
+        b64_end = render_md.rindex(")")
+        b64_payload = render_md[b64_start:b64_end]
+        assert len(b64_payload) > 100, f"data URI payload is suspiciously short: {len(b64_payload)} chars"
 
     @pytest.mark.asyncio
-    async def test_render_md_multi_image_all_urls_are_http(self):
-        """Every URL in a multi-image render_md must be a real http URL."""
+    async def test_image_url_in_metadata_is_http_not_data_uri(self):
+        """image_url in JSON metadata must be an HTTP URL (for tool chaining), not a data URI."""
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_gemini_response()
+
+        with patch.object(server, "_get_client", return_value=mock_client):
+            result = await server.generate_image("cat")
+
+        meta = _parse_result(result)
+        assert "image_url" in meta
+        assert meta["image_url"].startswith("http"), (
+            "image_url must be an HTTP URL for tool chaining, not a data URI"
+        )
+        assert "data:" not in meta["image_url"]
+
+    @pytest.mark.asyncio
+    async def test_render_md_multi_image_all_data_uris(self):
+        """Every image in a multi-image render_md must use a data URI."""
         mock_client = MagicMock()
         mock_client.models.generate_content.return_value = self._mock_gemini_response()
 
@@ -2934,20 +2962,14 @@ class TestRenderMdUrlValidity:
             result = await server.generate_image("cats", count=3)
 
         render_md = result[0]
-        import re
-        urls = re.findall(r'\(([^)]+)\)', render_md)
-        assert len(urls) == 3, f"Expected 3 URLs in render_md, found {len(urls)}"
-        for url in urls:
-            assert url.startswith("http"), f"render_md URL must be http(s), got: {url!r}"
-            assert len(url) > 10, f"render_md URL is suspiciously short: {url!r}"
+        assert render_md.count("![") == 3, f"Expected 3 images in render_md"
+        assert render_md.count("data:image/jpeg;base64,") == 3, (
+            "Each image in render_md must have its own data URI thumbnail"
+        )
 
     @pytest.mark.asyncio
-    async def test_s3_render_md_url_has_no_query_params(self):
-        """render_md must use a plain S3 URL with no query params.
-
-        Presigned URLs (?X-Amz-...) cause claude.ai to show 'Open external link'
-        instead of rendering the image inline. Plain .jpg URLs render correctly.
-        """
+    async def test_s3_render_md_still_uses_data_uri(self):
+        """Even with S3 configured, render_md uses data URI (not the S3 URL)."""
         mock_client = MagicMock()
         mock_client.models.generate_content.return_value = self._mock_gemini_response()
 
@@ -2959,10 +2981,15 @@ class TestRenderMdUrlValidity:
             result = await server.generate_image("cat")
 
         render_md = result[0]
-        assert fake_s3_url in render_md, "S3 URL must appear in render_md"
-        assert "?" not in render_md, (
-            "render_md must not contain query params — breaks claude.ai image rendering"
+        assert "data:image/jpeg;base64," in render_md, (
+            "render_md must use data URI even when S3 is configured"
         )
+        assert fake_s3_url not in render_md, (
+            "S3 URL must be in JSON metadata (image_url) not in render_md"
+        )
+        # S3 URL is in the JSON for tool chaining
+        meta = _parse_result(result)
+        assert meta["image_url"] == fake_s3_url
 
 
 class TestS3UrlFormat:
