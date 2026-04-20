@@ -804,10 +804,12 @@ def _get_s3_client():
 
 
 def _upload_to_s3(jpeg_bytes: bytes, prefix: str = "gen") -> str:
-    """Upload JPEG bytes to S3 and return a presigned URL (7-day TTL).
+    """Upload JPEG bytes to S3 and return a plain public URL.
 
-    S3 objects are private by default — a presigned URL lets the browser load
-    the image without requiring a public bucket policy or ACL.
+    The URL ends in .jpg so claude.ai's markdown renderer recognises it as an
+    image and renders it inline. Presigned URLs (with ?X-Amz-... query params)
+    do NOT end in .jpg — claude.ai falls back to "Open external link" instead
+    of rendering the image. Requires the bucket to have a public-read policy.
     """
     s3 = _get_s3_client()
     key = f"{prefix}/{uuid.uuid4().hex}.jpg"
@@ -823,15 +825,7 @@ def _upload_to_s3(jpeg_bytes: bytes, prefix: str = "gen") -> str:
             f"S3 upload failed: {e}. Check AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, "
             f"and that the IAM user has s3:PutObject on {S3_BUCKET}."
         )
-    try:
-        return s3.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": S3_BUCKET, "Key": key},
-            ExpiresIn=604800,  # 7 days
-        )
-    except Exception:
-        # Presigning failed (e.g. no GetObject permission) — fall back to public URL
-        return f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{key}"
+    return f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{key}"
 
 
 def _upload_to_cloud(jpeg_bytes: bytes, prefix: str = "gen") -> str:

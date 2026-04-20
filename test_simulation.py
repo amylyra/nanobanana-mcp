@@ -2942,31 +2942,68 @@ class TestRenderMdUrlValidity:
             assert len(url) > 10, f"render_md URL is suspiciously short: {url!r}"
 
     @pytest.mark.asyncio
-    async def test_s3_render_md_url_is_presigned_not_plain_s3(self):
-        """When S3 is configured, render_md must contain a presigned URL (has query params)."""
+    async def test_s3_render_md_url_has_no_query_params(self):
+        """render_md must use a plain S3 URL with no query params.
+
+        Presigned URLs (?X-Amz-...) cause claude.ai to show 'Open external link'
+        instead of rendering the image inline. Plain .jpg URLs render correctly.
+        """
         mock_client = MagicMock()
         mock_client.models.generate_content.return_value = self._mock_gemini_response()
 
-        fake_presigned = "https://bucket.s3.amazonaws.com/gen/x.jpg?AWSAccessKeyId=ABC&Signature=XYZ&Expires=999"
+        fake_s3_url = "https://bucket.s3.amazonaws.com/gen/x.jpg"
 
         with patch.object(server, "_get_client", return_value=mock_client), \
              patch.object(server, "S3_BUCKET", "bucket"), \
-             patch.object(server, "_upload_to_s3", return_value=fake_presigned):
+             patch.object(server, "_upload_to_s3", return_value=fake_s3_url):
             result = await server.generate_image("cat")
 
         render_md = result[0]
-        assert fake_presigned in render_md, "Presigned URL must appear in render_md"
-        assert "?" in render_md, "Presigned URL must have query params (not a plain S3 URL)"
+        assert fake_s3_url in render_md, "S3 URL must appear in render_md"
+        assert "?" not in render_md, (
+            "render_md must not contain query params — breaks claude.ai image rendering"
+        )
 
 
-class TestS3PresignedUrlFallback:
-    """_upload_to_s3 must fall back to public URL if generate_presigned_url raises."""
+class TestS3UrlFormat:
+    """_upload_to_s3 must return a plain URL ending in .jpg — no query params.
 
-    def test_presign_failure_falls_back_to_public_url(self):
-        """If generate_presigned_url raises, return the plain public S3 URL."""
+    claude.ai detects image URLs by extension. A presigned URL (?X-Amz-Algorithm=...)
+    does NOT end in .jpg, so claude.ai shows 'Open external link' instead of the image.
+    """
+
+    def test_s3_url_ends_in_jpg(self):
+        """Returned URL must end in .jpg so claude.ai renders it as an image."""
         fake_s3 = MagicMock()
         fake_s3.put_object.return_value = {}
-        fake_s3.generate_presigned_url.side_effect = Exception("no GetObject permission")
+
+        with patch.object(server, "_get_s3_client", return_value=fake_s3), \
+             patch.object(server, "S3_BUCKET", "my-bucket"), \
+             patch.object(server, "S3_REGION", "us-east-1"):
+            url = server._upload_to_s3(b"fake-jpeg", prefix="gen")
+
+        assert url.endswith(".jpg"), (
+            f"S3 URL must end in .jpg for claude.ai image rendering, got: {url}"
+        )
+
+    def test_s3_url_has_no_query_params(self):
+        """Returned URL must have no query params — presigned URLs break image rendering."""
+        fake_s3 = MagicMock()
+        fake_s3.put_object.return_value = {}
+
+        with patch.object(server, "_get_s3_client", return_value=fake_s3), \
+             patch.object(server, "S3_BUCKET", "my-bucket"), \
+             patch.object(server, "S3_REGION", "us-east-1"):
+            url = server._upload_to_s3(b"fake-jpeg", prefix="gen")
+
+        assert "?" not in url, (
+            f"S3 URL must not have query params (no presigning) — got: {url}"
+        )
+
+    def test_s3_url_format(self):
+        """URL must be the standard public S3 path-style URL."""
+        fake_s3 = MagicMock()
+        fake_s3.put_object.return_value = {}
 
         with patch.object(server, "_get_s3_client", return_value=fake_s3), \
              patch.object(server, "S3_BUCKET", "my-bucket"), \
@@ -2975,37 +3012,6 @@ class TestS3PresignedUrlFallback:
 
         assert url.startswith("https://my-bucket.s3.us-east-1.amazonaws.com/gen/")
         assert url.endswith(".jpg")
-
-    def test_presign_success_returns_presigned_url(self):
-        """When presigning succeeds, the presigned URL is returned (not the plain URL)."""
-        fake_presigned = "https://my-bucket.s3.amazonaws.com/gen/abc.jpg?X-Amz-Signature=xyz"
-        fake_s3 = MagicMock()
-        fake_s3.put_object.return_value = {}
-        fake_s3.generate_presigned_url.return_value = fake_presigned
-
-        with patch.object(server, "_get_s3_client", return_value=fake_s3), \
-             patch.object(server, "S3_BUCKET", "my-bucket"), \
-             patch.object(server, "S3_REGION", "us-east-1"):
-            url = server._upload_to_s3(b"fake-jpeg", prefix="gen")
-
-        assert url == fake_presigned
-        # Must NOT be the plain URL — plain URL would 403 in browser
-        assert "X-Amz-Signature" in url
-
-    def test_presign_uses_7_day_expiry(self):
-        """Presigned URL TTL must be 604800 seconds (7 days)."""
-        fake_s3 = MagicMock()
-        fake_s3.put_object.return_value = {}
-        fake_s3.generate_presigned_url.return_value = "https://presigned"
-
-        with patch.object(server, "_get_s3_client", return_value=fake_s3), \
-             patch.object(server, "S3_BUCKET", "bucket"), \
-             patch.object(server, "S3_REGION", "us-east-1"):
-            server._upload_to_s3(b"bytes", prefix="gen")
-
-        call_kwargs = fake_s3.generate_presigned_url.call_args
-        assert call_kwargs[1]["ExpiresIn"] == 604800 or call_kwargs[0][2] == 604800 if len(call_kwargs[0]) > 2 else call_kwargs[1].get("ExpiresIn") == 604800, \
-            "Presigned URL must expire in 604800 seconds (7 days)"
 
 
 class TestServerInstructions:
