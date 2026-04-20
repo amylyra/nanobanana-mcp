@@ -2358,5 +2358,301 @@ class TestCompositeSwap:
         assert isinstance(result[1], MCPImage)
 
 
+# ---------------------------------------------------------------------------
+# 30. structured_output=False — prove the pydantic serialization bug and fix
+# ---------------------------------------------------------------------------
+
+class TestStructuredOutputFix:
+    """Verify that structured_output=False prevents the PydanticSerializationError.
+
+    Without this flag, fastmcp infers an output_schema from `list | str` and
+    routes through pydantic structured serialization.  pydantic_core.to_json
+    cannot handle the Image type and raises:
+      PydanticSerializationError: Unable to serialize unknown type: <class '...Image'>
+
+    With structured_output=False, fastmcp uses _convert_to_content() which calls
+    Image.to_image_content() and produces proper MCP ImageContent objects.
+    """
+
+    def test_pydantic_core_fails_on_image_without_fix(self):
+        """Reproduce the original crash: pydantic_core.to_json chokes on Image."""
+        import pydantic_core
+        from mcp.server.fastmcp.utilities.types import Image as FastMCPImage
+
+        fake_img = FastMCPImage(data=_make_test_image(64, 64), format="jpeg")
+        with pytest.raises(pydantic_core.PydanticSerializationError, match="Unable to serialize unknown type"):
+            pydantic_core.to_json({"result": ['{"test": 1}', fake_img]})
+
+    def test_convert_to_content_handles_image_correctly(self):
+        """fastmcp's _convert_to_content converts Image → ImageContent without error."""
+        from mcp.server.fastmcp.utilities.func_metadata import _convert_to_content
+        from mcp.server.fastmcp.utilities.types import Image as FastMCPImage
+        from mcp.types import ImageContent, TextContent
+
+        json_str = '{"image_url": "https://example.com/img.jpg"}'
+        img = FastMCPImage(data=_make_test_image(64, 64), format="jpeg")
+        result = _convert_to_content([json_str, img])
+
+        assert len(result) == 2
+        assert isinstance(result[0], TextContent)
+        assert isinstance(result[1], ImageContent)
+        assert result[1].mimeType == "image/jpeg"
+        assert len(result[1].data) > 0  # base64 data present
+
+    def test_all_four_tools_have_structured_output_false(self):
+        """All 4 image generation tools must have structured_output=False."""
+        import mcp.server.fastmcp.tools.base as tools_base
+
+        mcp_instance = server.mcp
+        tool_names = ["generate_image", "edit_image", "swap_background", "create_variations"]
+        for name in tool_names:
+            tool = mcp_instance._tool_manager._tools.get(name)
+            assert tool is not None, f"Tool '{name}' not registered"
+            # structured_output=False means output_schema must be None
+            assert tool.fn_metadata.output_schema is None, (
+                f"Tool '{name}' has an output_schema — structured_output=False was not applied. "
+                "This will cause PydanticSerializationError when Image objects are in the return list."
+            )
+
+
+# ---------------------------------------------------------------------------
+# 31. S3 URL completeness — multi-image, fallback, all tools
+# ---------------------------------------------------------------------------
+
+class TestS3UrlCompleteness:
+    """Verify S3 URL behavior across all generation tools and edge cases."""
+
+    def _mock_gemini_response(self):
+        test_img = _make_test_image(256, 256)
+        mock_part = MagicMock()
+        mock_part.inline_data = MagicMock(mime_type="image/png", data=test_img)
+        mock_candidate = MagicMock()
+        mock_candidate.content.parts = [mock_part]
+        mock_response = MagicMock()
+        mock_response.candidates = [mock_candidate]
+        return mock_response
+
+    def setup_method(self):
+        with server._STORE_LOCK:
+            server._IMAGE_STORE.clear()
+
+    @pytest.mark.asyncio
+    async def test_multi_image_each_gets_unique_s3_url(self):
+        """count=3 with S3: each image gets its own distinct S3 URL."""
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_gemini_response()
+
+        call_counter = [0]
+        def make_s3_url(jpeg_bytes, prefix="gen"):
+            call_counter[0] += 1
+            return f"https://bucket.s3.amazonaws.com/{prefix}/img{call_counter[0]}.jpg"
+
+        with patch.object(server, "_get_client", return_value=mock_client), \
+             patch.object(server, "S3_BUCKET", "bucket"), \
+             patch.object(server, "_upload_to_s3", side_effect=make_s3_url):
+            result = await server.generate_image("cats", count=3)
+
+        meta = _parse_result(result)
+        assert "images" in meta
+        urls = [img["image_url"] for img in meta["images"]]
+        assert len(urls) == 3
+        assert len(set(urls)) == 3, "Each image must have a unique S3 URL"
+        assert all("amazonaws.com" in u for u in urls)
+
+    @pytest.mark.asyncio
+    async def test_s3_failure_fallback_to_local_url(self):
+        """When _upload_to_s3 raises, tool returns /images/ URL with expires_in."""
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_gemini_response()
+
+        with patch.object(server, "_get_client", return_value=mock_client), \
+             patch.object(server, "S3_BUCKET", "bucket"), \
+             patch.object(server, "_upload_to_s3", side_effect=Exception("S3 auth failed")):
+            result = await server.generate_image("cat")
+
+        assert isinstance(result, list), "Must still return [json, image] on S3 failure"
+        meta = _parse_result(result)
+        assert "/images/" in meta["image_url"], "Must fall back to local /images/ URL"
+        assert "amazonaws.com" not in meta["image_url"]
+        assert "expires_in" in meta, "Fallback URL must have expiry warning"
+
+    @pytest.mark.asyncio
+    async def test_swap_background_returns_s3_url(self):
+        """swap_background returns S3 URL when S3_BUCKET is set."""
+        src = _make_test_image(200, 200)
+        src_id = server._store_image(src, "image/jpeg")
+        mock_ctx = MagicMock()
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_gemini_response()
+        fake_url = "https://bucket.s3.amazonaws.com/bgswap/x.jpg"
+
+        with patch.object(server, "_get_client", return_value=mock_client), \
+             patch.object(server, "S3_BUCKET", "bucket"), \
+             patch.object(server, "_upload_to_s3", return_value=fake_url):
+            result = await server.swap_background(
+                image=f"nanobanana://{src_id}", background="beach", ctx=mock_ctx
+            )
+
+        meta = _parse_result(result)
+        assert meta["image_url"] == fake_url
+        assert "expires_in" not in meta
+
+    @pytest.mark.asyncio
+    async def test_create_variations_returns_s3_urls(self):
+        """create_variations returns S3 URLs for each variation when S3_BUCKET is set."""
+        src = _make_test_image(200, 200)
+        src_id = server._store_image(src, "image/jpeg")
+        mock_ctx = MagicMock()
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_gemini_response()
+
+        n = [0]
+        def make_url(b, prefix="var"):
+            n[0] += 1
+            return f"https://bucket.s3.amazonaws.com/{prefix}/{n[0]}.jpg"
+
+        with patch.object(server, "_get_client", return_value=mock_client), \
+             patch.object(server, "S3_BUCKET", "bucket"), \
+             patch.object(server, "_upload_to_s3", side_effect=make_url):
+            result = await server.create_variations(
+                image=f"nanobanana://{src_id}", ctx=mock_ctx, count=2
+            )
+
+        meta = _parse_result(result)
+        assert "images" in meta
+        for img in meta["images"]:
+            assert "amazonaws.com" in img["image_url"]
+            assert "expires_in" not in img
+
+    @pytest.mark.asyncio
+    async def test_edit_image_s3_failure_still_returns_image(self):
+        """edit_image gracefully falls back when S3 fails — tool result still valid."""
+        src = _make_test_image(200, 200)
+        src_id = server._store_image(src, "image/jpeg")
+        mock_ctx = MagicMock()
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_gemini_response()
+
+        with patch.object(server, "_get_client", return_value=mock_client), \
+             patch.object(server, "S3_BUCKET", "bucket"), \
+             patch.object(server, "_upload_to_s3", side_effect=ConnectionError("timeout")):
+            result = await server.edit_image(
+                image=f"nanobanana://{src_id}", prompt="add hat", ctx=mock_ctx
+            )
+
+        assert isinstance(result, list)
+        meta = _parse_result(result)
+        assert "/images/" in meta["image_url"]
+        assert "expires_in" in meta
+
+
+# ---------------------------------------------------------------------------
+# 32. Docstring instruction contract
+# ---------------------------------------------------------------------------
+
+class TestDocstringInstructions:
+    """Verify the ![](image_url) instruction is present in all generation tools."""
+
+    def test_all_generation_tools_have_markdown_image_instruction(self):
+        """All 4 tools must instruct Claude to render the image via markdown."""
+        tools = [
+            server.generate_image,
+            server.edit_image,
+            server.swap_background,
+            server.create_variations,
+        ]
+        for tool in tools:
+            doc = tool.__doc__ or ""
+            assert "![](image_url)" in doc, (
+                f"{tool.__name__} is missing '![](image_url)' in its docstring. "
+                "Without this, Claude won't render the image inline in its reply."
+            )
+            assert "Always show the image" in doc, (
+                f"{tool.__name__} is missing 'Always show the image' instruction."
+            )
+
+
+# ---------------------------------------------------------------------------
+# 33. save_folder + S3 simultaneously
+# ---------------------------------------------------------------------------
+
+class TestSaveFolderWithS3:
+    """Both save_folder and S3 can be active at the same time."""
+
+    def _mock_gemini_response(self):
+        test_img = _make_test_image(128, 128)
+        mock_part = MagicMock()
+        mock_part.inline_data = MagicMock(mime_type="image/png", data=test_img)
+        mock_candidate = MagicMock()
+        mock_candidate.content.parts = [mock_part]
+        mock_response = MagicMock()
+        mock_response.candidates = [mock_candidate]
+        return mock_response
+
+    def setup_method(self):
+        with server._STORE_LOCK:
+            server._IMAGE_STORE.clear()
+
+    @pytest.mark.asyncio
+    async def test_single_image_has_both_s3_url_and_saved_path(self, tmp_path):
+        """Single image: metadata has S3 image_url AND local saved_to path."""
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_gemini_response()
+        fake_s3 = "https://bucket.s3.amazonaws.com/gen/abc.jpg"
+
+        with patch.object(server, "_get_client", return_value=mock_client), \
+             patch.object(server, "S3_BUCKET", "bucket"), \
+             patch.object(server, "_upload_to_s3", return_value=fake_s3):
+            result = await server.generate_image("cat", save_folder=str(tmp_path))
+
+        meta = _parse_result(result)
+        assert meta["image_url"] == fake_s3
+        assert "saved_to" in meta
+        assert os.path.isfile(meta["saved_to"])
+        assert str(tmp_path) in meta["saved_to"]
+
+    @pytest.mark.asyncio
+    async def test_multi_image_each_has_s3_url_and_saved_path(self, tmp_path):
+        """count=2 with S3 + save_folder: each image has both fields."""
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_gemini_response()
+
+        n = [0]
+        def make_url(b, prefix="gen"):
+            n[0] += 1
+            return f"https://bucket.s3.amazonaws.com/gen/{n[0]}.jpg"
+
+        with patch.object(server, "_get_client", return_value=mock_client), \
+             patch.object(server, "S3_BUCKET", "bucket"), \
+             patch.object(server, "_upload_to_s3", side_effect=make_url):
+            result = await server.generate_image("cats", count=2, save_folder=str(tmp_path))
+
+        meta = _parse_result(result)
+        assert "images" in meta
+        for img in meta["images"]:
+            assert "amazonaws.com" in img["image_url"]
+            assert "saved_to" in img
+            assert os.path.isfile(img["saved_to"])
+        # Files must be distinct
+        paths = [img["saved_to"] for img in meta["images"]]
+        assert len(set(paths)) == 2
+
+    @pytest.mark.asyncio
+    async def test_s3_failure_still_saves_to_folder(self, tmp_path):
+        """Even when S3 upload fails, save_folder write succeeds."""
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_gemini_response()
+
+        with patch.object(server, "_get_client", return_value=mock_client), \
+             patch.object(server, "S3_BUCKET", "bucket"), \
+             patch.object(server, "_upload_to_s3", side_effect=Exception("S3 down")):
+            result = await server.generate_image("cat", save_folder=str(tmp_path))
+
+        meta = _parse_result(result)
+        assert "/images/" in meta["image_url"]   # fallback URL
+        assert "saved_to" in meta                # local save still worked
+        assert os.path.isfile(meta["saved_to"])
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
