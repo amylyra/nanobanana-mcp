@@ -225,6 +225,7 @@ mcp = FastMCP(
     ).format(upload_url=_get_upload_base_url()),
     host=os.environ.get("HOST", "0.0.0.0"),
     port=int(os.environ.get("PORT", 8080)),
+    stateless_http=True,
 )
 
 
