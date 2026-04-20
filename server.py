@@ -802,7 +802,11 @@ def _get_s3_client():
 
 
 def _upload_to_s3(jpeg_bytes: bytes, prefix: str = "gen") -> str:
-    """Upload JPEG bytes to S3 and return a public URL."""
+    """Upload JPEG bytes to S3 and return a presigned URL (7-day TTL).
+
+    S3 objects are private by default — a presigned URL lets the browser load
+    the image without requiring a public bucket policy or ACL.
+    """
     s3 = _get_s3_client()
     key = f"{prefix}/{uuid.uuid4().hex}.jpg"
     try:
@@ -817,7 +821,15 @@ def _upload_to_s3(jpeg_bytes: bytes, prefix: str = "gen") -> str:
             f"S3 upload failed: {e}. Check AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, "
             f"and that the IAM user has s3:PutObject on {S3_BUCKET}."
         )
-    return f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{key}"
+    try:
+        return s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": S3_BUCKET, "Key": key},
+            ExpiresIn=604800,  # 7 days
+        )
+    except Exception:
+        # Presigning failed (e.g. no GetObject permission) — fall back to public URL
+        return f"https://{S3_BUCKET}.s3.{S3_REGION}.amazonaws.com/{key}"
 
 
 def _upload_to_cloud(jpeg_bytes: bytes, prefix: str = "gen") -> str:
