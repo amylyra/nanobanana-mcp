@@ -40,11 +40,20 @@ from mcp.server.fastmcp import Image as MCPImage
 def _parse_result(result) -> dict:
     """Parse JSON metadata from a tool result.
 
-    Image-generating tools return [json_str, Image, ...] so Claude.ai can render
-    images inline. Error paths and non-image tools still return a plain str.
+    Image-generating tools return [render_md, json_str, Image, ...].
+    render_md is pure markdown (not JSON), so we find the first item
+    that parses as valid JSON.
+    Error paths and non-image tools still return a plain str.
     """
-    json_str = result[0] if isinstance(result, list) else result
-    return json.loads(json_str)
+    if isinstance(result, (list, tuple)):
+        for item in result:
+            if isinstance(item, str):
+                try:
+                    return json.loads(item)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+        raise ValueError("No valid JSON found in result")
+    return json.loads(result)
 
 
 def _make_test_image(w=200, h=300, mode="RGB", fmt="JPEG") -> bytes:
@@ -301,7 +310,7 @@ class TestNoDoubleJPEG:
             {"test": True},
             [(jpeg, {"index": 1})],
         )
-        assert isinstance(result, str)
+        assert isinstance(result, tuple)
         metadata = _parse_result(result)
         assert "image_url" in metadata
         assert "/images/" in metadata["image_url"]
@@ -459,9 +468,9 @@ class TestGenerateImageFlow:
         with patch.object(server, "_get_client", return_value=mock_client):
             result = await server.generate_image("a cute cat")
 
-        # Tools now return [json_str, Image, ...] for inline display in Claude.ai
+        # Tools now return [render_md, json_str, Image, ...] for inline display in Claude.ai
         assert isinstance(result, list)
-        assert len(result) == 2  # JSON metadata + 1 embedded image
+        assert len(result) == 3  # render_md + JSON metadata + 1 embedded image
         metadata = _parse_result(result)
         assert "model" in metadata
         assert "image_url" in metadata
@@ -1028,32 +1037,31 @@ class TestCloudOutputKeyConsistency:
         assert isinstance(meta["size_kb"], int)
 
     def test_single_image_render_markdown_contains_url(self):
-        """Single image response includes render_markdown with the image URL."""
+        """Single image response: render_markdown is the first tuple element, contains the URL."""
         jpeg = _make_test_image(100, 100)
-        result = server._build_image_response({}, [(jpeg, {"index": 1})])
-        meta = _parse_result(result)
-        assert "render_markdown" in meta
-        assert meta["image_url"] in meta["render_markdown"]
-        assert "![" in meta["render_markdown"]
+        render_md, json_str = server._build_image_response({}, [(jpeg, {"index": 1})])
+        meta = json.loads(json_str)
+        assert "![" in render_md
+        assert meta["image_url"] in render_md
+        # render_markdown not duplicated in JSON
+        assert "render_markdown" not in meta
 
     def test_multi_image_render_markdown_contains_all_urls(self):
-        """Multi-image response includes render_markdown with all image URLs."""
+        """Multi-image response: render_markdown contains all image URLs."""
         imgs = [(_make_test_image(100, 100), {"index": i}) for i in range(3)]
-        result = server._build_image_response({}, imgs)
-        meta = _parse_result(result)
-        assert "render_markdown" in meta
+        render_md, json_str = server._build_image_response({}, imgs)
+        meta = json.loads(json_str)
         for img in meta["images"]:
-            assert img["image_url"] in meta["render_markdown"]
+            assert img["image_url"] in render_md
         # Should have 3 separate image markdown entries
-        assert meta["render_markdown"].count("![") == 3
+        assert render_md.count("![") == 3
 
     def test_multi_image_render_markdown_labels_images(self):
         """Multi-image render_markdown uses Image 1, Image 2, ... labels."""
         imgs = [(_make_test_image(100, 100), {"index": i}) for i in range(2)]
-        result = server._build_image_response({}, imgs)
-        meta = _parse_result(result)
-        assert "Image 1" in meta["render_markdown"]
-        assert "Image 2" in meta["render_markdown"]
+        render_md, _ = server._build_image_response({}, imgs)
+        assert "Image 1" in render_md
+        assert "Image 2" in render_md
 
 
 # ---------------------------------------------------------------------------
@@ -1501,11 +1509,11 @@ class TestEmbeddedImageContract:
             result = await server.generate_image("a sunset")
 
         assert isinstance(result, list), "Should return list, not str"
-        assert len(result) == 2, f"Expected [json, image], got {len(result)} items"
+        assert len(result) == 3, f"Expected [render_md, json, image], got {len(result)} items"
         assert isinstance(result[0], str), "First item must be JSON string"
-        assert isinstance(result[1], MCPImage), "Second item must be MCPImage for inline display"
+        assert isinstance(result[2], MCPImage), "Third item must be MCPImage (index 2, after render_md and json)"
         # Image must have actual bytes
-        assert result[1].data and len(result[1].data) > 0
+        assert result[2].data and len(result[2].data) > 0
 
     @pytest.mark.asyncio
     async def test_generate_image_count3_embeds_3_images(self):
@@ -1517,9 +1525,9 @@ class TestEmbeddedImageContract:
             result = await server.generate_image("cats", count=3)
 
         assert isinstance(result, list)
-        assert len(result) == 4, f"Expected [json, img, img, img], got {len(result)} items"
+        assert len(result) == 5, f"Expected [render_md, json, img, img, img], got {len(result)} items"
         assert isinstance(result[0], str)
-        for i in range(1, 4):
+        for i in range(2, 5):
             assert isinstance(result[i], MCPImage), f"Item {i} should be MCPImage"
 
     @pytest.mark.asyncio
@@ -1536,7 +1544,7 @@ class TestEmbeddedImageContract:
             )
 
         assert isinstance(result, list)
-        assert isinstance(result[1], MCPImage)
+        assert isinstance(result[2], MCPImage)
 
     @pytest.mark.asyncio
     async def test_swap_background_embeds_image(self):
@@ -1552,7 +1560,7 @@ class TestEmbeddedImageContract:
             )
 
         assert isinstance(result, list)
-        assert isinstance(result[1], MCPImage)
+        assert isinstance(result[2], MCPImage)
 
     @pytest.mark.asyncio
     async def test_create_variations_embeds_all_variations(self):
@@ -1568,8 +1576,8 @@ class TestEmbeddedImageContract:
             )
 
         assert isinstance(result, list)
-        assert len(result) == 3  # json + 2 images
-        assert all(isinstance(result[i], MCPImage) for i in range(1, 3))
+        assert len(result) == 4  # render_md + json + 2 images
+        assert all(isinstance(result[i], MCPImage) for i in range(2, 4))
 
     @pytest.mark.asyncio
     async def test_error_paths_return_str_not_list(self):
@@ -1698,7 +1706,7 @@ class TestDefaultOutputBehavior:
             result = await server.generate_image("cat")
 
         assert isinstance(result, list)
-        assert isinstance(result[1], MCPImage)
+        assert isinstance(result[2], MCPImage)
 
     @pytest.mark.asyncio
     async def test_s3_bucket_gives_s3_url_in_metadata(self):
@@ -1718,7 +1726,7 @@ class TestDefaultOutputBehavior:
         assert "amazonaws.com" in meta["image_url"]
         assert "expires_in" not in meta, "S3 URLs don't expire"
         # Inline image still embedded
-        assert isinstance(result, list) and isinstance(result[1], MCPImage)
+        assert isinstance(result, list) and isinstance(result[2], MCPImage)
 
     @pytest.mark.asyncio
     async def test_no_s3_bucket_uses_local_url(self):
@@ -1790,8 +1798,8 @@ class TestClaudeCodeContext:
         edit_meta = _parse_result(edit_result)
         assert "image_url" in edit_meta
         # Embedding present in both results
-        assert isinstance(gen_result, list) and isinstance(gen_result[1], MCPImage)
-        assert isinstance(edit_result, list) and isinstance(edit_result[1], MCPImage)
+        assert isinstance(gen_result, list) and isinstance(gen_result[2], MCPImage)
+        assert isinstance(edit_result, list) and isinstance(edit_result[2], MCPImage)
 
     @pytest.mark.asyncio
     async def test_s3_urls_returned_for_both_gen_and_edit(self):
@@ -2383,7 +2391,7 @@ class TestCompositeSwap:
             )
 
         assert isinstance(result, list)
-        assert isinstance(result[1], MCPImage)
+        assert isinstance(result[2], MCPImage)
 
 
 # ---------------------------------------------------------------------------
@@ -2417,15 +2425,17 @@ class TestStructuredOutputFix:
         from mcp.server.fastmcp.utilities.types import Image as FastMCPImage
         from mcp.types import ImageContent, TextContent
 
+        render_md = "![](https://example.com/img.jpg)"
         json_str = '{"image_url": "https://example.com/img.jpg"}'
         img = FastMCPImage(data=_make_test_image(64, 64), format="jpeg")
-        result = _convert_to_content([json_str, img])
+        result = _convert_to_content([render_md, json_str, img])
 
-        assert len(result) == 2
+        assert len(result) == 3
         assert isinstance(result[0], TextContent)
-        assert isinstance(result[1], ImageContent)
-        assert result[1].mimeType == "image/jpeg"
-        assert len(result[1].data) > 0  # base64 data present
+        assert isinstance(result[1], TextContent)
+        assert isinstance(result[2], ImageContent)
+        assert result[2].mimeType == "image/jpeg"
+        assert len(result[2].data) > 0  # base64 data present
 
     def test_all_four_tools_have_structured_output_false(self):
         """All 4 image generation tools must have structured_output=False."""
@@ -2797,8 +2807,8 @@ class TestGeminiExceptionHandling:
 
         # Should return the one successful image, not fail entirely
         assert isinstance(result, list), "Partial success must still return images"
-        assert isinstance(result[1], MCPImage)
-        meta = json.loads(result[0])
+        assert isinstance(result[2], MCPImage)
+        meta = _parse_result(result)
         assert "errors" in meta, "Partial failure must be reported in errors field"
 
     @pytest.mark.asyncio
@@ -2815,16 +2825,16 @@ class TestGeminiExceptionHandling:
             )
 
         assert isinstance(result, list)
-        assert len(result) == 3, f"Expected [json, img, img], got {len(result)} items"
-        meta = json.loads(result[0])
+        assert len(result) == 4, f"Expected [render_md, json, img, img], got {len(result)} items"
+        meta = _parse_result(result)
         assert "images" in meta, "Multi-image result must use images[] array (not top-level image_url)"
         assert len(meta["images"]) == 2
         assert all("image_url" in img for img in meta["images"])
-        assert all(isinstance(result[i], MCPImage) for i in range(1, 3))
+        assert all(isinstance(result[i], MCPImage) for i in range(2, 4))
 
     @pytest.mark.asyncio
     async def test_swap_background_count2_embeds_2_images(self):
-        """swap_background count=2 returns [json, img1, img2]."""
+        """swap_background count=2 returns [render_md, json, img1, img2]."""
         src_id = server._store_image(_make_test_image(200, 200), "image/jpeg")
         mock_ctx = MagicMock()
         mock_client = MagicMock()
@@ -2836,11 +2846,11 @@ class TestGeminiExceptionHandling:
             )
 
         assert isinstance(result, list)
-        assert len(result) == 3
-        meta = json.loads(result[0])
+        assert len(result) == 4
+        meta = _parse_result(result)
         assert "images" in meta
         assert len(meta["images"]) == 2
-        assert all(isinstance(result[i], MCPImage) for i in range(1, 3))
+        assert all(isinstance(result[i], MCPImage) for i in range(2, 4))
 
     @pytest.mark.asyncio
     async def test_edit_image_count2_all_fail_returns_json_error(self):

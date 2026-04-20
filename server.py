@@ -854,14 +854,18 @@ def _build_image_response(
     generated: list[tuple[bytes, dict]],
     save_folder: str | None = None,
     prefix: str = "gen",
-) -> str:
+) -> tuple[str, str]:
     """Build a tool response with metadata + images.
 
     generated: list of (jpeg_bytes, per_image_metadata) tuples.
 
+    Returns (render_markdown, json_metadata):
+    - render_markdown: pure markdown string the tool should return as its first
+      text item so Claude includes it verbatim in its reply.
+    - json_metadata: JSON string for tool chaining (image_url, size_kb, etc.)
+
     Always stores images server-side (/images/ URLs, 1-hour TTL) for tool chaining.
-    If S3 is configured, also uploads to S3 and uses the durable S3 URL as image_url
-    so users have a persistent link even when inline rendering isn't available.
+    If S3 is configured, also uploads to S3 and uses the durable S3 URL as image_url.
     If save_folder is provided, also writes JPEG files there.
     """
     base_url = _get_upload_base_url()
@@ -887,14 +891,14 @@ def _build_image_response(
     if len(generated) == 1:
         result.update(generated[0][1])
         result.pop("index", None)
-        result["render_markdown"] = f"![]({result['image_url']})"
+        render_md = f"![]({result['image_url']})"
     else:
         result["images"] = [{k: v for k, v in meta.items() if k != "index"} for _, meta in generated]
-        result["render_markdown"] = "\n\n".join(
+        render_md = "\n\n".join(
             f"![Image {i + 1}]({img['image_url']})"
             for i, img in enumerate(result["images"])
         )
-    return json.dumps(result)
+    return render_md, json.dumps(result)
 
 
 # ---------------------------------------------------------------------------
@@ -1162,12 +1166,13 @@ async def generate_image(
         result["errors"] = errors
 
     try:
-        json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="gen")
+        render_md, json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="gen")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload generated images: {e}"})
-    # Embed images as MCP Image content so Claude.ai renders them inline.
-    # JSON metadata is still returned first for tool chaining (image_url field).
-    return [json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
+    # render_md is the first text item — Claude outputs it verbatim, showing images inline.
+    # json_result is the second text item — contains image_url etc. for tool chaining.
+    # Image objects provide previews in the tool result block.
+    return [render_md, json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
 
 
 @mcp.tool(structured_output=False)
@@ -1291,10 +1296,10 @@ async def edit_image(
     if errors:
         result["errors"] = errors
     try:
-        json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="edit")
+        render_md, json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="edit")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload edited images: {e}"})
-    return [json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
+    return [render_md, json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
 
 
 @mcp.tool(structured_output=False)
@@ -1368,10 +1373,10 @@ async def swap_background(
     if errors:
         result["errors"] = errors
     try:
-        json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="bgswap")
+        render_md, json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="bgswap")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload background-swapped images: {e}"})
-    return [json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
+    return [render_md, json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
 
 
 @mcp.tool(structured_output=False)
@@ -1479,11 +1484,11 @@ async def create_variations(
         result["guidance"] = prompt
 
     try:
-        json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="var")
+        render_md, json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="var")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload variation images: {e}"})
 
-    return [json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
+    return [render_md, json_result] + [Image(data=jpeg_bytes, format="jpeg") for jpeg_bytes, _ in generated]
 
 
 # ---------------------------------------------------------------------------
