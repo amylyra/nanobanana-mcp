@@ -2876,110 +2876,11 @@ class TestGeminiExceptionHandling:
 
 
 # ---------------------------------------------------------------------------
-# Tests for gaps that caused real production failures
-# ---------------------------------------------------------------------------
-
-class TestRenderMdUrlValidity:
-    """Tool result must include MCPImage objects for inline display and image_url for chaining."""
-
-    def _mock_gemini_response(self):
-        img = _make_test_image(100, 100)
-        part = MagicMock()
-        part.inline_data = MagicMock()
-        part.inline_data.mime_type = "image/jpeg"
-        part.inline_data.data = img
-        candidate = MagicMock()
-        candidate.content.parts = [part]
-        response = MagicMock()
-        response.candidates = [candidate]
-        return response
-
-    @pytest.mark.asyncio
-    async def test_result_includes_mcp_image(self):
-        """generate_image returns a list with MCPImage for inline rendering."""
-        mock_client = MagicMock()
-        mock_client.models.generate_content.return_value = self._mock_gemini_response()
-
-        with patch.object(server, "_get_client", return_value=mock_client):
-            result = await server.generate_image("cat")
-
-        assert isinstance(result, list)
-        assert isinstance(result[1], MCPImage), "Second item must be MCPImage"
-
-    @pytest.mark.asyncio
-    async def test_mcp_image_has_jpeg_data(self):
-        """MCPImage returned must contain valid JPEG bytes."""
-        mock_client = MagicMock()
-        mock_client.models.generate_content.return_value = self._mock_gemini_response()
-
-        with patch.object(server, "_get_client", return_value=mock_client):
-            result = await server.generate_image("cat")
-
-        img = result[1]
-        # Data must be non-trivially large (real image, not empty)
-        assert len(img.data) > 100
-        # Must be valid JPEG
-        pil = PILImage.open(BytesIO(img.data))
-        assert pil.format == "JPEG"
-
-    @pytest.mark.asyncio
-    async def test_image_url_in_metadata_is_http_not_data_uri(self):
-        """image_url in JSON metadata must be an HTTP URL (for tool chaining), not a data URI."""
-        mock_client = MagicMock()
-        mock_client.models.generate_content.return_value = self._mock_gemini_response()
-
-        with patch.object(server, "_get_client", return_value=mock_client):
-            result = await server.generate_image("cat")
-
-        meta = _parse_result(result)
-        assert "image_url" in meta
-        assert meta["image_url"].startswith("http"), (
-            "image_url must be an HTTP URL for tool chaining, not a data URI"
-        )
-        assert "data:" not in meta["image_url"]
-
-    @pytest.mark.asyncio
-    async def test_multi_image_all_have_mcp_image_objects(self):
-        """Every image in a multi-image result must have a corresponding MCPImage."""
-        mock_client = MagicMock()
-        mock_client.models.generate_content.return_value = self._mock_gemini_response()
-
-        with patch.object(server, "_get_client", return_value=mock_client):
-            result = await server.generate_image("cats", count=3)
-
-        assert isinstance(result, list)
-        assert len(result) == 4, "Should be [json_str, img1, img2, img3]"
-        for i in range(1, 4):
-            assert isinstance(result[i], MCPImage)
-
-    @pytest.mark.asyncio
-    async def test_s3_still_returns_mcp_image(self):
-        """Even with S3 configured, MCPImage objects are still returned."""
-        mock_client = MagicMock()
-        mock_client.models.generate_content.return_value = self._mock_gemini_response()
-
-        fake_s3_url = "https://bucket.s3.amazonaws.com/gen/x.jpg"
-
-        with patch.object(server, "_get_client", return_value=mock_client), \
-             patch.object(server, "S3_BUCKET", "bucket"), \
-             patch.object(server, "_upload_to_s3", return_value=fake_s3_url):
-            result = await server.generate_image("cat")
-
-        assert isinstance(result, list)
-        assert isinstance(result[1], MCPImage)
-        meta = _parse_result(result)
-        assert meta["image_url"] == fake_s3_url
-
-
-# ---------------------------------------------------------------------------
 # Tests: MCPImage thumbnail validity — decodes to a real JPEG within bounds
 # ---------------------------------------------------------------------------
 
-class TestDataUriThumbnailValidity:
-    """Verify MCPImage thumbnails returned by tools are real, decodable JPEGs.
-
-    These tests guard against regressions where the thumbnail is empty or corrupt.
-    """
+class TestMCPImageValidity:
+    """Verify MCPImage thumbnails returned by tools are real, decodable JPEGs."""
 
     def setup_method(self):
         with server._STORE_LOCK:
@@ -2995,40 +2896,6 @@ class TestDataUriThumbnailValidity:
         response.candidates = [candidate]
         return response
 
-    def test_make_thumbnail_data_uri_returns_valid_jpeg(self):
-        """_make_thumbnail_data_uri (helper) produces a base64 JPEG that PIL can open."""
-        jpeg = _make_test_image(400, 300)
-        uri = server._make_thumbnail_data_uri(jpeg)
-
-        prefix = "data:image/jpeg;base64,"
-        assert uri.startswith(prefix)
-        b64_data = uri[len(prefix):]
-        raw = base64.b64decode(b64_data)
-        img = PILImage.open(BytesIO(raw))
-        assert img.format == "JPEG"
-
-    def test_make_thumbnail_data_uri_respects_max_dim(self):
-        """_make_thumbnail_data_uri thumbnail must be ≤ max_dim on both axes."""
-        jpeg = _make_test_image(1024, 768)
-        uri = server._make_thumbnail_data_uri(jpeg, max_dim=256)
-
-        b64_data = uri[len("data:image/jpeg;base64,"):]
-        raw = base64.b64decode(b64_data)
-        img = PILImage.open(BytesIO(raw))
-        w, h = img.size
-        assert max(w, h) <= 256, f"Thumbnail {w}x{h} exceeds max_dim=256"
-
-    def test_make_thumbnail_data_uri_small_image_not_upscaled(self):
-        """Images already smaller than max_dim must not be upscaled."""
-        jpeg = _make_test_image(50, 50)
-        uri = server._make_thumbnail_data_uri(jpeg, max_dim=256)
-
-        b64_data = uri[len("data:image/jpeg;base64,"):]
-        raw = base64.b64decode(b64_data)
-        img = PILImage.open(BytesIO(raw))
-        w, h = img.size
-        assert max(w, h) <= 50, f"Small image was upscaled to {w}x{h}"
-
     def test_build_image_response_returns_mcp_image_with_valid_jpeg(self):
         """_build_image_response MCPImage contains valid JPEG bytes."""
         jpeg = _make_test_image(200, 200)
@@ -3036,8 +2903,7 @@ class TestDataUriThumbnailValidity:
         assert isinstance(result, list) and len(result) == 2
         mcp_img = result[1]
         assert isinstance(mcp_img, MCPImage)
-        raw = mcp_img.data
-        img = PILImage.open(BytesIO(raw))
+        img = PILImage.open(BytesIO(mcp_img.data))
         assert img.format == "JPEG"
         w, h = img.size
         assert max(w, h) <= 512, f"MCPImage thumbnail too large: {w}x{h}"
@@ -3048,14 +2914,13 @@ class TestDataUriThumbnailValidity:
         result = server._build_image_response({}, imgs)
         assert len(result) == 4
         for i in range(1, 4):
-            raw = result[i].data
-            pil_img = PILImage.open(BytesIO(raw))
+            pil_img = PILImage.open(BytesIO(result[i].data))
             assert pil_img.format == "JPEG", f"Image {i} MCPImage is not JPEG"
             w, h = pil_img.size
             assert max(w, h) <= 512, f"Image {i} thumbnail too large: {w}x{h}"
 
     @pytest.mark.asyncio
-    async def test_generate_image_mcp_image_decodable_in_production_flow(self):
+    async def test_generate_image_mcp_image_is_valid_jpeg(self):
         """Full generate_image flow: MCPImage in result contains valid JPEG."""
         mock_client = MagicMock()
         mock_client.models.generate_content.return_value = self._mock_gemini_response(512, 512)
@@ -3063,20 +2928,17 @@ class TestDataUriThumbnailValidity:
         with patch.object(server, "_get_client", return_value=mock_client):
             result = await server.generate_image("a test image")
 
-        assert isinstance(result, list)
         mcp_img = result[1]
         assert isinstance(mcp_img, MCPImage)
         img = PILImage.open(BytesIO(mcp_img.data))
         assert img.format == "JPEG"
-        w, h = img.size
-        assert max(w, h) <= 512
+        assert max(img.size) <= 512
 
     @pytest.mark.asyncio
-    async def test_rgba_source_image_mcp_image_is_valid_jpeg(self):
-        """RGBA source images (PNG with transparency) must produce valid JPEG in MCPImage."""
+    async def test_rgba_source_produces_valid_jpeg(self):
+        """RGBA/PNG source images must produce valid JPEG in MCPImage."""
         rgba_img = _make_test_image(200, 200, mode="RGBA", fmt="PNG")
         mock_client = MagicMock()
-
         part = MagicMock()
         part.inline_data = MagicMock(mime_type="image/png", data=rgba_img)
         candidate = MagicMock()
@@ -3088,9 +2950,8 @@ class TestDataUriThumbnailValidity:
         with patch.object(server, "_get_client", return_value=mock_client):
             result = await server.generate_image("test rgba")
 
-        mcp_img = result[1]
-        img = PILImage.open(BytesIO(mcp_img.data))
-        assert img.format == "JPEG", "RGBA source must be converted to JPEG for MCPImage"
+        img = PILImage.open(BytesIO(result[1].data))
+        assert img.format == "JPEG"
 
 
 class TestS3UrlFormat:

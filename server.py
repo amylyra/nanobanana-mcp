@@ -868,27 +868,6 @@ def _save_to_folder(jpeg_bytes: bytes, folder: str, prefix: str = "gen") -> str 
         return None
 
 
-def _make_thumbnail_data_uri(jpeg_bytes: bytes, max_dim: int = 256, quality: int = 65) -> str:
-    """Resize JPEG to a small thumbnail and return as a base64 data URI.
-
-    Data URIs render inline in claude.ai automatically — unlike HTTP URLs,
-    which show a "Show Image" button requiring a click. Using a thumbnail
-    (not the full image) keeps the data URI small enough (~10-20KB base64)
-    to fit comfortably in Claude's context window.
-    """
-    from PIL import Image as PILImage
-    img = PILImage.open(BytesIO(jpeg_bytes))
-    w, h = img.size
-    if max(w, h) > max_dim:
-        scale = max_dim / max(w, h)
-        img = img.resize((int(w * scale), int(h * scale)), PILImage.LANCZOS)
-    if img.mode != "RGB":
-        img = img.convert("RGB")
-    buf = BytesIO()
-    img.save(buf, format="JPEG", quality=quality, optimize=True)
-    b64 = base64.b64encode(buf.getvalue()).decode()
-    return f"data:image/jpeg;base64,{b64}"
-
 
 def _build_image_response(
     result: dict,
