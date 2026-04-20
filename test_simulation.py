@@ -2870,5 +2870,180 @@ class TestGeminiExceptionHandling:
         assert len(data["details"]) == 2  # both attempts reported
 
 
+# ---------------------------------------------------------------------------
+# Tests for gaps that caused real production failures
+# ---------------------------------------------------------------------------
+
+class TestRenderMdUrlValidity:
+    """render_md must contain a real, non-empty http URL — not an empty fragment."""
+
+    def _mock_gemini_response(self):
+        img = _make_test_image(100, 100)
+        part = MagicMock()
+        part.inline_data = MagicMock()
+        part.inline_data.mime_type = "image/jpeg"
+        part.inline_data.data = img
+        candidate = MagicMock()
+        candidate.content.parts = [part]
+        response = MagicMock()
+        response.candidates = [candidate]
+        return response
+
+    @pytest.mark.asyncio
+    async def test_render_md_url_is_http(self):
+        """render_md URL must start with http — never empty, never relative."""
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_gemini_response()
+
+        with patch.object(server, "_get_client", return_value=mock_client):
+            result = await server.generate_image("cat")
+
+        assert isinstance(result, list)
+        render_md = result[0]
+        # Extract URL from ![](url)
+        assert render_md.startswith("![")
+        url_start = render_md.index("(") + 1
+        url_end = render_md.rindex(")")
+        url = render_md[url_start:url_end]
+        assert url.startswith("http"), f"render_md URL must be http(s), got: {url!r}"
+        assert len(url) > 10, f"render_md URL is suspiciously short: {url!r}"
+
+    @pytest.mark.asyncio
+    async def test_render_md_url_matches_image_url_in_metadata(self):
+        """The URL in render_md must match image_url in the JSON metadata."""
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_gemini_response()
+
+        with patch.object(server, "_get_client", return_value=mock_client):
+            result = await server.generate_image("cat")
+
+        render_md = result[0]
+        meta = _parse_result(result)
+        image_url = meta["image_url"]
+        assert image_url in render_md, (
+            f"image_url {image_url!r} not found in render_md {render_md!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_render_md_multi_image_all_urls_are_http(self):
+        """Every URL in a multi-image render_md must be a real http URL."""
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_gemini_response()
+
+        with patch.object(server, "_get_client", return_value=mock_client):
+            result = await server.generate_image("cats", count=3)
+
+        render_md = result[0]
+        import re
+        urls = re.findall(r'\(([^)]+)\)', render_md)
+        assert len(urls) == 3, f"Expected 3 URLs in render_md, found {len(urls)}"
+        for url in urls:
+            assert url.startswith("http"), f"render_md URL must be http(s), got: {url!r}"
+            assert len(url) > 10, f"render_md URL is suspiciously short: {url!r}"
+
+    @pytest.mark.asyncio
+    async def test_s3_render_md_url_is_presigned_not_plain_s3(self):
+        """When S3 is configured, render_md must contain a presigned URL (has query params)."""
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_gemini_response()
+
+        fake_presigned = "https://bucket.s3.amazonaws.com/gen/x.jpg?AWSAccessKeyId=ABC&Signature=XYZ&Expires=999"
+
+        with patch.object(server, "_get_client", return_value=mock_client), \
+             patch.object(server, "S3_BUCKET", "bucket"), \
+             patch.object(server, "_upload_to_s3", return_value=fake_presigned):
+            result = await server.generate_image("cat")
+
+        render_md = result[0]
+        assert fake_presigned in render_md, "Presigned URL must appear in render_md"
+        assert "?" in render_md, "Presigned URL must have query params (not a plain S3 URL)"
+
+
+class TestS3PresignedUrlFallback:
+    """_upload_to_s3 must fall back to public URL if generate_presigned_url raises."""
+
+    def test_presign_failure_falls_back_to_public_url(self):
+        """If generate_presigned_url raises, return the plain public S3 URL."""
+        fake_s3 = MagicMock()
+        fake_s3.put_object.return_value = {}
+        fake_s3.generate_presigned_url.side_effect = Exception("no GetObject permission")
+
+        with patch.object(server, "_get_s3_client", return_value=fake_s3), \
+             patch.object(server, "S3_BUCKET", "my-bucket"), \
+             patch.object(server, "S3_REGION", "us-east-1"):
+            url = server._upload_to_s3(b"fake-jpeg", prefix="gen")
+
+        assert url.startswith("https://my-bucket.s3.us-east-1.amazonaws.com/gen/")
+        assert url.endswith(".jpg")
+
+    def test_presign_success_returns_presigned_url(self):
+        """When presigning succeeds, the presigned URL is returned (not the plain URL)."""
+        fake_presigned = "https://my-bucket.s3.amazonaws.com/gen/abc.jpg?X-Amz-Signature=xyz"
+        fake_s3 = MagicMock()
+        fake_s3.put_object.return_value = {}
+        fake_s3.generate_presigned_url.return_value = fake_presigned
+
+        with patch.object(server, "_get_s3_client", return_value=fake_s3), \
+             patch.object(server, "S3_BUCKET", "my-bucket"), \
+             patch.object(server, "S3_REGION", "us-east-1"):
+            url = server._upload_to_s3(b"fake-jpeg", prefix="gen")
+
+        assert url == fake_presigned
+        # Must NOT be the plain URL — plain URL would 403 in browser
+        assert "X-Amz-Signature" in url
+
+    def test_presign_uses_7_day_expiry(self):
+        """Presigned URL TTL must be 604800 seconds (7 days)."""
+        fake_s3 = MagicMock()
+        fake_s3.put_object.return_value = {}
+        fake_s3.generate_presigned_url.return_value = "https://presigned"
+
+        with patch.object(server, "_get_s3_client", return_value=fake_s3), \
+             patch.object(server, "S3_BUCKET", "bucket"), \
+             patch.object(server, "S3_REGION", "us-east-1"):
+            server._upload_to_s3(b"bytes", prefix="gen")
+
+        call_kwargs = fake_s3.generate_presigned_url.call_args
+        assert call_kwargs[1]["ExpiresIn"] == 604800 or call_kwargs[0][2] == 604800 if len(call_kwargs[0]) > 2 else call_kwargs[1].get("ExpiresIn") == 604800, \
+            "Presigned URL must expire in 604800 seconds (7 days)"
+
+
+class TestServerInstructions:
+    """MCP server instructions must contain critical behavioral guidance."""
+
+    def _get_instructions(self):
+        return server.mcp._instructions if hasattr(server.mcp, '_instructions') else str(server.mcp.settings)
+
+    def test_instructions_say_no_base64_on_curl_failure(self):
+        """Instructions must explicitly tell Claude not to use base64 when curl fails."""
+        instructions = server.mcp.instructions if hasattr(server.mcp, 'instructions') else ""
+        if not instructions:
+            # Try accessing through settings
+            instructions = getattr(server.mcp, '_instructions', "") or getattr(server.mcp.settings, 'instructions', "")
+        assert "base64" in instructions.lower(), "Instructions must mention base64"
+        assert "curl" in instructions.lower(), "Instructions must mention curl"
+        # The key rule: don't base64 if curl fails
+        assert "not" in instructions.lower() or "never" in instructions.lower(), \
+            "Instructions must include a prohibition on base64"
+
+    def test_instructions_say_copy_render_markdown_verbatim(self):
+        """Instructions must tell Claude to copy render_markdown verbatim."""
+        instructions = server.mcp.instructions if hasattr(server.mcp, 'instructions') else ""
+        if not instructions:
+            instructions = getattr(server.mcp, '_instructions', "") or getattr(server.mcp.settings, 'instructions', "")
+        assert "render_markdown" in instructions, \
+            "Instructions must reference render_markdown field"
+        assert "verbatim" in instructions.lower() or "copy" in instructions.lower(), \
+            "Instructions must say to copy render_markdown verbatim"
+
+    def test_instructions_include_upload_page_url(self):
+        """Instructions must include the /upload page URL so Claude can direct users there."""
+        instructions = server.mcp.instructions if hasattr(server.mcp, 'instructions') else ""
+        if not instructions:
+            instructions = getattr(server.mcp, '_instructions', "") or getattr(server.mcp.settings, 'instructions', "")
+        assert "/upload" in instructions, \
+            "Instructions must include /upload page URL as fallback for image uploads"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
