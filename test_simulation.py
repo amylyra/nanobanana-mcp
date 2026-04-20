@@ -2554,7 +2554,7 @@ class TestDocstringInstructions:
     """Verify the ![](image_url) instruction is present in all generation tools."""
 
     def test_all_generation_tools_have_markdown_image_instruction(self):
-        """All 4 tools must instruct Claude to render the image via markdown."""
+        """All 4 tools must instruct Claude to render images via markdown — single AND multi."""
         tools = [
             server.generate_image,
             server.edit_image,
@@ -2563,12 +2563,19 @@ class TestDocstringInstructions:
         ]
         for tool in tools:
             doc = tool.__doc__ or ""
+            # Single-image rendering instruction
             assert "![](image_url)" in doc, (
                 f"{tool.__name__} is missing '![](image_url)' in its docstring. "
-                "Without this, Claude won't render the image inline in its reply."
+                "Without this, Claude won't render single images inline."
             )
-            assert "Always show the image" in doc, (
-                f"{tool.__name__} is missing 'Always show the image' instruction."
+            # Multi-image rendering instruction (the key fix for count > 1)
+            assert "images[]" in doc or "images[0]" in doc, (
+                f"{tool.__name__} is missing multi-image rendering instruction. "
+                "Without this, Claude describes multi-image results instead of rendering them."
+            )
+            # Imperative rendering instruction
+            assert "Always render" in doc or "always show" in doc.lower(), (
+                f"{tool.__name__} is missing an imperative render instruction."
             )
 
 
