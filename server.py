@@ -194,7 +194,8 @@ mcp = FastMCP(
         "All image tool parameters accept http/https URLs only.\n\n"
         "1. **Direct URL (http/https, S3, CDN)** → pass straight to the tool.\n"
         "2. **Public Google Drive link** → pass straight to the tool (auto-rewritten).\n"
-        "3. **Pasted image or local file (no URL)** → use the Python code tool to read, compress, and upload:\n\n"
+        "3. **Pasted image or local file (no URL)** → NEVER use curl (DNS fails in this sandbox).\n"
+        "   Use the Python code tool ONLY:\n\n"
         "```python\n"
         "import os, base64\n"
         "from io import BytesIO\n"
@@ -211,7 +212,6 @@ mcp = FastMCP(
         "print(uri[:80], '...')\n"
         "```\n\n"
         "   Then call `upload_image(image=uri)` with the full data URI — it returns an S3 URL.\n"
-        "   Do NOT use curl — it fails with DNS errors in the claude.ai sandbox.\n"
         "   If the uploads directory doesn't exist, ask the user to upload manually at {upload_url}/upload.\n\n"
         "Never fabricate URLs. Never start a local HTTP server.\n\n"
         "## Tools\n"
@@ -236,9 +236,9 @@ mcp = FastMCP(
         "prompt='replace X with reference image 1 and Y with reference image 2').\n\n"
         "Default aspect ratio 4:5, resolution 1K.\n\n"
         "## Rendering images — CRITICAL\n"
-        "Every image tool result includes a `render_markdown` field.\n"
-        "Copy that field's value verbatim into your reply — do not paraphrase, skip, or describe the images instead.\n"
-        "Example: if render_markdown is `![](https://...)`, your reply must contain `![](https://...)`."
+        "Every image tool result returns ImageContent objects that claude.ai renders inline automatically.\n"
+        "Do NOT describe images — they are already shown. Just summarize what was generated.\n"
+        "To use a generated image as input to another tool, pass its `image_url` from the JSON metadata."
     ).format(upload_url=_get_upload_base_url()),
     host=os.environ.get("HOST", "0.0.0.0"),
     port=int(os.environ.get("PORT", 8080)),
@@ -895,22 +895,18 @@ def _build_image_response(
     generated: list[tuple[bytes, dict]],
     save_folder: str | None = None,
     prefix: str = "gen",
-) -> tuple[str, str]:
-    """Build a tool response with metadata + images.
+) -> list:
+    """Build a tool response: [json_str, Image(thumbnail1), Image(thumbnail2), ...].
 
     generated: list of (jpeg_bytes, per_image_metadata) tuples.
 
-    Returns (render_markdown, json_metadata):
-    - render_markdown: markdown string using a base64 thumbnail data URI.
-      Data URIs auto-render inline in claude.ai without any user interaction.
-      Claude reproduces them in its response, making the image appear inline.
-    - json_metadata: JSON string for tool chaining (image_url is the full S3/local URL).
-
-    Always stores images server-side (/images/ URLs, 1-hour TTL) for tool chaining.
-    If S3 is configured, also uploads to S3 and uses the durable S3 URL as image_url.
-    If save_folder is provided, also writes JPEG files there.
+    Returns a list so FastMCP emits ImageContent objects that claude.ai renders
+    inline in the tool result block — no base64 text for Claude to output.
+    Each image also gets:
+    - image_url: full-quality S3 or /images/ URL — pass to other tools for chaining
     """
     base_url = _get_upload_base_url()
+    thumbnails: list[bytes] = []
     for jpeg_bytes, meta in generated:
         img_id = _store_image(jpeg_bytes, "image/jpeg")
         local_url = f"{base_url}/images/{img_id}"
@@ -926,8 +922,16 @@ def _build_image_response(
         else:
             meta["image_url"] = local_url
             meta["expires_in"] = "1 hour"
-        # Thumbnail data URI for render_md — separate from image_url (full quality for chaining)
-        meta["_thumbnail"] = _make_thumbnail_data_uri(jpeg_bytes)
+        # Build thumbnail for ImageContent (shown inline by claude.ai, no text output needed)
+        from PIL import Image as PILImage
+        pil = PILImage.open(BytesIO(jpeg_bytes))
+        if max(pil.size) > 512:
+            pil.thumbnail((512, 512), PILImage.LANCZOS)
+        if pil.mode != "RGB":
+            pil = pil.convert("RGB")
+        buf = BytesIO()
+        pil.save(buf, format="JPEG", quality=75, optimize=True)
+        thumbnails.append(buf.getvalue())
         if save_folder:
             saved_path = _save_to_folder(jpeg_bytes, save_folder, prefix)
             if saved_path:
@@ -936,14 +940,10 @@ def _build_image_response(
     if len(generated) == 1:
         result.update(generated[0][1])
         result.pop("index", None)
-        render_md = f"![]({result.pop('_thumbnail')})"
     else:
         result["images"] = [{k: v for k, v in meta.items() if k != "index"} for _, meta in generated]
-        render_md = "\n\n".join(
-            f"![Image {i + 1}]({img.pop('_thumbnail')})"
-            for i, img in enumerate(result["images"])
-        )
-    return render_md, json.dumps(result)
+
+    return [json.dumps(result)] + [Image(data=thumb, format="jpeg") for thumb in thumbnails]
 
 
 # ---------------------------------------------------------------------------
@@ -1120,9 +1120,8 @@ async def generate_image(
         save_folder: Optional local folder path to save generated JPEG files.
 
     Returns:
-        Metadata JSON with a render_markdown field. IMPORTANT: copy the render_markdown
-        value verbatim into your reply so the images display inline. Do not describe
-        the images instead of showing them.
+        JSON metadata with image_url for chaining, plus ImageContent objects shown inline
+        by claude.ai. Use image_url to pass this image to edit_image, swap_background, etc.
     """
     from google.genai import types
 
@@ -1211,13 +1210,10 @@ async def generate_image(
         result["errors"] = errors
 
     try:
-        render_md, json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="gen")
+        json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="gen")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload generated images: {e}"})
-    # render_md is the first text item — Claude outputs it verbatim, showing images inline.
-    # json_result is the second text item — contains image_url etc. for tool chaining.
-    # Image objects provide previews in the tool result block.
-    return [render_md, json_result]
+    return json_result
 
 
 @mcp.tool(structured_output=False)
@@ -1259,9 +1255,8 @@ async def edit_image(
         save_folder: Optional local folder path to save edited JPEG files.
 
     Returns:
-        Metadata JSON with a render_markdown field. IMPORTANT: copy the render_markdown
-        value verbatim into your reply so the images display inline. Do not describe
-        the images instead of showing them.
+        JSON metadata with image_url for chaining, plus ImageContent objects shown inline
+        by claude.ai. Use image_url to pass this image to edit_image, swap_background, etc.
     """
     from google.genai import types
 
@@ -1341,10 +1336,10 @@ async def edit_image(
     if errors:
         result["errors"] = errors
     try:
-        render_md, json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="edit")
+        json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="edit")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload edited images: {e}"})
-    return [render_md, json_result]
+    return json_result
 
 
 @mcp.tool(structured_output=False)
@@ -1372,9 +1367,8 @@ async def swap_background(
         save_folder: Optional local folder path to save result JPEG files.
 
     Returns:
-        Metadata JSON with a render_markdown field. IMPORTANT: copy the render_markdown
-        value verbatim into your reply so the images display inline. Do not describe
-        the images instead of showing them.
+        JSON metadata with image_url for chaining, plus ImageContent objects shown inline
+        by claude.ai. Use image_url to pass this image to edit_image, swap_background, etc.
     """
     from google.genai import types
 
@@ -1418,10 +1412,10 @@ async def swap_background(
     if errors:
         result["errors"] = errors
     try:
-        render_md, json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="bgswap")
+        json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="bgswap")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload background-swapped images: {e}"})
-    return [render_md, json_result]
+    return json_result
 
 
 @mcp.tool(structured_output=False)
@@ -1457,9 +1451,8 @@ async def create_variations(
         save_folder: Optional local folder path to save variation JPEG files.
 
     Returns:
-        Metadata JSON with a render_markdown field. IMPORTANT: copy the render_markdown
-        value verbatim into your reply so the images display inline. Do not describe
-        the images instead of showing them.
+        JSON metadata with image_url for chaining, plus ImageContent objects shown inline
+        by claude.ai. Use image_url to pass this image to edit_image, swap_background, etc.
     """
     from google.genai import types
 
@@ -1529,11 +1522,11 @@ async def create_variations(
         result["guidance"] = prompt
 
     try:
-        render_md, json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="var")
+        json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="var")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload variation images: {e}"})
 
-    return [render_md, json_result]
+    return json_result
 
 
 # ---------------------------------------------------------------------------
