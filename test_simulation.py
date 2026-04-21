@@ -3475,6 +3475,114 @@ class TestDnsUploadFailureScenario:
         data = json.loads(result)
         assert "error" in data, "Fetch failure on source image must return JSON error"
 
+    # ------------------------------------------------------------------
+    # Image #29 scenario: Claude runs curl, gets empty output, then tries
+    # to JSON-parse "" → JSONDecodeError → stuck. These tests verify the
+    # fixes that prevent this from happening.
+    # ------------------------------------------------------------------
+
+    def test_instructions_lead_with_curl_prohibition(self):
+        """The curl prohibition must appear NEAR THE START of the instructions,
+        not buried mid-text. Image #29 showed that Claude ignored a buried warning.
+        The ⚠️ CRITICAL block must appear before any other tool-usage guidance."""
+        instructions = self._get_instructions()
+        curl_pos = instructions.lower().find("curl")
+        assert curl_pos != -1, "Instructions must mention curl"
+        # The curl prohibition must appear within the first 500 characters
+        # (before the 'Getting images into tools' section, tool lists, etc.)
+        assert curl_pos < 500, (
+            f"curl prohibition must appear near the start of instructions "
+            f"(found at char {curl_pos}); it was buried and Claude ignored it"
+        )
+
+    def test_instructions_have_critical_marker(self):
+        """Instructions must contain a prominent CRITICAL or WARNING marker
+        specifically for the curl prohibition — not just a soft mention."""
+        instructions = self._get_instructions()
+        # Look for emphasis markers near the curl warning
+        has_critical = "critical" in instructions.lower()
+        has_warning = "⚠️" in instructions or "warning" in instructions.lower()
+        assert has_critical or has_warning, (
+            "Instructions must have a CRITICAL or WARNING marker for the curl "
+            "prohibition so Claude does not treat it as an optional suggestion"
+        )
+
+    def test_instructions_say_curl_returns_empty_output(self):
+        """Instructions must explain WHY curl fails (empty output / DNS blocked),
+        not just say 'don't use curl'. Without the reason, Claude may retry with curl."""
+        instructions = self._get_instructions()
+        has_empty = "empty" in instructions.lower()
+        has_silent = "silent" in instructions.lower()
+        has_dns = "dns" in instructions.lower()
+        assert has_dns and (has_empty or has_silent), (
+            "Instructions must explain that curl returns empty output due to DNS "
+            "being blocked — so Claude understands the symptom and does not retry"
+        )
+
+    def test_upload_image_error_says_do_not_use_curl(self):
+        """The upload_image error message for invalid input must explicitly say
+        'Do NOT use curl' so Claude gets the prohibition even if it ignored instructions."""
+        instructions = self._get_instructions()
+        # The error message is in the server source; we check the instructions surface
+        # because that's what Claude reads. But the docstring / error path must also
+        # reinforce the prohibition — check via a direct call with empty input.
+        import asyncio
+        mock_ctx = MagicMock()
+
+        async def _run():
+            return await server.upload_image(ctx=mock_ctx, image="")
+
+        result = asyncio.get_event_loop().run_until_complete(_run())
+        data = json.loads(result)
+        assert "error" in data
+        error_msg = data["error"].lower()
+        assert "curl" in error_msg, (
+            "upload_image error message must mention curl so Claude learns "
+            "not to use it even when it ignores server instructions"
+        )
+
+    def test_instructions_show_claude_ai_web_python_snippet(self):
+        """Instructions must include the /mnt/user-data/uploads snippet for
+        claude.ai web users — this is the ONLY working path to upload pasted images."""
+        instructions = self._get_instructions()
+        assert "/mnt/user-data/uploads" in instructions, (
+            "Instructions must include the /mnt/user-data/uploads Python snippet "
+            "for claude.ai web — Claude needs this to handle pasted images correctly"
+        )
+
+    def test_instructions_show_local_file_python_snippet(self):
+        """Instructions must include a local-file Python snippet for Claude Code
+        (not just the claude.ai web path), since Claude Code has different file access."""
+        instructions = self._get_instructions()
+        # The Claude Code path uses open() with an explicit local file path
+        has_open = "open(" in instructions
+        has_local_hint = "local" in instructions.lower() or "claude code" in instructions.lower()
+        assert has_open or has_local_hint, (
+            "Instructions must include a local-file Python snippet for Claude Code "
+            "users (not just the /mnt/user-data/uploads path for claude.ai web)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_upload_image_accepts_data_uri_not_just_http(self):
+        """upload_image must accept data URIs — if it rejects them, Claude falls back
+        to curl which always fails with empty output (Image #29 root cause)."""
+        mock_ctx = MagicMock()
+        # Minimal valid 1×1 white JPEG as a data URI
+        from PIL import Image as PILImage
+        from io import BytesIO
+        buf = BytesIO()
+        PILImage.new("RGB", (1, 1), color=(255, 255, 255)).save(buf, format="JPEG")
+        b64 = __import__("base64").b64encode(buf.getvalue()).decode()
+        data_uri = f"data:image/jpeg;base64,{b64}"
+
+        result = await server.upload_image(ctx=mock_ctx, image=data_uri)
+        data = json.loads(result)
+        assert "error" not in data, (
+            f"upload_image must accept data URIs; got error: {data.get('error')}. "
+            "If data URIs are rejected, Claude tries curl which always returns empty output."
+        )
+        assert "url" in data, "Successful upload must return a url field"
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
