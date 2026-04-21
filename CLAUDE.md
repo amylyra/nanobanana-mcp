@@ -25,10 +25,37 @@ Run the full test suite before deploying:
 python -m pytest test_simulation.py -x -q
 ```
 
-All 134 tests must pass.
+All 177 tests must pass. `conftest.py` provides async test support without requiring `pytest-asyncio`.
 
 ## Architecture
 
 - `server.py` — FastMCP server (single file)
 - `test_simulation.py` — unit/integration tests (mock Gemini, real PIL/store logic)
+- `conftest.py` — pytest hook that runs `@pytest.mark.asyncio` tests without the `pytest-asyncio` plugin
 - Cloud Run serves both the MCP endpoint (`/mcp`) and a direct upload page (`/upload`)
+
+## Tool output contract
+
+Image-generating tools (`generate_image`, `edit_image`, `swap_background`, `create_variations`) return a list:
+
+```
+[json_str, Image(thumbnail1), Image(thumbnail2), ...]
+```
+
+- **`json_str`** — JSON metadata including:
+  - `image_url` — full-quality S3 or `/images/` URL for passing to other tools
+  - `display_markdown` — `![generated image](image_url)` markdown string
+  - `assistant_response_template` — suggested one-line reply + `display_markdown`
+  - `expires_in` — present when using in-memory store (no cloud storage configured)
+- **`Image` objects** — 512px JPEG thumbnails; FastMCP converts these to `ImageContent` blocks that claude.ai renders inline in the tool result pane.
+
+The MCP server instructs Claude to always include `display_markdown` in its assistant reply so the image is visible in the chat response (not just in the tool result pane).
+
+## Key design decisions
+
+- **`structured_output=False`** on all image tools — required to prevent `PydanticSerializationError` when FastMCP serialises the mixed `[str, Image, ...]` return list.
+- **JSON-first ordering** — `json_str` is the first list element so clients that only read the first content block still get usable metadata.
+- **Thumbnails in ImageContent** — 512px max, quality 75; keeps payload small while being visible inline.
+- **Full-size in `image_url`** — the `/images/` store or S3 URL always points to the full-resolution JPEG.
+- **`stateless_http=True`** — required for Cloud Run (no sticky sessions across instances).
+- **`S3_BUCKET` env var** — when set, images are uploaded to S3 synchronously during `_build_image_response`. URLs are plain `https://bucket.s3.region.amazonaws.com/prefix/uuid.jpg` (no presigning) so claude.ai detects them as images.
