@@ -1,7 +1,7 @@
 """
 User-perspective simulation tests for NanoBanana MCP server.
 
-Tests the key bug fixes:
+Tests the key behaviours:
 1. No double-JPEG encoding (images go through _to_jpeg once, not twice)
 2. Cloud output validation happens early with clear error
 3. analyze_image with focus=quality uses SOURCE_MAX_DIM (2048px)
@@ -9,7 +9,9 @@ Tests the key bug fixes:
 5. Input validation on all tools
 6. _normalize_image handles RGBA, bad data, oversized images
 7. _decode_raw handles nanobanana://, HTTP URLs, /images/ shortcut, data URIs
-8. _build_image_response produces correct structure for both output modes
+8. _build_image_response returns a single combined text block:
+   "![generated image](url)\n\n{json}" — markdown first, then machine-readable JSON.
+   No ImageContent objects are returned (Attempt 9 of the inline display problem).
 """
 
 import asyncio
@@ -30,7 +32,6 @@ os.environ.setdefault("GEMINI_API_KEY", "test-key-not-real")
 
 # Import after setting env
 import server
-from mcp.server.fastmcp import Image as MCPImage
 
 
 # ---------------------------------------------------------------------------
@@ -1683,11 +1684,10 @@ class TestEmbeddedImageContract:
 # ---------------------------------------------------------------------------
 
 class TestDefaultOutputBehavior:
-    """Validate the new default output contract:
+    """Validate the default output contract:
 
-    - Images always displayed inline in Claude (MCPImage in return list)
-    - image_url always points to /images/ (in-memory, 1-hour TTL) for chaining
-    - S3 catch-all upload fires in background when S3_BUCKET is configured
+    - Tools return a single combined text block: markdown image link(s) + JSON
+    - image_url always points to /images/ (in-memory, 1-hour TTL) or S3 for chaining
     - save_folder writes JPEG files to disk when provided
     """
 
@@ -1767,7 +1767,7 @@ class TestDefaultOutputBehavior:
         assert meta["image_url"] == fake_s3_url, "S3 URL must be returned as image_url"
         assert "amazonaws.com" in meta["image_url"]
         assert "expires_in" not in meta, "S3 URLs don't expire"
-        # Result is a single text block — no MCPImage objects
+        # Result is a single text block — no ImageContent objects
         assert isinstance(result, list)
         assert len(result) == 1
         assert result[0].startswith("![")
@@ -2419,7 +2419,7 @@ class TestCompositeSwap:
 
     @pytest.mark.asyncio
     async def test_composite_swap_result_is_embedded(self):
-        """Result must be [json, MCPImage] so Claude.ai shows it inline."""
+        """Result is a single text block starting with a markdown image link."""
         src_id = server._store_image(_make_test_image(200, 200), "image/jpeg")
         ref_id = server._store_image(_make_test_image(100, 100), "image/jpeg")
         mock_ctx = MagicMock()

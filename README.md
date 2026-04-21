@@ -346,7 +346,6 @@ If both `S3_BUCKET` and `GCS_BUCKET` are set, S3 is used.
 | Reference images (`generate_image`) | 1024px | JPEG | 85 |
 | Source images (`edit_image`, `swap_background`, `create_variations`) | 2048px | JPEG | 92 |
 | Mask images (`edit_image`) | 2048px | PNG | lossless |
-| Inline thumbnails (ImageContent in tool result) | 512px | JPEG | 75 |
 | `image_url` / `saved_to` | Full resolution | JPEG | 92 |
 
 ## License
