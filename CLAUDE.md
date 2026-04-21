@@ -25,7 +25,7 @@ Run the full test suite before deploying:
 python -m pytest test_simulation.py -x -q
 ```
 
-All 177 tests must pass. `conftest.py` provides async test support without requiring `pytest-asyncio`.
+All 176 tests must pass. `conftest.py` provides async test support without requiring `pytest-asyncio`.
 
 ## Architecture
 
@@ -36,26 +36,23 @@ All 177 tests must pass. `conftest.py` provides async test support without requi
 
 ## Tool output contract
 
-Image-generating tools (`generate_image`, `edit_image`, `swap_background`, `create_variations`) return a single-item list:
+Image-generating tools (`generate_image`, `edit_image`, `swap_background`, `create_variations`) return a two-item list (Attempt 11):
 
 ```
-["![generated image](url)\n\n{json}"]
+[render_md, json_str]
 ```
 
-A **combined text block**: markdown image link(s) first, then machine-readable JSON. The tool result pane displays this as a text box with the URL visible and copyable. No `ImageContent` is returned (see `IMAGE_DISPLAY_ATTEMPTS.md` for why).
+- **`render_md`** — standalone markdown image link(s): `"![](url)"` (single) or `"![Image 1](url1)\n\n![Image 2](url2)"` (multi). This is its own `TextContent` block — no JSON mixed in. Claude sees it as the primary result and includes it in its reply.
+- **`json_str`** — JSON metadata for tool chaining: `image_url`, `size_kb`, `expires_in`, etc.
 
-- **`response_mode: "deterministic_markdown"`** — signals to clients that the text block is in this format.
-- **`image_url`** — full-quality S3 or `/images/` URL for passing to other tools.
-- **`expires_in`** — present when using in-memory store (no cloud storage configured).
-- **Multi-image**: markdown section has N lines, JSON has an `images` array.
+No `ImageContent` objects are returned (see `IMAGE_DISPLAY_ATTEMPTS.md` for the full history).
 
-**Known limitation:** See `IMAGE_DISPLAY_ATTEMPTS.md` for the full history of 10 failed attempts to get images to render inline in Claude's chat response. Current state: images appear as a text box in the tool result pane (URLs visible/copyable). When Claude includes the markdown in its reply, claude.ai shows a "Show Image" click-to-load gate rather than rendering inline.
+**Known limitation:** When Claude includes the markdown in its reply, claude.ai shows a "Show Image" click-to-load gate rather than rendering inline. `ImageContent` bypasses the gate but Claude doesn't reliably repeat those in its reply.
 
 ## Key design decisions
 
-- **`structured_output=False`** on all image tools — required to prevent `PydanticSerializationError` when FastMCP serialises the mixed `[str, Image, ...]` return list.
-- **JSON-first ordering** — `json_str` is the first list element so clients that only read the first content block still get usable metadata.
-- **Thumbnails in ImageContent** — 512px max, quality 75; keeps payload small while being visible inline.
-- **Full-size in `image_url`** — the `/images/` store or S3 URL always points to the full-resolution JPEG.
+- **`structured_output=False`** on all image tools — required to prevent `PydanticSerializationError` when FastMCP serialises the `[str, str]` list return type.
+- **render_md first** — render_md is `result[0]` so Claude sees it as the primary content; json_str is `result[1]` for tool chaining.
+- **`_build_image_response` returns a tuple** — `(render_md, json_str)`. Tool call sites unpack and return `[render_md, json_result]` list.
 - **`stateless_http=True`** — required for Cloud Run (no sticky sessions across instances).
 - **`S3_BUCKET` env var** — when set, images are uploaded to S3 synchronously during `_build_image_response`. URLs are plain `https://bucket.s3.region.amazonaws.com/prefix/uuid.jpg` (no presigning) so claude.ai detects them as images.

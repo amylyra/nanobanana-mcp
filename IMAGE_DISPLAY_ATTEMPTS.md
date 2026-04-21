@@ -192,6 +192,31 @@ Instructions updated to: "Every image tool result begins with a standalone markd
 
 ---
 
+---
+
+## Attempt 11 — Two separate TextContent blocks: `[render_md, json_str]`
+
+**What we tried:**
+Reverted from Attempt 9's combined single string to two *separate* TextContent blocks:
+
+```
+[render_md, json_str]
+```
+
+- `render_md` = `"![](url)"` (single) or `"![Image 1](url1)\n\n![Image 2](url2)"` (multi) — a clean, standalone TextContent block containing *only* markdown image links.
+- `json_str` = JSON metadata for tool chaining.
+
+Key differences from Attempt 9 (combined string `"![](url)\n\n{json}"`):
+- render_md and json_str are two separate blocks, not merged into one.
+- The tool result pane shows both as separate text boxes.
+- The MCP instruction tells Claude: "Every image tool result begins with a standalone markdown image link. Copy that value verbatim into your reply."
+
+This matches what commit `09a18bb` produced — the version the user confirmed showed "Show Image" boxes in Claude's chat response (preferred over the text-box-only Attempt 9 result).
+
+**Result:** Pending production verification.
+
+---
+
 ## Things not yet tried
 
 - **MCP Prompts** — define an MCP prompt that Claude runs after every image generation, forcing a structured reply. Distinct from `instructions`; a named prompt the client actively invokes.

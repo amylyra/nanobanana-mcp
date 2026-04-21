@@ -9,9 +9,9 @@ Tests the key behaviours:
 5. Input validation on all tools
 6. _normalize_image handles RGBA, bad data, oversized images
 7. _decode_raw handles nanobanana://, HTTP URLs, /images/ shortcut, data URIs
-8. _build_image_response returns a single combined text block:
-   "![generated image](url)\n\n{json}" — markdown first, then machine-readable JSON.
-   No ImageContent objects are returned (Attempt 9 of the inline display problem).
+8. _build_image_response returns a (render_md, json_str) tuple — two separate
+   TextContent blocks. No ImageContent objects are returned (Attempt 11).
+   Tool call sites unpack and return [render_md, json_str] list.
 """
 
 import asyncio
@@ -61,9 +61,10 @@ def _extract_json_from_str(s: str) -> dict | None:
 def _parse_result(result) -> dict:
     """Parse JSON metadata from a tool result.
 
-    Image-generating tools return [combined_str] where combined_str is
-    "![...](url)\n\n{json}". Error paths return a plain str JSON with an
-    'error' key.
+    Image-generating tools return [render_md, json_str] where render_md is
+    "![](url)" and json_str is the JSON metadata. Error paths return a plain
+    str JSON with an 'error' key. Direct _build_image_response calls return
+    a (render_md, json_str) tuple.
     """
     if isinstance(result, (list, tuple)):
         for item in result:
@@ -333,7 +334,7 @@ class TestNoDoubleJPEG:
             {"test": True},
             [(jpeg, {"index": 1})],
         )
-        assert isinstance(result, list)
+        assert isinstance(result, tuple)
         metadata = _parse_result(result)
         assert "image_url" in metadata
         assert "/images/" in metadata["image_url"]
@@ -491,7 +492,7 @@ class TestGenerateImageFlow:
         with patch.object(server, "_get_client", return_value=mock_client):
             result = await server.generate_image("a cute cat")
 
-        # Tools return [json_str, Image, ...] — Image objects render inline in claude.ai
+        # Tools return [render_md, json_str] — two separate TextContent blocks (Attempt 11)
         assert isinstance(result, list)
         metadata = _parse_result(result)
         assert "model" in metadata
@@ -1058,28 +1059,29 @@ class TestCloudOutputKeyConsistency:
         assert "size_kb" in meta
         assert isinstance(meta["size_kb"], int)
 
-    def test_single_image_returns_single_text_block(self):
-        """Single image response: returns [combined_str] starting with markdown link."""
+    def test_single_image_returns_two_text_blocks(self):
+        """Single image: _build_image_response returns (render_md, json_str) tuple."""
         jpeg = _make_test_image(100, 100)
         result = server._build_image_response({}, [(jpeg, {"index": 1})])
-        assert isinstance(result, list)
-        assert len(result) == 1, "Single text block (no ImageContent objects)"
-        assert isinstance(result[0], str)
-        assert result[0].startswith("!["), "Text block must start with markdown image link"
+        assert isinstance(result, tuple)
+        assert len(result) == 2, "Two separate TextContent blocks: render_md and json_str"
+        render_md, json_str = result
+        assert isinstance(render_md, str)
+        assert render_md.startswith("!["), "render_md must start with markdown image link"
         meta = _parse_result(result)
         # image_url in JSON is the full S3/local URL for tool chaining
         assert meta["image_url"].startswith("http"), "image_url must be http URL for chaining"
         assert "data:" not in meta["image_url"], "image_url must not be a data URI"
 
-    def test_multi_image_returns_single_text_block(self):
-        """Multi-image response: returns [combined_str] with N markdown links."""
+    def test_multi_image_returns_two_text_blocks(self):
+        """Multi-image: _build_image_response returns (render_md, json_str) tuple."""
         imgs = [(_make_test_image(100, 100), {"index": i}) for i in range(3)]
         result = server._build_image_response({}, imgs)
-        assert isinstance(result, list)
-        assert len(result) == 1, "Single text block regardless of image count"
-        assert isinstance(result[0], str)
-        markdown_section = result[0].split("\n\n")[0]
-        assert markdown_section.count("![") == 3
+        assert isinstance(result, tuple)
+        assert len(result) == 2, "Two separate TextContent blocks regardless of image count"
+        render_md, json_str = result
+        assert isinstance(render_md, str)
+        assert render_md.count("![") == 3, "render_md must have one link per image"
         meta = _parse_result(result)
         assert "images" in meta
         assert len(meta["images"]) == 3
@@ -1510,13 +1512,13 @@ class TestDataUriInTools:
 # ---------------------------------------------------------------------------
 
 class TestEmbeddedImageContract:
-    """Verify every image-generating tool returns [combined_str].
+    """Verify every image-generating tool returns [render_md, json_str].
 
-    combined_str = "![generated image](url)\n\n{json}"
+    render_md = "![](url)" — standalone markdown image link(s)
+    json_str  = "{...}"    — JSON metadata for tool chaining
 
-    The markdown image link is the first line so Claude includes it verbatim
-    in its reply, making the image visible in the chat response (not just the
-    tool result pane).
+    Claude sees render_md as the primary result and includes it in its reply
+    (Attempt 11 — two separate TextContent blocks, no ImageContent objects).
     """
 
     def _mock_gemini_response(self):
@@ -1536,8 +1538,8 @@ class TestEmbeddedImageContract:
             server._IMAGE_STORE.clear()
 
     @pytest.mark.asyncio
-    async def test_generate_image_returns_single_text_block(self):
-        """generate_image returns [combined_str] starting with markdown image link."""
+    async def test_generate_image_returns_two_text_blocks(self):
+        """generate_image returns [render_md, json_str] — two separate TextContent blocks."""
         mock_client = MagicMock()
         mock_client.models.generate_content.return_value = self._mock_gemini_response()
 
@@ -1545,16 +1547,16 @@ class TestEmbeddedImageContract:
             result = await server.generate_image("a sunset")
 
         assert isinstance(result, list), "Should return list"
-        assert len(result) == 1, "Should be a single text block — no ImageContent objects"
+        assert len(result) == 2, "Two text blocks: render_md and json_str"
         assert isinstance(result[0], str)
-        assert result[0].startswith("!["), "Text block must begin with markdown image link"
+        assert result[0].startswith("!["), "First block must be markdown image link"
+        assert isinstance(result[1], str)
         meta = _parse_result(result)
         assert "image_url" in meta
-        assert meta.get("response_mode") == "deterministic_markdown"
 
     @pytest.mark.asyncio
-    async def test_generate_image_count3_returns_single_block_with_3_links(self):
-        """count=3: returns [combined_str] with 3 markdown image lines."""
+    async def test_generate_image_count3_returns_3_links_in_render_md(self):
+        """count=3: render_md contains 3 markdown image links."""
         mock_client = MagicMock()
         mock_client.models.generate_content.return_value = self._mock_gemini_response()
 
@@ -1562,13 +1564,11 @@ class TestEmbeddedImageContract:
             result = await server.generate_image("cats", count=3)
 
         assert isinstance(result, list)
-        assert len(result) == 1, "Single text block regardless of count"
-        text = result[0]
-        markdown_section = text.split("\n\n")[0]
-        assert markdown_section.count("![") == 3, "3 markdown image links in text block"
+        assert len(result) == 2
+        assert result[0].count("![") == 3, "3 markdown image links in render_md"
 
     @pytest.mark.asyncio
-    async def test_edit_image_returns_single_text_block(self):
+    async def test_edit_image_returns_two_text_blocks(self):
         src = _make_test_image(200, 200)
         src_id = server._store_image(src, "image/jpeg")
         mock_ctx = MagicMock()
@@ -1581,11 +1581,11 @@ class TestEmbeddedImageContract:
             )
 
         assert isinstance(result, list)
-        assert len(result) == 1
+        assert len(result) == 2
         assert result[0].startswith("![")
 
     @pytest.mark.asyncio
-    async def test_swap_background_returns_single_text_block(self):
+    async def test_swap_background_returns_two_text_blocks(self):
         src = _make_test_image(200, 200)
         src_id = server._store_image(src, "image/jpeg")
         mock_ctx = MagicMock()
@@ -1598,11 +1598,11 @@ class TestEmbeddedImageContract:
             )
 
         assert isinstance(result, list)
-        assert len(result) == 1
+        assert len(result) == 2
         assert result[0].startswith("![")
 
     @pytest.mark.asyncio
-    async def test_create_variations_returns_single_text_block(self):
+    async def test_create_variations_returns_two_text_blocks(self):
         src = _make_test_image(200, 200)
         src_id = server._store_image(src, "image/jpeg")
         mock_ctx = MagicMock()
@@ -1615,10 +1615,8 @@ class TestEmbeddedImageContract:
             )
 
         assert isinstance(result, list)
-        assert len(result) == 1
-        text = result[0]
-        markdown_section = text.split("\n\n")[0]
-        assert markdown_section.count("![") == 2, "2 markdown image links for count=2"
+        assert len(result) == 2
+        assert result[0].count("![") == 2, "2 markdown image links for count=2"
 
     @pytest.mark.asyncio
     async def test_error_paths_return_str_not_list(self):
@@ -1686,7 +1684,7 @@ class TestEmbeddedImageContract:
 class TestDefaultOutputBehavior:
     """Validate the default output contract:
 
-    - Tools return a single combined text block: markdown image link(s) + JSON
+    - Tools return [render_md, json_str] — two separate TextContent blocks
     - image_url always points to /images/ (in-memory, 1-hour TTL) or S3 for chaining
     - save_folder writes JPEG files to disk when provided
     """
@@ -1737,8 +1735,8 @@ class TestDefaultOutputBehavior:
             server.S3_BUCKET = orig_s3
 
     @pytest.mark.asyncio
-    async def test_result_is_single_text_block_with_markdown(self):
-        """generate_image returns [combined_str] — single text block, markdown first."""
+    async def test_result_is_two_text_blocks_with_markdown_first(self):
+        """generate_image returns [render_md, json_str] — render_md starts with ![."""
         mock_client = MagicMock()
         mock_client.models.generate_content.return_value = self._mock_gemini_response()
 
@@ -1746,7 +1744,7 @@ class TestDefaultOutputBehavior:
             result = await server.generate_image("cat")
 
         assert isinstance(result, list)
-        assert len(result) == 1
+        assert len(result) == 2
         assert isinstance(result[0], str)
         assert result[0].startswith("![")
 
@@ -1767,9 +1765,9 @@ class TestDefaultOutputBehavior:
         assert meta["image_url"] == fake_s3_url, "S3 URL must be returned as image_url"
         assert "amazonaws.com" in meta["image_url"]
         assert "expires_in" not in meta, "S3 URLs don't expire"
-        # Result is a single text block — no ImageContent objects
+        # Result is two text blocks: render_md and json_str
         assert isinstance(result, list)
-        assert len(result) == 1
+        assert len(result) == 2
         assert result[0].startswith("![")
 
     @pytest.mark.asyncio
@@ -1841,9 +1839,9 @@ class TestClaudeCodeContext:
 
         edit_meta = _parse_result(edit_result)
         assert "image_url" in edit_meta
-        # Both results are single text blocks starting with markdown
-        assert isinstance(gen_result, list) and len(gen_result) == 1 and gen_result[0].startswith("![")
-        assert isinstance(edit_result, list) and len(edit_result) == 1 and edit_result[0].startswith("![")
+        # Both results are [render_md, json_str] two-item lists starting with markdown
+        assert isinstance(gen_result, list) and len(gen_result) == 2 and gen_result[0].startswith("![")
+        assert isinstance(edit_result, list) and len(edit_result) == 2 and edit_result[0].startswith("![")
 
     @pytest.mark.asyncio
     async def test_s3_urls_returned_for_both_gen_and_edit(self):
@@ -2435,7 +2433,7 @@ class TestCompositeSwap:
             )
 
         assert isinstance(result, list)
-        assert len(result) == 1
+        assert len(result) == 2
         assert result[0].startswith("![")
 
 
@@ -2446,7 +2444,7 @@ class TestCompositeSwap:
 class TestStructuredOutputFix:
     """Verify that structured_output=False is still set on all image tools.
 
-    Tools return [combined_str] (a list with one string). structured_output=False
+    Tools return [render_md, json_str] (a list with two strings). structured_output=False
     keeps fastmcp from inferring an output_schema and routing through pydantic
     serialization — which could break if the return type changes in the future.
     """
@@ -2465,17 +2463,19 @@ class TestStructuredOutputFix:
                 f"Tool '{name}' has an output_schema — structured_output=False was not applied."
             )
 
-    def test_convert_to_content_handles_list_of_strings(self):
-        """fastmcp's _convert_to_content converts [combined_str] → [TextContent]."""
+    def test_convert_to_content_handles_list_of_two_strings(self):
+        """fastmcp's _convert_to_content converts [render_md, json_str] → [TextContent, TextContent]."""
         from mcp.server.fastmcp.utilities.func_metadata import _convert_to_content
         from mcp.types import TextContent
 
-        combined = "![generated image](https://example.com/img.jpg)\n\n{\"image_url\": \"https://example.com/img.jpg\"}"
-        result = _convert_to_content([combined])
+        render_md = "![generated image](https://example.com/img.jpg)"
+        json_str = "{\"image_url\": \"https://example.com/img.jpg\"}"
+        result = _convert_to_content([render_md, json_str])
 
-        assert len(result) == 1
+        assert len(result) == 2
         assert isinstance(result[0], TextContent)
         assert result[0].text.startswith("![")
+        assert isinstance(result[1], TextContent)
 
 
 # ---------------------------------------------------------------------------
@@ -2533,7 +2533,7 @@ class TestS3UrlCompleteness:
              patch.object(server, "_upload_to_s3", side_effect=Exception("S3 auth failed")):
             result = await server.generate_image("cat")
 
-        assert isinstance(result, list), "Must still return [json, Image] on S3 failure"
+        assert isinstance(result, list), "Must still return [render_md, json_str] on S3 failure"
         meta = _parse_result(result)
         assert "/images/" in meta["image_url"], "Must fall back to local /images/ URL"
         assert "amazonaws.com" not in meta["image_url"]
@@ -2828,14 +2828,14 @@ class TestGeminiExceptionHandling:
             )
 
         # Should return the one successful image, not fail entirely
-        assert isinstance(result, list), "Partial success must still return a text block"
-        assert len(result) == 1 and result[0].startswith("![")
+        assert isinstance(result, list), "Partial success must still return [render_md, json_str]"
+        assert len(result) == 2 and result[0].startswith("![")
         meta = _parse_result(result)
         assert "errors" in meta, "Partial failure must be reported in errors field"
 
     @pytest.mark.asyncio
-    async def test_edit_image_count2_returns_single_block_with_2_links(self):
-        """edit_image count=2 returns [combined_str] with 2 markdown image links."""
+    async def test_edit_image_count2_returns_two_blocks_with_2_links(self):
+        """edit_image count=2 returns [render_md, json_str] with 2 markdown links in render_md."""
         src_id = server._store_image(_make_test_image(200, 200), "image/jpeg")
         mock_ctx = MagicMock()
         mock_client = MagicMock()
@@ -2847,17 +2847,16 @@ class TestGeminiExceptionHandling:
             )
 
         assert isinstance(result, list)
-        assert len(result) == 1, "Single text block regardless of count"
-        markdown_section = result[0].split("\n\n")[0]
-        assert markdown_section.count("![") == 2
+        assert len(result) == 2, "Two text blocks: render_md and json_str"
+        assert result[0].count("![") == 2
         meta = _parse_result(result)
         assert "images" in meta, "Multi-image result must use images[] array"
         assert len(meta["images"]) == 2
         assert all("image_url" in img for img in meta["images"])
 
     @pytest.mark.asyncio
-    async def test_swap_background_count2_returns_single_block_with_2_links(self):
-        """swap_background count=2 returns [combined_str] with 2 markdown image links."""
+    async def test_swap_background_count2_returns_two_blocks_with_2_links(self):
+        """swap_background count=2 returns [render_md, json_str] with 2 markdown links."""
         src_id = server._store_image(_make_test_image(200, 200), "image/jpeg")
         mock_ctx = MagicMock()
         mock_client = MagicMock()
@@ -2869,9 +2868,8 @@ class TestGeminiExceptionHandling:
             )
 
         assert isinstance(result, list)
-        assert len(result) == 1, "Single text block regardless of count"
-        markdown_section = result[0].split("\n\n")[0]
-        assert markdown_section.count("![") == 2
+        assert len(result) == 2, "Two text blocks: render_md and json_str"
+        assert result[0].count("![") == 2
         meta = _parse_result(result)
         assert "images" in meta
         assert len(meta["images"]) == 2
@@ -2901,7 +2899,7 @@ class TestGeminiExceptionHandling:
 # ---------------------------------------------------------------------------
 
 class TestDeterministicMarkdownFormat:
-    """Verify _build_image_response returns a valid combined string: markdown then JSON."""
+    """Verify _build_image_response returns (render_md, json_str) tuple (Attempt 11)."""
 
     def setup_method(self):
         with server._STORE_LOCK:
@@ -2917,51 +2915,46 @@ class TestDeterministicMarkdownFormat:
         response.candidates = [candidate]
         return response
 
-    def test_single_image_combined_string_format(self):
-        """Single image: result is [str] where str = '![...](url)\n\n{json}'."""
+    def test_single_image_two_block_format(self):
+        """Single image: _build_image_response returns (render_md, json_str) tuple."""
         jpeg = _make_test_image(200, 200)
         result = server._build_image_response({}, [(jpeg, {"index": 1})])
-        assert isinstance(result, list) and len(result) == 1
-        text = result[0]
-        assert isinstance(text, str)
-        # Starts with markdown image link
-        assert text.startswith("![generated image](")
-        # JSON section follows double newline
-        parts = text.split("\n\n", 1)
-        assert len(parts) == 2
-        meta = json.loads(parts[1])
+        assert isinstance(result, tuple) and len(result) == 2
+        render_md, json_str = result
+        assert isinstance(render_md, str)
+        # render_md is the standalone markdown image link
+        assert render_md.startswith("![")
+        # json_str is valid JSON with image_url
+        meta = json.loads(json_str)
         assert "image_url" in meta
-        assert meta.get("response_mode") == "deterministic_markdown"
 
-    def test_multi_image_combined_string_format(self):
-        """Multi-image: result is [str] with N markdown links then JSON."""
+    def test_multi_image_two_block_format(self):
+        """Multi-image: render_md has N links, json_str has images[] array."""
         imgs = [(_make_test_image(300, 300), {"index": i}) for i in range(3)]
         result = server._build_image_response({}, imgs)
-        assert isinstance(result, list) and len(result) == 1
-        text = result[0]
-        markdown_section, json_section = text.split("\n\n", 1)
-        assert markdown_section.count("![") == 3
-        meta = json.loads(json_section)
+        assert isinstance(result, tuple) and len(result) == 2
+        render_md, json_str = result
+        assert render_md.count("![") == 3
+        meta = json.loads(json_str)
         assert "images" in meta
         assert len(meta["images"]) == 3
 
     @pytest.mark.asyncio
-    async def test_generate_image_combined_string_is_parseable(self):
-        """Full generate_image flow: combined string JSON section is parseable."""
+    async def test_generate_image_json_is_parseable(self):
+        """Full generate_image flow: json_str (result[1]) is parseable."""
         mock_client = MagicMock()
         mock_client.models.generate_content.return_value = self._mock_gemini_response(512, 512)
 
         with patch.object(server, "_get_client", return_value=mock_client):
             result = await server.generate_image("a test image")
 
-        assert len(result) == 1
+        assert len(result) == 2
         meta = _parse_result(result)
         assert "image_url" in meta
-        assert meta.get("response_mode") == "deterministic_markdown"
 
     @pytest.mark.asyncio
     async def test_rgba_source_still_produces_valid_result(self):
-        """RGBA/PNG source images still produce a valid combined string result."""
+        """RGBA/PNG source images still produce a valid two-block result."""
         rgba_img = _make_test_image(200, 200, mode="RGBA", fmt="PNG")
         mock_client = MagicMock()
         part = MagicMock()
@@ -2975,7 +2968,7 @@ class TestDeterministicMarkdownFormat:
         with patch.object(server, "_get_client", return_value=mock_client):
             result = await server.generate_image("test rgba")
 
-        assert isinstance(result, list) and len(result) == 1
+        assert isinstance(result, list) and len(result) == 2
         assert result[0].startswith("![")
 
 
