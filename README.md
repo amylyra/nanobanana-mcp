@@ -36,10 +36,15 @@ Alternatively, open `{server_url}/upload` in your browser and drag-and-drop any 
 
 ### How generated images are returned
 
-Every image-generating tool returns:
-- A **standalone markdown image link** (`![](url)`) as the first item — Claude copies this into its reply.
-- A **JSON metadata block** with `image_url` for tool chaining.
-- One or more **inline ImageContent blocks** that claude.ai renders as image previews in the tool result pane.
+Every image-generating tool returns a single text block:
+
+```
+![generated image](https://...)
+
+{"response_mode": "deterministic_markdown", "image_url": "...", ...}
+```
+
+The tool result pane displays this as a text box showing the image URL. Use `image_url` from the JSON section to pass the image to another tool.
 
 ## Tools
 

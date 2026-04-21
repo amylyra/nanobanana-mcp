@@ -36,19 +36,20 @@ All 177 tests must pass. `conftest.py` provides async test support without requi
 
 ## Tool output contract
 
-Image-generating tools (`generate_image`, `edit_image`, `swap_background`, `create_variations`) return a list:
+Image-generating tools (`generate_image`, `edit_image`, `swap_background`, `create_variations`) return a single-item list:
 
 ```
-[render_md, json_str, Image(thumbnail1), Image(thumbnail2), ...]
+["![generated image](url)\n\n{json}"]
 ```
 
-- **`render_md`** — standalone markdown string: `"![](url)"` for one image, `"![Image 1](url1)\n\n![Image 2](url2)"` for multiple. This is the **first** item so Claude treats it as the primary result and copies it into its reply.
-- **`json_str`** — JSON metadata including:
-  - `image_url` — full-quality S3 or `/images/` URL for passing to other tools
-  - `expires_in` — present when using in-memory store (no cloud storage configured)
-- **`Image` objects** — 512px JPEG thumbnails; FastMCP converts these to `ImageContent` blocks that claude.ai renders inline in the tool result pane.
+A **combined text block**: markdown image link(s) first, then machine-readable JSON. The tool result pane displays this as a text box with the URL visible and copyable. No `ImageContent` is returned (see `IMAGE_DISPLAY_ATTEMPTS.md` for why).
 
-**Known limitation:** Images are reliably visible in the tool result pane via `ImageContent`. Getting images into Claude's chat response is the unsolved problem — see `IMAGE_DISPLAY_ATTEMPTS.md`. Attempt 10 (render_md as standalone first item + ImageContent) is the current approach, reviving `ff9897a` which previously worked.
+- **`response_mode: "deterministic_markdown"`** — signals to clients that the text block is in this format.
+- **`image_url`** — full-quality S3 or `/images/` URL for passing to other tools.
+- **`expires_in`** — present when using in-memory store (no cloud storage configured).
+- **Multi-image**: markdown section has N lines, JSON has an `images` array.
+
+**Known limitation:** See `IMAGE_DISPLAY_ATTEMPTS.md` for the full history of 10 failed attempts to get images to render inline in Claude's chat response. Current state: images appear as a text box in the tool result pane (URLs visible/copyable). When Claude includes the markdown in its reply, claude.ai shows a "Show Image" click-to-load gate rather than rendering inline.
 
 ## Key design decisions
 

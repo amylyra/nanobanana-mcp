@@ -148,9 +148,12 @@ The fundamental issue is a **two-surface rendering problem**:
 
 **New insight from Attempt 9:** claude.ai's tool result pane does **not** render markdown in text content blocks — it displays them as raw monospaced text. `ImageContent` is the *only* mechanism that produces rendered image previews in the tool pane. Removing `ImageContent` made the pane worse without any benefit to the chat response.
 
-**Current state (Attempts 1–9 exhausted):**
-- Tool result pane: ✅ solved — `ImageContent` thumbnails render reliably
-- Chat response: ❌ unsolved — Claude ignores or inconsistently follows every instruction format tried
+**New insight from Attempt 10:** claude.ai applies a **"Show Image" consent gate** to externally-linked images when they appear in Claude's text (`![](url)` markdown). This gate does NOT apply to `ImageContent` protocol blocks, which render inline automatically. So even when Claude successfully includes `![](url)` in its reply, the user still has to click "Show Image" rather than seeing the image inline. True inline rendering in the chat response may only be possible via `ImageContent`, which Claude cannot emit directly — only tools can return `ImageContent`.
+
+**Current state (Attempts 1–10 exhausted):**
+- Tool result pane: ✅ solved — `ImageContent` thumbnails render reliably (no consent gate)
+- Chat response inline: ❌ fundamentally blocked — `![](url)` text triggers consent gate; `ImageContent` in chat response is not a feature Claude can emit
+- Chat response text link: ✅ achievable — Claude can include the URL or markdown, but user must click "Show Image"
 
 The chat response surface requires Claude to voluntarily emit markdown. We can instruct but not enforce via:
 - MCP server `instructions` (loaded once at session start)
@@ -181,7 +184,11 @@ Key differences from prior attempts:
 
 Instructions updated to: "Every image tool result begins with a standalone markdown image link. Copy that value verbatim into your reply."
 
-**Result:** ⏳ Not yet verified in production.
+**Result:** ❌ Failed — but with a new insight. Claude DID include the markdown image link in its chat response (visible in the conversation), but claude.ai rendered it as **"Show Image" placeholder boxes** rather than inline images. Clicking "Show Image" loads the image behind a user-consent gate. This is better than Claude ignoring the link, but worse than true inline rendering.
+
+**New insight from Attempt 10:** claude.ai gating may be tied to the S3 URL domain. When `ImageContent` is returned, claude.ai renders the image directly (no consent gate). When the URL appears in Claude's text as `![](url)`, claude.ai shows "Show Image" and requires a click. This suggests the consent gate is applied to externally-linked images in text but not to `ImageContent` protocol blocks.
+
+**User preference:** Attempt 9 (raw markdown text in tool result pane, URLs visible and copyable) is preferred over Attempt 10's "Show Image" boxes, which require an extra click and don't auto-render.
 
 ---
 
