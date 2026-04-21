@@ -1450,8 +1450,8 @@ class TestDataUriInTools:
         assert "error" not in data
 
     @pytest.mark.asyncio
-    async def test_upload_image_rejects_data_uri(self):
-        """upload_image only accepts http/https URLs — data URIs must use curl/upload endpoint."""
+    async def test_upload_image_accepts_data_uri(self):
+        """upload_image now accepts data URIs — the correct path for Claude Code local files."""
         img = _make_test_image(100, 100)
         b64 = base64.b64encode(img).decode()
         data_uri = f"data:image/jpeg;base64,{b64}"
@@ -1459,9 +1459,9 @@ class TestDataUriInTools:
 
         result = await server.upload_image(ctx=mock_ctx, image=data_uri)
         data = _parse_result(result)
-        assert "error" in data
-        # Error should tell user how to upload
-        assert "upload" in data["error"].lower()
+        assert "error" not in data, "data URI must be accepted by upload_image"
+        assert "url" in data, "upload_image must return a url for the re-hosted image"
+        assert data["url"].startswith("http")
 
 
 # ===========================================================================

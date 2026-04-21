@@ -190,32 +190,32 @@ mcp = FastMCP(
     "nanobanana",
     instructions=(
         "NanoBanana image generation server. Powered by Gemini.\n\n"
-        "## Getting images into tools — 3 paths\n\n"
-        "All image tool parameters accept http/https URLs only.\n\n"
+        "## Getting images into tools\n\n"
+        "All image tool parameters accept http/https URLs or data URIs.\n\n"
         "1. **Direct URL (http/https, S3, CDN)** → pass straight to the tool.\n"
         "2. **Public Google Drive link** → pass straight to the tool (auto-rewritten).\n"
-        "3. **Pasted image or local file (no URL)** → NEVER use curl (DNS fails in this sandbox).\n"
-        "   Use the Python code tool ONLY:\n\n"
+        "3. **Local file (Claude Code / bash available)** → encode as data URI in bash, "
+        "then call upload_image. NEVER use curl or wget — DNS is blocked:\n\n"
         "```python\n"
-        "import os, base64\n"
+        "import base64\n"
         "from io import BytesIO\n"
         "from PIL import Image\n"
-        "uploads = '/mnt/user-data/uploads'\n"
-        "files = sorted([f for f in os.listdir(uploads) if f.lower().endswith(('.png','.jpg','.jpeg','.webp'))],\n"
-        "               key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True)\n"
-        "img = Image.open(os.path.join(uploads, files[0]))\n"
+        "img = Image.open('/full/path/to/file.jpg')  # use the actual file path\n"
         "if max(img.size) > 1536: img.thumbnail((1536, 1536), Image.LANCZOS)\n"
         "img = img.convert('RGB')\n"
         "buf = BytesIO()\n"
         "img.save(buf, format='JPEG', quality=85)\n"
         "uri = 'data:image/jpeg;base64,' + base64.b64encode(buf.getvalue()).decode()\n"
-        "print(uri[:80], '...')\n"
+        "print(uri)\n"
         "```\n\n"
-        "   Then call `upload_image(image=uri)` with the full data URI — it returns an S3 URL.\n"
-        "   If the uploads directory doesn't exist, ask the user to upload manually at {upload_url}/upload.\n\n"
-        "Never fabricate URLs. Never start a local HTTP server.\n\n"
+        "   Call `upload_image(image=uri)` with the full data URI string — it returns a URL.\n"
+        "   upload_image accepts BOTH http/https URLs AND data URIs (data:image/...;base64,...).\n\n"
+        "4. **Pasted image (claude.ai web)** → use the Python code tool reading from "
+        "`/mnt/user-data/uploads`, encode as data URI, call upload_image(image=uri).\n\n"
+        "   If that directory doesn't exist, direct user to {upload_url}/upload to drag-and-drop.\n\n"
+        "Never fabricate URLs. Never use curl/wget (DNS blocked). Never start a local HTTP server.\n\n"
         "## Tools\n"
-        "- upload_image — re-host an image URL (http/https) to a server URL for use in other tools\n"
+        "- upload_image — re-host an image URL or data URI to a server URL for use in other tools\n"
         "- generate_image — text-to-image, optional reference image URLs, style presets\n"
         "- edit_image — edit an image (inpaint, remove, outpaint); accepts multiple reference_images\n"
         "- swap_background — keep subject, replace background\n"
@@ -1009,32 +1009,56 @@ async def upload_image(
     ctx: Context,
     image: str,
 ) -> str:
-    """Re-host an image URL to a server URL for use in other tools.
+    """Re-host an image to a server URL for use in other tools.
 
-    Accepts http/https URLs only (including Google Drive share links).
-    For pasted images or local files, use curl to POST to the /upload HTTP endpoint
-    and pass the returned URL here instead.
+    Accepts:
+    - http/https URLs (including Google Drive share links — auto-rewritten)
+    - data URIs: `data:image/jpeg;base64,<base64-encoded-bytes>`
+
+    **For local files (Claude Code / bash available):** encode the file as a
+    data URI with Python and pass it here — do NOT try curl (DNS is blocked):
+
+        import base64, sys
+        from io import BytesIO
+        from PIL import Image
+        img = Image.open('/path/to/file.jpg')
+        if max(img.size) > 1536: img.thumbnail((1536, 1536), Image.LANCZOS)
+        img = img.convert('RGB')
+        buf = BytesIO()
+        img.save(buf, format='JPEG', quality=85)
+        uri = 'data:image/jpeg;base64,' + base64.b64encode(buf.getvalue()).decode()
+        print(uri)
+
+    Then call `upload_image(image=uri)`.
+
+    **For pasted/dragged images (claude.ai web):** use the Python code tool with
+    the snippet from server instructions (reads from /mnt/user-data/uploads).
 
     When cloud storage (S3/GCS) is configured, the returned URL is durable (no expiry).
-    Otherwise the URL expires after 1 hour — the response includes "expires_in" when applicable.
+    Otherwise the URL expires after 1 hour — the response includes "expires_in".
 
     Args:
-        image: Image URL (http/https). Google Drive share links are rewritten automatically.
+        image: http/https URL or data URI (`data:image/jpeg;base64,...`).
 
     Returns:
-        JSON with a URL to use in other tools, plus image dimensions.
+        JSON with `url` (pass to any other tool), width, height, size_kb.
     """
     from PIL import Image as PILImage
 
     upload_url = f"{_BASE_URL}/upload"
-    if not _is_url(image):
+    is_data_uri = image.startswith("data:")
+    if not _is_url(image) and not is_data_uri:
         return json.dumps({
             "error": (
-                "upload_image only accepts http/https URLs. "
-                "To upload a pasted or local image, run this in bash: "
-                f"curl -s -F file=@/mnt/user-data/uploads/<filename> {upload_url} "
-                "— then pass the returned 'url' field to the tool. "
-                f"Or upload manually at: {upload_url}"
+                "upload_image accepts http/https URLs or data URIs "
+                "(data:image/jpeg;base64,...). "
+                "For local files, encode with Python: "
+                "import base64; from PIL import Image; from io import BytesIO; "
+                "img=Image.open('/path/to/file.jpg'); img=img.convert('RGB'); "
+                "buf=BytesIO(); img.save(buf,'JPEG',quality=85); "
+                "uri='data:image/jpeg;base64,'+base64.b64encode(buf.getvalue()).decode(); "
+                "then call upload_image(image=uri). "
+                f"Or drag-and-drop at: {upload_url}"
             )
         })
 
