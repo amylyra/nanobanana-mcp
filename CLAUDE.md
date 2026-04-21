@@ -25,7 +25,7 @@ Run the full test suite before deploying:
 python -m pytest test_simulation.py -x -q
 ```
 
-All 176 tests must pass. `conftest.py` provides async test support without requiring `pytest-asyncio`.
+All 177 tests must pass. `conftest.py` provides async test support without requiring `pytest-asyncio`.
 
 ## Architecture
 
@@ -36,20 +36,17 @@ All 176 tests must pass. `conftest.py` provides async test support without requi
 
 ## Tool output contract
 
-Image-generating tools (`generate_image`, `edit_image`, `swap_background`, `create_variations`) return a single-item list:
+Image-generating tools (`generate_image`, `edit_image`, `swap_background`, `create_variations`) return a mixed list (Attempt 10):
 
 ```
-["![generated image](url)\n\n{json}"]
+[render_md, json_str, Image(thumb1), Image(thumb2), ...]
 ```
 
-A **combined text block**: markdown image link(s) first, then machine-readable JSON. The tool result pane displays this as a text box with the URL visible and copyable. No `ImageContent` is returned (see `IMAGE_DISPLAY_ATTEMPTS.md` for why).
+- **`render_md`** — standalone markdown image link(s): `"![](url)"` (single) or `"![Image 1](url1)\n\n![Image 2](url2)"` (multi). First item so Claude sees it as the primary result.
+- **`json_str`** — JSON metadata for tool chaining: `image_url`, `size_kb`, `expires_in`, etc.
+- **`Image` objects** — 512px JPEG `ImageContent` blocks for tool pane previews (render inline in the tool result pane, no consent gate).
 
-- **`response_mode: "deterministic_markdown"`** — signals to clients that the text block is in this format.
-- **`image_url`** — full-quality S3 or `/images/` URL for passing to other tools.
-- **`expires_in`** — present when using in-memory store (no cloud storage configured).
-- **Multi-image**: markdown section has N lines, JSON has an `images` array.
-
-**Known limitation:** See `IMAGE_DISPLAY_ATTEMPTS.md` for the full history of 10 failed attempts to get images to render inline in Claude's chat response. Current state: images appear as a text box in the tool result pane (URLs visible/copyable). When Claude includes the markdown in its reply, claude.ai shows a "Show Image" click-to-load gate rather than rendering inline.
+**Known limitation:** When Claude includes `render_md` in its reply, claude.ai shows clickable "Show Image" boxes rather than rendering inline. `ImageContent` renders inline in the tool pane without a consent gate. See `IMAGE_DISPLAY_ATTEMPTS.md` for the full history.
 
 ## Key design decisions
 
