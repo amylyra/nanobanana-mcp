@@ -3353,5 +3353,128 @@ class TestBatchAnalyzeGeminiFailure:
         assert data["count"] == 2
 
 
+# ---------------------------------------------------------------------------
+# 41. DNS / upload endpoint failure scenario (Image #27)
+#
+# In the claude.ai web sandbox, Claude cannot reach the NanoBanana Cloud Run
+# URL directly — DNS resolution fails with a 503 "DNS cache overflow".
+# This has been observed when Claude tries to POST to /upload via curl or
+# raw binary upload rather than using the Python PIL + base64 + upload_image
+# workflow described in the server instructions.
+#
+# These tests verify:
+#   1. Server instructions explicitly warn against curl / direct HTTP to /upload
+#   2. Server instructions prescribe the ONLY correct path (Python PIL → data URI → upload_image)
+#   3. upload_image handles network errors on the source URL gracefully
+#   4. upload_image returns a clear error for empty/malformed input
+# ---------------------------------------------------------------------------
+
+class TestDnsUploadFailureScenario:
+    """Guards against the DNS failure scenario seen in production:
+    Claude tries to curl the /upload endpoint → 503 → stuck.
+    """
+
+    def _get_instructions(self):
+        """Extract MCP server instructions string."""
+        instructions = getattr(server.mcp, "instructions", None)
+        if not instructions:
+            instructions = getattr(server.mcp, "_instructions", "") or \
+                           getattr(getattr(server.mcp, "settings", None), "instructions", "")
+        return instructions or ""
+
+    def test_instructions_say_never_use_curl(self):
+        """Instructions must explicitly forbid curl for the upload path."""
+        instructions = self._get_instructions()
+        assert "curl" in instructions.lower(), \
+            "Instructions must mention curl"
+        assert "never" in instructions.lower() or "not" in instructions.lower(), \
+            "Instructions must prohibit curl"
+
+    def test_instructions_prescribe_python_pil_path(self):
+        """Instructions must describe the Python PIL → base64 → upload_image workflow
+        as the ONLY way to handle pasted/local images."""
+        instructions = self._get_instructions()
+        assert "pil" in instructions.lower() or "from pil" in instructions.lower(), \
+            "Instructions must mention PIL (Pillow) for image encoding"
+        assert "base64" in instructions.lower(), \
+            "Instructions must mention base64 encoding"
+        assert "upload_image" in instructions.lower(), \
+            "Instructions must name upload_image as the tool to call after encoding"
+
+    def test_instructions_mention_upload_page_as_fallback(self):
+        """Instructions must mention the /upload page so Claude can direct users there
+        when the PIL approach is unavailable."""
+        instructions = self._get_instructions()
+        assert "/upload" in instructions, \
+            "Instructions must include /upload page URL as manual upload fallback"
+
+    def test_instructions_warn_about_dns_in_sandbox(self):
+        """Instructions must warn that DNS fails in the claude.ai sandbox so Claude
+        knows not to attempt direct HTTP calls to external servers."""
+        instructions = self._get_instructions()
+        assert "dns" in instructions.lower(), \
+            "Instructions must mention DNS restrictions so Claude avoids curl/direct HTTP"
+
+    @pytest.mark.asyncio
+    async def test_upload_image_returns_error_for_empty_string(self):
+        """upload_image('') must return a JSON error, not crash or attempt elicitation."""
+        mock_ctx = MagicMock()
+        result = await server.upload_image(ctx=mock_ctx, image="")
+        data = json.loads(result)
+        assert "error" in data, "Empty image must return error"
+
+    @pytest.mark.asyncio
+    async def test_upload_image_returns_error_for_whitespace(self):
+        """upload_image with whitespace-only string must return a JSON error."""
+        mock_ctx = MagicMock()
+        result = await server.upload_image(ctx=mock_ctx, image="   ")
+        data = json.loads(result)
+        assert "error" in data, "Whitespace-only image must return error"
+
+    @pytest.mark.asyncio
+    async def test_upload_image_http_503_returns_error(self):
+        """When _fetch_url raises (e.g. 503 from the upstream server), upload_image
+        must catch it and return a JSON error — not let the exception propagate."""
+        mock_ctx = MagicMock()
+        with patch.object(server, "_fetch_url",
+                          side_effect=Exception("503 DNS cache overflow")):
+            result = await server.upload_image(
+                ctx=mock_ctx,
+                image="https://nanobanana-739905005785.us-central1.run.app/upload",
+            )
+        data = json.loads(result)
+        assert "error" in data, "HTTP failure must return JSON error, not raise"
+
+    @pytest.mark.asyncio
+    async def test_upload_image_connection_timeout_returns_error(self):
+        """Connection timeouts from _fetch_url must surface as JSON error."""
+        mock_ctx = MagicMock()
+        with patch.object(server, "_fetch_url",
+                          side_effect=Exception("Connection timed out")):
+            result = await server.upload_image(
+                ctx=mock_ctx,
+                image="https://example.com/some-image.jpg",
+            )
+        data = json.loads(result)
+        assert "error" in data, "Timeout must return JSON error"
+
+    @pytest.mark.asyncio
+    async def test_edit_image_http_503_on_source_returns_error(self):
+        """edit_image must return JSON error (not raise) when source image fetch fails
+        with a 503, as happens when Claude passes the /upload endpoint URL as image."""
+        mock_ctx = MagicMock()
+        mock_client = MagicMock()
+        with patch.object(server, "_fetch_url",
+                          side_effect=Exception("503 DNS cache overflow")), \
+             patch.object(server, "_get_client", return_value=mock_client):
+            result = await server.edit_image(
+                image="https://nanobanana-739905005785.us-central1.run.app/upload",
+                prompt="add a hat",
+                ctx=mock_ctx,
+            )
+        data = json.loads(result)
+        assert "error" in data, "Fetch failure on source image must return JSON error"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

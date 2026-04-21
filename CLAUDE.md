@@ -25,7 +25,7 @@ Run the full test suite before deploying:
 python -m pytest test_simulation.py -x -q
 ```
 
-All 177 tests must pass. `conftest.py` provides async test support without requiring `pytest-asyncio`.
+All 186 tests must pass. `conftest.py` provides async test support without requiring `pytest-asyncio`.
 
 ## Architecture
 
