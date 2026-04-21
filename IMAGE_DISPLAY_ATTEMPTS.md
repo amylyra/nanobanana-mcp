@@ -144,20 +144,26 @@ The fundamental issue is a **two-surface rendering problem**:
 | Surface | How images appear | Controllable? |
 |---|---|---|
 | Tool result pane | `ImageContent` blocks render inline automatically | Yes — return `Image` objects |
-| Assistant chat response | Only if Claude outputs `![](url)` in its text | Indirectly — depends on Claude following instructions |
+| Assistant chat response | Only if Claude outputs `![](url)` in its text | No — Claude decides independently |
 
-The tool result pane is solved (Attempt 5). The chat response surface requires Claude to voluntarily emit markdown. We cannot force this — we can only instruct Claude via:
+**New insight from Attempt 9:** claude.ai's tool result pane does **not** render markdown in text content blocks — it displays them as raw monospaced text. `ImageContent` is the *only* mechanism that produces rendered image previews in the tool pane. Removing `ImageContent` made the pane worse without any benefit to the chat response.
+
+**Current state (Attempts 1–9 exhausted):**
+- Tool result pane: ✅ solved — `ImageContent` thumbnails render reliably
+- Chat response: ❌ unsolved — Claude ignores or inconsistently follows every instruction format tried
+
+The chat response surface requires Claude to voluntarily emit markdown. We can instruct but not enforce via:
 - MCP server `instructions` (loaded once at session start)
-- Tool docstrings (visible to Claude when it decides to call the tool)
-- Fields in the JSON metadata (visible after the tool returns)
+- Tool docstrings (visible when Claude decides to call the tool)
+- Fields in the JSON metadata (`display_markdown`, `assistant_response_template`)
 
-So far no combination has been reliably effective. The open question is whether `display_markdown` + `assistant_response_template` (Attempt 8) with a stricter instruction format will hold.
+None of these have been reliable across conversations.
 
 ---
 
 ## Things not yet tried
 
-- **MCP Prompts** — define an MCP prompt that Claude runs after every image generation, forcing a structured reply. The server already has a `handle_image` prompt but it's for upload UX, not display.
+- **MCP Prompts** — define an MCP prompt that Claude runs after every image generation, forcing a structured reply. Distinct from `instructions`; a named prompt the client actively invokes.
 - **Structured output with a `reply` field** — return a top-level `reply` string from the tool that MCP surfaces as a suggested assistant turn (not currently part of MCP spec).
 - **Client-side rendering** — build a Claude Code extension or custom client that intercepts `ImageContent` and injects it into the visible response.
 - **Webhook / side-channel** — have the server push a rendered HTML page to a browser tab when an image is generated, sidestepping the claude.ai response surface entirely.

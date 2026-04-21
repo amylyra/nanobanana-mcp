@@ -49,7 +49,7 @@ Image-generating tools (`generate_image`, `edit_image`, `swap_background`, `crea
   - `expires_in` — present when using in-memory store (no cloud storage configured)
 - **`Image` objects** — 512px JPEG thumbnails; FastMCP converts these to `ImageContent` blocks that claude.ai renders inline in the tool result pane.
 
-The MCP server instructs Claude to always include `display_markdown` in its assistant reply so the image is visible in the chat response (not just in the tool result pane).
+**Known limitation:** Images are reliably visible in the tool result pane via `ImageContent`. Getting images into Claude's chat response requires Claude to voluntarily emit `display_markdown` — instructed but not reliably enforced. As of Attempt 9, no approach has solved this. See `IMAGE_DISPLAY_ATTEMPTS.md` for full history.
 
 ## Key design decisions
 
