@@ -875,7 +875,7 @@ def _build_image_response(
     save_folder: str | None = None,
     prefix: str = "gen",
 ) -> list:
-    """Build a tool response: [json_str, Image(thumbnail1), Image(thumbnail2), ...].
+    """Build a tool response: [Image(thumbnail1), Image(thumbnail2), ..., json_str].
 
     generated: list of (jpeg_bytes, per_image_metadata) tuples.
 
@@ -922,7 +922,9 @@ def _build_image_response(
     else:
         result["images"] = [{k: v for k, v in meta.items() if k != "index"} for _, meta in generated]
 
-    return [json.dumps(result)] + [Image(data=thumb, format="jpeg") for thumb in thumbnails]
+    # Put Image blocks first so clients that prioritize the first tool-result block
+    # still render images inline. Keep JSON metadata as trailing text for chaining.
+    return [Image(data=thumb, format="jpeg") for thumb in thumbnails] + [json.dumps(result)]
 
 
 # ---------------------------------------------------------------------------
