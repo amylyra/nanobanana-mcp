@@ -108,7 +108,28 @@ Reversed the list order to put `ImageContent` blocks first: `[Image(thumb), json
 - Updated MCP instructions with a numbered, deterministic format:
   > "After any image tool call, your assistant response MUST include a Markdown image using the returned `image_url`. Use this format: 1) One short sentence summary. 2) The `display_markdown` value exactly as returned."
 
-**Result:** ⏳ Not yet verified in production as of this writing. Currently deployed as revision `nanobanana-00039-6tq`.
+**Result:** ❌ Failed. Claude still did not reliably include the image in its chat response despite the stricter numbered format instructions and the pre-formatted `display_markdown` field.
+
+---
+
+## Attempt 9 — Single text block: markdown first, JSON second (`response_mode: "deterministic_markdown"`)
+
+**What we tried:**
+Replaced the mixed `[json_str, Image(thumbnail), ...]` return with a **single text block**:
+
+```
+![generated image](https://bucket.s3.amazonaws.com/gen/uuid.jpg)
+
+{"response_mode": "deterministic_markdown", "image_url": "...", ...}
+```
+
+Key differences from all prior attempts:
+- No `ImageContent` objects at all — the hypothesis is that Claude sees `ImageContent` rendered in the tool pane and considers the image "already shown", so it doesn't include it in its reply. Removing `ImageContent` forces Claude to emit the markdown to show the image at all.
+- The markdown image link is the **first thing in the string** (not buried in a JSON field like `display_markdown` was), making it the obvious primary content of the tool result.
+- A single, unambiguous text block removes the "mixed content" ambiguity of prior attempts.
+- Added `response_mode: "deterministic_markdown"` to signal the format to clients.
+
+**Result:** ⏳ Not yet verified in production.
 
 ---
 

@@ -235,14 +235,10 @@ mcp = FastMCP(
         "call edit_image(image=urlA, reference_images=[urlB, urlC], "
         "prompt='replace X with reference image 1 and Y with reference image 2').\n\n"
         "Default aspect ratio 4:5, resolution 1K.\n\n"
-        "## Rendering images — CRITICAL\n"
-        "Every image tool result returns ImageContent objects that claude.ai renders inline automatically.\n"
-        "After any image-generation/edit tool call, your assistant response MUST include a Markdown image "
-        "using the returned `image_url` (e.g. ![result](URL)).\n"
-        "Use this deterministic format:\n"
-        "1) One short sentence summary.\n"
-        "2) The `display_markdown` value exactly as returned by the tool metadata.\n"
-        "To use a generated image as input to another tool, pass its `image_url` from the JSON metadata."
+        "## Rendering images\n"
+        "Every image-generation/edit tool result begins with a Markdown image link, e.g. ![generated image](URL).\n"
+        "Copy that line verbatim into your reply — it is the first line of the tool result text.\n"
+        "To chain a generated image into another tool, use the `image_url` value from the JSON section."
     ).format(upload_url=_get_upload_base_url()),
     host=os.environ.get("HOST", "0.0.0.0"),
     port=int(os.environ.get("PORT", 8080)),
@@ -879,18 +875,21 @@ def _build_image_response(
     save_folder: str | None = None,
     prefix: str = "gen",
 ) -> list:
-    """Build a tool response: [Image(thumbnail1), Image(thumbnail2), ..., json_str].
+    """Build a tool response: a single text block — markdown image link(s) then JSON.
 
     generated: list of (jpeg_bytes, per_image_metadata) tuples.
 
-    Returns a list so FastMCP emits ImageContent objects that claude.ai renders
-    inline in the tool result block — no base64 text for Claude to output.
-    Each image also gets:
-    - image_url: full-quality S3 or /images/ URL — pass to other tools for chaining
-    - display_markdown: markdown snippet for Claude to include in its reply
+    Returns [combined_str] where combined_str is:
+      ![generated image](url)
+
+      {"response_mode": "deterministic_markdown", "image_url": "...", ...}
+
+    Putting the markdown image link first in a single text block (instead of
+    using mixed ImageContent objects) removes ambiguity: Claude sees the
+    markdown as the primary content of the tool result and includes it in its
+    reply, making the image visible in the chat response.
     """
     base_url = _get_upload_base_url()
-    thumbnails: list[bytes] = []
     for jpeg_bytes, meta in generated:
         img_id = _store_image(jpeg_bytes, "image/jpeg")
         local_url = f"{base_url}/images/{img_id}"
@@ -906,48 +905,29 @@ def _build_image_response(
         else:
             meta["image_url"] = local_url
             meta["expires_in"] = "1 hour"
-        # Build thumbnail for ImageContent (shown inline by claude.ai)
-        from PIL import Image as PILImage
-        pil = PILImage.open(BytesIO(jpeg_bytes))
-        if max(pil.size) > 512:
-            pil.thumbnail((512, 512), PILImage.LANCZOS)
-        if pil.mode != "RGB":
-            pil = pil.convert("RGB")
-        buf = BytesIO()
-        pil.save(buf, format="JPEG", quality=75, optimize=True)
-        thumbnails.append(buf.getvalue())
         if save_folder:
             saved_path = _save_to_folder(jpeg_bytes, save_folder, prefix)
             if saved_path:
                 meta["saved_to"] = saved_path
 
+    result["response_mode"] = "deterministic_markdown"
+
     if len(generated) == 1:
         result.update(generated[0][1])
         result.pop("index", None)
-        image_url = result.get("image_url")
-        if image_url:
-            result["display_markdown"] = f"![generated image]({image_url})"
-            result["assistant_response_template"] = (
-                "Done. Here is the generated image:\n"
-                f"{result['display_markdown']}"
-            )
+        image_url = result.get("image_url", "")
+        markdown = f"![generated image]({image_url})"
     else:
         result["images"] = [{k: v for k, v in meta.items() if k != "index"} for _, meta in generated]
-        markdown_lines = [
+        markdown = "\n".join(
             f"![image {i + 1}]({img.get('image_url')})"
             for i, img in enumerate(result["images"])
             if img.get("image_url")
-        ]
-        if markdown_lines:
-            result["display_markdown"] = "\n".join(markdown_lines)
-            result["assistant_response_template"] = (
-                "Done. Here are the generated images:\n"
-                f"{result['display_markdown']}"
-            )
+        )
 
-    # Keep JSON metadata first for maximum client compatibility, followed by
-    # Image blocks that Claude/clients can render inline.
-    return [json.dumps(result)] + [Image(data=thumb, format="jpeg") for thumb in thumbnails]
+    # Single text block: markdown first so Claude includes it in its reply,
+    # followed by machine-readable JSON for tool chaining.
+    return [f"{markdown}\n\n{json.dumps(result)}"]
 
 
 # ---------------------------------------------------------------------------
