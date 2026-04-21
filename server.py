@@ -874,18 +874,20 @@ def _build_image_response(
     generated: list[tuple[bytes, dict]],
     save_folder: str | None = None,
     prefix: str = "gen",
-) -> tuple[str, str]:
-    """Build a tool response: two separate TextContent blocks.
+) -> list:
+    """Build a tool response: a single text block — markdown image link(s) then JSON.
 
     generated: list of (jpeg_bytes, per_image_metadata) tuples.
 
-    Returns (render_md, json_str):
-    - render_md: standalone markdown image link(s) — its own TextContent block.
-      Single: "![](url)"
-      Multiple: "![Image 1](url1)\\n\\n![Image 2](url2)"
-      Claude sees this as the primary result and includes it in its reply,
-      which claude.ai renders as "Show Image" clickable boxes.
-    - json_str: JSON metadata for tool chaining (image_url, size_kb, etc.)
+    Returns [combined_str] where combined_str is:
+      ![generated image](url)
+
+      {"response_mode": "deterministic_markdown", "image_url": "...", ...}
+
+    Putting the markdown image link first in a single text block (instead of
+    using mixed ImageContent objects) removes ambiguity: Claude sees the
+    markdown as the primary content of the tool result and includes it in its
+    reply, making the image visible in the chat response.
     """
     base_url = _get_upload_base_url()
     for jpeg_bytes, meta in generated:
@@ -908,19 +910,24 @@ def _build_image_response(
             if saved_path:
                 meta["saved_to"] = saved_path
 
+    result["response_mode"] = "deterministic_markdown"
+
     if len(generated) == 1:
         result.update(generated[0][1])
         result.pop("index", None)
-        render_md = f"![]({result.get('image_url', '')})"
+        image_url = result.get("image_url", "")
+        markdown = f"![generated image]({image_url})"
     else:
         result["images"] = [{k: v for k, v in meta.items() if k != "index"} for _, meta in generated]
-        render_md = "\n\n".join(
-            f"![Image {i + 1}]({img['image_url']})"
+        markdown = "\n".join(
+            f"![image {i + 1}]({img.get('image_url')})"
             for i, img in enumerate(result["images"])
             if img.get("image_url")
         )
 
-    return render_md, json.dumps(result)
+    # Single text block: markdown first so Claude includes it in its reply,
+    # followed by machine-readable JSON for tool chaining.
+    return [f"{markdown}\n\n{json.dumps(result)}"]
 
 
 # ---------------------------------------------------------------------------
@@ -1187,10 +1194,10 @@ async def generate_image(
         result["errors"] = errors
 
     try:
-        render_md, json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="gen")
+        json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="gen")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload generated images: {e}"})
-    return [render_md, json_result]
+    return json_result
 
 
 @mcp.tool(structured_output=False)
@@ -1313,10 +1320,10 @@ async def edit_image(
     if errors:
         result["errors"] = errors
     try:
-        render_md, json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="edit")
+        json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="edit")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload edited images: {e}"})
-    return [render_md, json_result]
+    return json_result
 
 
 @mcp.tool(structured_output=False)
@@ -1389,10 +1396,10 @@ async def swap_background(
     if errors:
         result["errors"] = errors
     try:
-        render_md, json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="bgswap")
+        json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="bgswap")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload background-swapped images: {e}"})
-    return [render_md, json_result]
+    return json_result
 
 
 @mcp.tool(structured_output=False)
@@ -1499,11 +1506,11 @@ async def create_variations(
         result["guidance"] = prompt
 
     try:
-        render_md, json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="var")
+        json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="var")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload variation images: {e}"})
 
-    return [render_md, json_result]
+    return json_result
 
 
 # ---------------------------------------------------------------------------

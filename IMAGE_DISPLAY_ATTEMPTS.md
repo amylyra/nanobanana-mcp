@@ -192,8 +192,6 @@ Instructions updated to: "Every image tool result begins with a standalone markd
 
 ---
 
----
-
 ## Attempt 11 — Two separate TextContent blocks: `[render_md, json_str]`
 
 **What we tried:**
@@ -213,7 +211,7 @@ Key differences from Attempt 9 (combined string `"![](url)\n\n{json}"`):
 
 This matches what commit `09a18bb` produced — the version the user confirmed showed "Show Image" boxes in Claude's chat response (preferred over the text-box-only Attempt 9 result).
 
-**Result:** Pending production verification.
+**Result:** ❌ Failed — same outcome as prior attempts. Claude did not reliably include the markdown in its reply. Reverted to Attempt 9 (single combined text block) as the stable baseline.
 
 ---
 
