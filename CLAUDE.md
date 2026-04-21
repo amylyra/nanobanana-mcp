@@ -25,7 +25,7 @@ Run the full test suite before deploying:
 python -m pytest test_simulation.py -x -q
 ```
 
-All 176 tests must pass. `conftest.py` provides async test support without requiring `pytest-asyncio`.
+All 177 tests must pass. `conftest.py` provides async test support without requiring `pytest-asyncio`.
 
 ## Architecture
 
@@ -36,30 +36,26 @@ All 176 tests must pass. `conftest.py` provides async test support without requi
 
 ## Tool output contract
 
-Image-generating tools (`generate_image`, `edit_image`, `swap_background`, `create_variations`) return a list with a single string:
+Image-generating tools (`generate_image`, `edit_image`, `swap_background`, `create_variations`) return a list:
 
 ```
-["![generated image](url)\n\n{json}"]
+[json_str, Image(thumbnail1), Image(thumbnail2), ...]
 ```
 
-The string is a **combined text block**: markdown image link(s) first, then machine-readable JSON. Format:
+- **`json_str`** — JSON metadata including:
+  - `image_url` — full-quality S3 or `/images/` URL for passing to other tools
+  - `display_markdown` — `![generated image](image_url)` markdown string
+  - `assistant_response_template` — suggested one-line reply + `display_markdown`
+  - `expires_in` — present when using in-memory store (no cloud storage configured)
+- **`Image` objects** — 512px JPEG thumbnails; FastMCP converts these to `ImageContent` blocks that claude.ai renders inline in the tool result pane.
 
-```
-![generated image](https://bucket.s3.amazonaws.com/gen/uuid.jpg)
-
-{"response_mode": "deterministic_markdown", "image_url": "...", "expires_in": "1 hour", ...}
-```
-
-- **Markdown first** — Claude sees the `![](url)` as the primary content and includes it verbatim in its reply, making the image visible in the chat response.
-- **`response_mode: "deterministic_markdown"`** — signals to clients that the text block is in this format.
-- **`image_url`** — full-quality S3 or `/images/` URL for passing to other tools.
-- **`expires_in`** — present when using in-memory store (no cloud storage configured).
-- **Multi-image**: markdown section has N lines (`![image 1](url1)\n![image 2](url2)\n...`), JSON has an `images` array.
+The MCP server instructs Claude to always include `display_markdown` in its assistant reply so the image is visible in the chat response (not just in the tool result pane).
 
 ## Key design decisions
 
-- **`structured_output=False`** on all image tools — kept for safety; prevents FastMCP from inferring an output schema that could break if the return type changes.
-- **Single text block (no `ImageContent`)** — prior approach returned `[json_str, Image(...)]` (mixed content). The theory is that Claude sees `ImageContent` already rendered in the tool pane and doesn't include the image in its reply. With only a text block, Claude must emit the markdown to show the image at all.
+- **`structured_output=False`** on all image tools — required to prevent `PydanticSerializationError` when FastMCP serialises the mixed `[str, Image, ...]` return list.
+- **JSON-first ordering** — `json_str` is the first list element so clients that only read the first content block still get usable metadata.
+- **Thumbnails in ImageContent** — 512px max, quality 75; keeps payload small while being visible inline.
 - **Full-size in `image_url`** — the `/images/` store or S3 URL always points to the full-resolution JPEG.
 - **`stateless_http=True`** — required for Cloud Run (no sticky sessions across instances).
 - **`S3_BUCKET` env var** — when set, images are uploaded to S3 synchronously during `_build_image_response`. URLs are plain `https://bucket.s3.region.amazonaws.com/prefix/uuid.jpg` (no presigning) so claude.ai detects them as images.

@@ -129,7 +129,11 @@ Key differences from all prior attempts:
 - A single, unambiguous text block removes the "mixed content" ambiguity of prior attempts.
 - Added `response_mode: "deterministic_markdown"` to signal the format to clients.
 
-**Result:** ⏳ Not yet verified in production.
+**Result:** ❌ Failed — and worse than prior attempts in a new way. The tool result pane rendered the raw markdown text literally (`![image 1](url)`) instead of as a rendered image. Claude then wrote "Two candidates above" pointing at the unrendered text in the pane. Two regressions at once:
+1. The tool pane, which previously showed `ImageContent` previews, now showed raw unstyled text.
+2. Claude's chat response still contained no images.
+
+Root cause: claude.ai's tool result pane does not render markdown in text content blocks. `ImageContent` was the only way to get a rendered preview there; removing it made the pane worse without improving the chat response.
 
 ---
 

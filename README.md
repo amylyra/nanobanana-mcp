@@ -36,15 +36,11 @@ Alternatively, open `{server_url}/upload` in your browser and drag-and-drop any 
 
 ### How generated images are returned
 
-Every image-generating tool returns a single text block:
+Every image-generating tool returns:
+- A **JSON metadata block** with `image_url` (for tool chaining), `display_markdown` (markdown snippet to include in your reply), and `assistant_response_template` (full suggested response).
+- One or more **inline ImageContent blocks** that claude.ai renders directly in the tool result pane.
 
-```
-![generated image](https://...)
-
-{"response_mode": "deterministic_markdown", "image_url": "...", ...}
-```
-
-The markdown image link is at the top so Claude includes it verbatim in its reply. The JSON section below it contains `image_url` for passing to other tools and `expires_in` when using in-memory storage.
+After a generation call, Claude will include `display_markdown` in its reply so the image is also visible in the chat response.
 
 ## Tools
 
@@ -346,6 +342,7 @@ If both `S3_BUCKET` and `GCS_BUCKET` are set, S3 is used.
 | Reference images (`generate_image`) | 1024px | JPEG | 85 |
 | Source images (`edit_image`, `swap_background`, `create_variations`) | 2048px | JPEG | 92 |
 | Mask images (`edit_image`) | 2048px | PNG | lossless |
+| Inline thumbnails (ImageContent in tool result) | 512px | JPEG | 75 |
 | `image_url` / `saved_to` | Full resolution | JPEG | 92 |
 
 ## License
