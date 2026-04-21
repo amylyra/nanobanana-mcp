@@ -34,6 +34,8 @@ Returns image URL, dimensions, and size.
 
 Text-to-image generation with optional reference images, style presets, AI prompt enhancement, and QA scoring. Returns images inline (viewable directly in Claude) plus metadata.
 
+> If your Claude.ai chat response does not visibly include the image, instruct Claude to include the `markdown` field returned by the tool result (or `markdown_gallery` for multiple images) in its reply.
+
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `prompt` | string | yes | — | Image generation instruction |
