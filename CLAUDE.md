@@ -39,17 +39,16 @@ All 177 tests must pass. `conftest.py` provides async test support without requi
 Image-generating tools (`generate_image`, `edit_image`, `swap_background`, `create_variations`) return a list:
 
 ```
-[json_str, Image(thumbnail1), Image(thumbnail2), ...]
+[render_md, json_str, Image(thumbnail1), Image(thumbnail2), ...]
 ```
 
+- **`render_md`** — standalone markdown string: `"![](url)"` for one image, `"![Image 1](url1)\n\n![Image 2](url2)"` for multiple. This is the **first** item so Claude treats it as the primary result and copies it into its reply.
 - **`json_str`** — JSON metadata including:
   - `image_url` — full-quality S3 or `/images/` URL for passing to other tools
-  - `display_markdown` — `![generated image](image_url)` markdown string
-  - `assistant_response_template` — suggested one-line reply + `display_markdown`
   - `expires_in` — present when using in-memory store (no cloud storage configured)
 - **`Image` objects** — 512px JPEG thumbnails; FastMCP converts these to `ImageContent` blocks that claude.ai renders inline in the tool result pane.
 
-**Known limitation:** Images are reliably visible in the tool result pane via `ImageContent`. Getting images into Claude's chat response requires Claude to voluntarily emit `display_markdown` — instructed but not reliably enforced. As of Attempt 9, no approach has solved this. See `IMAGE_DISPLAY_ATTEMPTS.md` for full history.
+**Known limitation:** Images are reliably visible in the tool result pane via `ImageContent`. Getting images into Claude's chat response is the unsolved problem — see `IMAGE_DISPLAY_ATTEMPTS.md`. Attempt 10 (render_md as standalone first item + ImageContent) is the current approach, reviving `ff9897a` which previously worked.
 
 ## Key design decisions
 

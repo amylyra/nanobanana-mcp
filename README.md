@@ -37,10 +37,9 @@ Alternatively, open `{server_url}/upload` in your browser and drag-and-drop any 
 ### How generated images are returned
 
 Every image-generating tool returns:
-- A **JSON metadata block** with `image_url` (for tool chaining) and `display_markdown` (a pre-formatted markdown image link).
+- A **standalone markdown image link** (`![](url)`) as the first item — Claude copies this into its reply.
+- A **JSON metadata block** with `image_url` for tool chaining.
 - One or more **inline ImageContent blocks** that claude.ai renders as image previews in the tool result pane.
-
-The image is always visible in the tool result pane. Whether it also appears in Claude's chat response depends on Claude including `display_markdown` in its reply — this is instructed but not guaranteed.
 
 ## Tools
 

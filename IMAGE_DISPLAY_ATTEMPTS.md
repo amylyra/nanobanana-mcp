@@ -161,6 +161,30 @@ None of these have been reliable across conversations.
 
 ---
 
+## Attempt 10 — Revive `ff9897a`: standalone render_md first + ImageContent
+
+**What we tried:**  
+Returned to the `ff9897a` approach, which the user confirmed worked in production at the time. Key structure:
+
+```
+[render_md, json_str, Image(thumb1), Image(thumb2), ...]
+```
+
+- `render_md` = `"![](url)"` (single) or `"![Image 1](url1)\n\n![Image 2](url2)"` (multi) — a short, standalone TextContent block containing *only* the markdown image link(s), nothing else.
+- `json_str` = JSON metadata for tool chaining.
+- `Image` objects = 512px JPEG thumbnails for the tool pane (ImageContent).
+
+Key differences from prior attempts:
+- Unlike Attempt 8 (`display_markdown` buried in JSON): render_md is its own separate TextContent block, not a field inside the JSON.
+- Unlike Attempt 9 (combined string, no ImageContent): ImageContent is still present for the tool pane, and render_md is a clean, short, standalone string.
+- Unlike Attempt 2 (`[render_md, json]` no Images): ImageContent objects are also returned alongside render_md.
+
+Instructions updated to: "Every image tool result begins with a standalone markdown image link. Copy that value verbatim into your reply."
+
+**Result:** ⏳ Not yet verified in production.
+
+---
+
 ## Things not yet tried
 
 - **MCP Prompts** — define an MCP prompt that Claude runs after every image generation, forcing a structured reply. Distinct from `instructions`; a named prompt the client actively invokes.
