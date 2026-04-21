@@ -8,10 +8,10 @@ httpx>=0.27.0
 # pip install python-dotenv
 # python-dotenv>=1.0.0
 
-# Optional — only needed if you use output="gcs" to upload images to Google Cloud Storage
-# pip install google-cloud-storage
-# google-cloud-storage>=2.0.0
-
-# Optional — only needed if you use output="s3" to upload images to AWS S3
+# Optional — only needed if you set S3_BUCKET to upload images to AWS S3
 # pip install boto3
 # boto3>=1.34.0
+
+# Optional — only needed if you set GCS_BUCKET to upload images to Google Cloud Storage
+# pip install google-cloud-storage
+# google-cloud-storage>=2.0.0

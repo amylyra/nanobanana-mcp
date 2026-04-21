@@ -190,12 +190,17 @@ mcp = FastMCP(
     "nanobanana",
     instructions=(
         "NanoBanana image generation server. Powered by Gemini.\n\n"
-        "## Getting images into tools — 3 paths\n\n"
-        "All image tool parameters accept http/https URLs only.\n\n"
+        "## ⚠️ CRITICAL: Do NOT use curl or wget for image uploads\n\n"
+        "curl and wget CANNOT reach this server — DNS is blocked in both the claude.ai "
+        "web sandbox and Claude Code. They return empty output and the upload fails silently. "
+        "Using curl is always wrong. Use the Python approach below instead.\n\n"
+        "## Getting images into tools\n\n"
+        "All image tool parameters accept http/https URLs or data URIs.\n\n"
         "1. **Direct URL (http/https, S3, CDN)** → pass straight to the tool.\n"
         "2. **Public Google Drive link** → pass straight to the tool (auto-rewritten).\n"
-        "3. **Pasted image or local file (no URL)** → NEVER use curl (DNS fails in this sandbox).\n"
-        "   Use the Python code tool ONLY:\n\n"
+        "3. **Pasted or local file** → encode as a data URI using the **Python code tool**, "
+        "then call upload_image(image=uri). This works in both claude.ai web and Claude Code.\n\n"
+        "   For claude.ai web (files in /mnt/user-data/uploads):\n"
         "```python\n"
         "import os, base64\n"
         "from io import BytesIO\n"
@@ -211,11 +216,24 @@ mcp = FastMCP(
         "uri = 'data:image/jpeg;base64,' + base64.b64encode(buf.getvalue()).decode()\n"
         "print(uri[:80], '...')\n"
         "```\n\n"
-        "   Then call `upload_image(image=uri)` with the full data URI — it returns an S3 URL.\n"
-        "   If the uploads directory doesn't exist, ask the user to upload manually at {upload_url}/upload.\n\n"
+        "   For Claude Code (local file path known):\n"
+        "```python\n"
+        "import base64\n"
+        "from io import BytesIO\n"
+        "from PIL import Image\n"
+        "img = Image.open('/full/path/to/file.jpg')\n"
+        "if max(img.size) > 1536: img.thumbnail((1536, 1536), Image.LANCZOS)\n"
+        "img = img.convert('RGB')\n"
+        "buf = BytesIO()\n"
+        "img.save(buf, format='JPEG', quality=85)\n"
+        "uri = 'data:image/jpeg;base64,' + base64.b64encode(buf.getvalue()).decode()\n"
+        "print(uri[:80], '...')\n"
+        "```\n\n"
+        "   Then call upload_image(image=uri) — it accepts data URIs directly and returns a URL.\n"
+        "   If uploads directory doesn't exist, ask user to visit {upload_url}/upload to drag-and-drop.\n\n"
         "Never fabricate URLs. Never start a local HTTP server.\n\n"
         "## Tools\n"
-        "- upload_image — re-host an image URL (http/https) to a server URL for use in other tools\n"
+        "- upload_image — re-host an image URL or data URI to a server URL for use in other tools\n"
         "- generate_image — text-to-image, optional reference image URLs, style presets\n"
         "- edit_image — edit an image (inpaint, remove, outpaint); accepts multiple reference_images\n"
         "- swap_background — keep subject, replace background\n"
@@ -236,9 +254,9 @@ mcp = FastMCP(
         "prompt='replace X with reference image 1 and Y with reference image 2').\n\n"
         "Default aspect ratio 4:5, resolution 1K.\n\n"
         "## Rendering images — CRITICAL\n"
-        "Every image tool result returns ImageContent objects that claude.ai renders inline automatically.\n"
-        "Do NOT describe images — they are already shown. Just summarize what was generated.\n"
-        "To use a generated image as input to another tool, pass its `image_url` from the JSON metadata."
+        "Every image tool result begins with a standalone markdown image link (e.g. `![](https://...)`).\n"
+        "Copy that value verbatim into your reply — do not paraphrase, skip, or describe the image in text instead.\n"
+        "To chain a generated image into another tool, use the `image_url` from the JSON metadata section."
     ).format(upload_url=_get_upload_base_url()),
     host=os.environ.get("HOST", "0.0.0.0"),
     port=int(os.environ.get("PORT", 8080)),
@@ -874,15 +892,18 @@ def _build_image_response(
     generated: list[tuple[bytes, dict]],
     save_folder: str | None = None,
     prefix: str = "gen",
-) -> list:
-    """Build a tool response: [Image(thumbnail1), Image(thumbnail2), ..., json_str].
+) -> tuple[str, str, list[bytes]]:
+    """Build a tool response.
 
     generated: list of (jpeg_bytes, per_image_metadata) tuples.
 
-    Returns a list so FastMCP emits ImageContent objects that claude.ai renders
-    inline in the tool result block — no base64 text for Claude to output.
-    Each image also gets:
-    - image_url: full-quality S3 or /images/ URL — pass to other tools for chaining
+    Returns (render_md, json_str, thumbnails):
+    - render_md: standalone markdown image link(s) — "![](url)" for one image,
+      "![Image 1](url1)\\n\\n![Image 2](url2)" for multiple. This is the FIRST
+      item returned by tools so Claude treats it as the primary result and
+      includes it verbatim in its reply.
+    - json_str: JSON metadata for tool chaining (image_url, size_kb, etc.)
+    - thumbnails: 512px JPEG bytes for ImageContent blocks (tool pane previews)
     """
     base_url = _get_upload_base_url()
     thumbnails: list[bytes] = []
@@ -901,7 +922,7 @@ def _build_image_response(
         else:
             meta["image_url"] = local_url
             meta["expires_in"] = "1 hour"
-        # Build thumbnail for ImageContent (shown inline by claude.ai, no text output needed)
+        # Build 512px thumbnail for ImageContent (tool pane preview)
         from PIL import Image as PILImage
         pil = PILImage.open(BytesIO(jpeg_bytes))
         if max(pil.size) > 512:
@@ -919,12 +940,16 @@ def _build_image_response(
     if len(generated) == 1:
         result.update(generated[0][1])
         result.pop("index", None)
+        render_md = f"![]({result.get('image_url', '')})"
     else:
         result["images"] = [{k: v for k, v in meta.items() if k != "index"} for _, meta in generated]
+        render_md = "\n\n".join(
+            f"![Image {i + 1}]({img['image_url']})"
+            for i, img in enumerate(result["images"])
+            if img.get("image_url")
+        )
 
-    # Put Image blocks first so clients that prioritize the first tool-result block
-    # still render images inline. Keep JSON metadata as trailing text for chaining.
-    return [Image(data=thumb, format="jpeg") for thumb in thumbnails] + [json.dumps(result)]
+    return render_md, json.dumps(result), thumbnails
 
 
 # ---------------------------------------------------------------------------
@@ -1002,32 +1027,56 @@ async def upload_image(
     ctx: Context,
     image: str,
 ) -> str:
-    """Re-host an image URL to a server URL for use in other tools.
+    """Re-host an image to a server URL for use in other tools.
 
-    Accepts http/https URLs only (including Google Drive share links).
-    For pasted images or local files, use curl to POST to the /upload HTTP endpoint
-    and pass the returned URL here instead.
+    Accepts:
+    - http/https URLs (including Google Drive share links — auto-rewritten)
+    - data URIs: `data:image/jpeg;base64,<base64-encoded-bytes>`
+
+    **For local files (Claude Code / bash available):** encode the file as a
+    data URI with Python and pass it here — do NOT try curl (DNS is blocked):
+
+        import base64, sys
+        from io import BytesIO
+        from PIL import Image
+        img = Image.open('/path/to/file.jpg')
+        if max(img.size) > 1536: img.thumbnail((1536, 1536), Image.LANCZOS)
+        img = img.convert('RGB')
+        buf = BytesIO()
+        img.save(buf, format='JPEG', quality=85)
+        uri = 'data:image/jpeg;base64,' + base64.b64encode(buf.getvalue()).decode()
+        print(uri)
+
+    Then call `upload_image(image=uri)`.
+
+    **For pasted/dragged images (claude.ai web):** use the Python code tool with
+    the snippet from server instructions (reads from /mnt/user-data/uploads).
 
     When cloud storage (S3/GCS) is configured, the returned URL is durable (no expiry).
-    Otherwise the URL expires after 1 hour — the response includes "expires_in" when applicable.
+    Otherwise the URL expires after 1 hour — the response includes "expires_in".
 
     Args:
-        image: Image URL (http/https). Google Drive share links are rewritten automatically.
+        image: http/https URL or data URI (`data:image/jpeg;base64,...`).
 
     Returns:
-        JSON with a URL to use in other tools, plus image dimensions.
+        JSON with `url` (pass to any other tool), width, height, size_kb.
     """
     from PIL import Image as PILImage
 
     upload_url = f"{_BASE_URL}/upload"
-    if not _is_url(image):
+    is_data_uri = image.startswith("data:")
+    if not _is_url(image) and not is_data_uri:
         return json.dumps({
             "error": (
-                "upload_image only accepts http/https URLs. "
-                "To upload a pasted or local image, run this in bash: "
-                f"curl -s -F file=@/mnt/user-data/uploads/<filename> {upload_url} "
-                "— then pass the returned 'url' field to the tool. "
-                f"Or upload manually at: {upload_url}"
+                "upload_image accepts http/https URLs or data URIs (data:image/jpeg;base64,...). "
+                "Do NOT use curl — DNS is blocked. "
+                "For local files, use the Python code tool to encode: "
+                "from PIL import Image; from io import BytesIO; import base64; "
+                "img=Image.open('/path/to/file.jpg').convert('RGB'); "
+                "buf=BytesIO(); img.save(buf,'JPEG',quality=85); "
+                "uri='data:image/jpeg;base64,'+base64.b64encode(buf.getvalue()).decode(); "
+                "then call upload_image(image=uri). "
+                f"Or user can drag-and-drop at: {upload_url}"
             )
         })
 
@@ -1191,10 +1240,10 @@ async def generate_image(
         result["errors"] = errors
 
     try:
-        json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="gen")
+        render_md, json_result, thumbnails = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="gen")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload generated images: {e}"})
-    return json_result
+    return [render_md, json_result] + [Image(data=t, format="jpeg") for t in thumbnails]
 
 
 @mcp.tool(structured_output=False)
@@ -1317,10 +1366,10 @@ async def edit_image(
     if errors:
         result["errors"] = errors
     try:
-        json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="edit")
+        render_md, json_result, thumbnails = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="edit")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload edited images: {e}"})
-    return json_result
+    return [render_md, json_result] + [Image(data=t, format="jpeg") for t in thumbnails]
 
 
 @mcp.tool(structured_output=False)
@@ -1393,10 +1442,10 @@ async def swap_background(
     if errors:
         result["errors"] = errors
     try:
-        json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="bgswap")
+        render_md, json_result, thumbnails = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="bgswap")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload background-swapped images: {e}"})
-    return json_result
+    return [render_md, json_result] + [Image(data=t, format="jpeg") for t in thumbnails]
 
 
 @mcp.tool(structured_output=False)
@@ -1503,11 +1552,11 @@ async def create_variations(
         result["guidance"] = prompt
 
     try:
-        json_result = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="var")
+        render_md, json_result, thumbnails = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="var")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload variation images: {e}"})
 
-    return json_result
+    return [render_md, json_result] + [Image(data=t, format="jpeg") for t in thumbnails]
 
 
 # ---------------------------------------------------------------------------
