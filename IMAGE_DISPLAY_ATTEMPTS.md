@@ -1,5 +1,14 @@
 # Attempts to display generated images in Claude's chat response
 
+## Current recommendation (April 22, 2026)
+
+- Keep mixed output format: `[render_md, json_str, ImageContent...]`.
+- Treat chat-surface inline rendering as a client limitation.
+- Optimize for reliable tool-pane preview + durable `image_url` chainability.
+- See also: `TROUBLESHOOTING.md` and `OPTIMIZATION_PLAN.md`.
+
+---
+
 ## The problem
 
 When NanoBanana generates an image, there are two places the image could appear in claude.ai:
