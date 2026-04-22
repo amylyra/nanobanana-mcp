@@ -54,16 +54,19 @@ uploads = '/mnt/user-data/uploads'
 files = sorted([f for f in os.listdir(uploads) if f.lower().endswith(('.png','.jpg','.jpeg','.webp'))],
                key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True)
 img = Image.open(os.path.join(uploads, files[0]))
-if max(img.size) > 1536:
-    img.thumbnail((1536, 1536), Image.LANCZOS)
+if max(img.size) > 1024:
+    img.thumbnail((1024, 1024), Image.LANCZOS)
 img = img.convert('RGB')
 buf = BytesIO()
-img.save(buf, format='JPEG', quality=85)
+img.save(buf, format='JPEG', quality=70, optimize=True)
 uri = 'data:image/jpeg;base64,' + base64.b64encode(buf.getvalue()).decode()
-print(uri[:80] + '...')
+print('uri_chars=', len(uri), uri[:80] + '...')
 ```
 
 Then pass `uri` to `upload_image`. Use returned `url` in downstream tools.
+
+If `uri_chars` is large (for example >300k), do **not** pass it through MCP tool parameters.  
+Use `[SERVER_URL]/upload` and paste the returned URL instead (especially when uploading 2+ images).
 
 ---
 

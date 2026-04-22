@@ -44,14 +44,14 @@ files = sorted(
     reverse=True,
 )
 img = Image.open(os.path.join(uploads, files[0]))
-if max(img.size) > 1536:
-    img.thumbnail((1536, 1536), Image.LANCZOS)
+if max(img.size) > 1024:
+    img.thumbnail((1024, 1024), Image.LANCZOS)
 img = img.convert('RGB')
 
 buf = BytesIO()
-img.save(buf, format='JPEG', quality=85)
+img.save(buf, format='JPEG', quality=70, optimize=True)
 uri = 'data:image/jpeg;base64,' + base64.b64encode(buf.getvalue()).decode()
-print(uri[:80] + '...')
+print('uri_chars=', len(uri), uri[:80] + '...')
 ```
 
 Then call:
@@ -59,6 +59,8 @@ Then call:
 ```json
 {"image": "data:image/jpeg;base64,..."}
 ```
+
+If `uri_chars` is large (for example >300k), use `{PUBLIC_URL}/upload` instead of passing a huge data URI through tool parameters.
 
 #### Flow C — manual upload page
 Open:

@@ -212,12 +212,12 @@ mcp = FastMCP(
         "files = sorted([f for f in os.listdir(uploads) if f.lower().endswith(('.png','.jpg','.jpeg','.webp'))],\n"
         "               key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True)\n"
         "img = Image.open(os.path.join(uploads, files[0]))\n"
-        "if max(img.size) > 1536: img.thumbnail((1536, 1536), Image.LANCZOS)\n"
+        "if max(img.size) > 1024: img.thumbnail((1024, 1024), Image.LANCZOS)\n"
         "img = img.convert('RGB')\n"
         "buf = BytesIO()\n"
-        "img.save(buf, format='JPEG', quality=85)\n"
+        "img.save(buf, format='JPEG', quality=70, optimize=True)\n"
         "uri = 'data:image/jpeg;base64,' + base64.b64encode(buf.getvalue()).decode()\n"
-        "print(uri[:80], '...')\n"
+        "print('uri_chars=', len(uri), uri[:80], '...')\n"
         "```\n\n"
         "   For Claude Code (local file path known):\n"
         "```python\n"
@@ -225,14 +225,16 @@ mcp = FastMCP(
         "from io import BytesIO\n"
         "from PIL import Image\n"
         "img = Image.open('/full/path/to/file.jpg')\n"
-        "if max(img.size) > 1536: img.thumbnail((1536, 1536), Image.LANCZOS)\n"
+        "if max(img.size) > 1024: img.thumbnail((1024, 1024), Image.LANCZOS)\n"
         "img = img.convert('RGB')\n"
         "buf = BytesIO()\n"
-        "img.save(buf, format='JPEG', quality=85)\n"
+        "img.save(buf, format='JPEG', quality=70, optimize=True)\n"
         "uri = 'data:image/jpeg;base64,' + base64.b64encode(buf.getvalue()).decode()\n"
-        "print(uri[:80], '...')\n"
+        "print('uri_chars=', len(uri), uri[:80], '...')\n"
         "```\n\n"
-        "   Then call upload_image(image=uri) — it accepts data URIs directly and returns a URL.\n"
+        "   If uri_chars is very large (e.g. >300k), DO NOT call upload_image with that data URI.\n"
+        "   Use {upload_url}/upload instead, especially for multiple images.\n"
+        "   Then call upload_image(image=uri) only for compact data URIs.\n"
         "   If uploads directory doesn't exist, ask user to visit {upload_url}/upload to drag-and-drop.\n\n"
         "Never fabricate URLs. Never start a local HTTP server.\n\n"
         "## Tools\n"
@@ -1156,14 +1158,15 @@ async def upload_image(
         from io import BytesIO
         from PIL import Image
         img = Image.open('/path/to/file.jpg')
-        if max(img.size) > 1536: img.thumbnail((1536, 1536), Image.LANCZOS)
+        if max(img.size) > 1024: img.thumbnail((1024, 1024), Image.LANCZOS)
         img = img.convert('RGB')
         buf = BytesIO()
-        img.save(buf, format='JPEG', quality=85)
+        img.save(buf, format='JPEG', quality=70, optimize=True)
         uri = 'data:image/jpeg;base64,' + base64.b64encode(buf.getvalue()).decode()
-        print(uri)
+        print('uri_chars=', len(uri))
 
-    Then call `upload_image(image=uri)`.
+    If uri_chars is very large (e.g. >300k), use the `/upload` page instead of
+    passing a huge data URI through MCP parameters.
 
     **For pasted/dragged images (claude.ai web):** use the Python code tool with
     the snippet from server instructions (reads from /mnt/user-data/uploads).
@@ -1188,8 +1191,9 @@ async def upload_image(
                 "Do NOT use curl — DNS is blocked. "
                 "For local files, use the Python code tool to encode: "
                 "from PIL import Image; from io import BytesIO; import base64; "
-                "img=Image.open('/path/to/file.jpg').convert('RGB'); "
-                "buf=BytesIO(); img.save(buf,'JPEG',quality=85); "
+                "img=Image.open('/path/to/file.jpg'); "
+                "img.thumbnail((1024,1024), Image.LANCZOS); img=img.convert('RGB'); "
+                "buf=BytesIO(); img.save(buf,'JPEG',quality=70,optimize=True); "
                 "uri='data:image/jpeg;base64,'+base64.b64encode(buf.getvalue()).decode(); "
                 "then call upload_image(image=uri). "
                 f"Or user can drag-and-drop at: {upload_url}"
