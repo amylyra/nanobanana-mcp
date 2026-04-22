@@ -61,6 +61,7 @@ RESOLUTIONS = {"1K", "2K", "4K"}
 # ---------------------------------------------------------------------------
 REF_MAX_DIM = 1024    # Reference images — preserves logo/label detail
 SOURCE_MAX_DIM = 2048  # Source images for edit/variations — high quality but bounded
+MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", 20 * 1024 * 1024))  # 20MB default
 
 # ---------------------------------------------------------------------------
 # Cloud storage config (optional — set bucket env var to enable)
@@ -68,6 +69,8 @@ SOURCE_MAX_DIM = 2048  # Source images for edit/variations — high quality but 
 GCS_BUCKET = os.environ.get("GCS_BUCKET")  # e.g. "my-nanobanana-images"
 S3_BUCKET = os.environ.get("S3_BUCKET")    # e.g. "claude-image-cache"
 S3_REGION = os.environ.get("AWS_REGION", os.environ.get("AWS_DEFAULT_REGION", "us-east-1"))
+REQUIRE_DURABLE_UPLOADS = os.environ.get("REQUIRE_DURABLE_UPLOADS", "false").lower() == "true"
+FETCH_RETRIES = int(os.environ.get("FETCH_RETRIES", 1))
 
 # ---------------------------------------------------------------------------
 # Server-side image store — upload once, reference by URL in all subsequent calls.
@@ -255,7 +258,10 @@ mcp = FastMCP(
         "Default aspect ratio 4:5, resolution 1K.\n\n"
         "## Rendering images — CRITICAL\n"
         "Every image tool result begins with a standalone markdown image link (e.g. `![](https://...)`).\n"
-        "Copy that value verbatim into your reply — do not paraphrase, skip, or describe the image in text instead.\n"
+        "In your assistant reply, include BOTH:\n"
+        "1) `chat_response_template` exactly as returned.\n"
+        "2) If unavailable, include `display_markdown` and `display_text_urls` exactly as returned.\n"
+        "Do not paraphrase, skip, or replace these with a text-only summary.\n"
         "To chain a generated image into another tool, use the `image_url` from the JSON metadata section."
     ).format(upload_url=_get_upload_base_url()),
     host=os.environ.get("HOST", "0.0.0.0"),
@@ -267,7 +273,7 @@ mcp = FastMCP(
 # ---------------------------------------------------------------------------
 # HTTP endpoints — direct image upload/serving (outside MCP protocol)
 # ---------------------------------------------------------------------------
-_UPLOAD_HTML = """<!DOCTYPE html>
+_UPLOAD_HTML_TEMPLATE = """<!DOCTYPE html>
 <html><head><title>NanoBanana — Upload Images</title>
 <style>
   body { font-family: system-ui, sans-serif; max-width: 600px; margin: 40px auto; padding: 0 20px; }
@@ -287,10 +293,11 @@ _UPLOAD_HTML = """<!DOCTYPE html>
     color: white; border-radius: 6px; cursor: pointer; font-weight: bold; font-size: 0.95em; }
   #copyAll:hover { background: #e09500; }
   .error { margin: 8px 0; padding: 10px; background: #fce4ec; border-radius: 6px; }
+  .thumb { width: 56px; height: 56px; object-fit: cover; border-radius: 6px; border: 1px solid #c8e6c9; }
 </style></head>
 <body>
   <h1>NanoBanana — Upload Images</h1>
-  <p>Drop one or more images to get URLs you can paste into Claude.</p>
+  <p>Drop one or more images to get URLs you can paste into Claude. Max file size: __MAX_UPLOAD_MB__MB each.</p>
   <div class="drop-zone" id="dropZone" onclick="document.getElementById('fileInput').click()">
     Drop images here or click to browse
   </div>
@@ -303,6 +310,7 @@ _UPLOAD_HTML = """<!DOCTYPE html>
     const urlsDiv = document.getElementById('urls');
     const copyAllBtn = document.getElementById('copyAll');
     const allUrls = [];
+    const MAX_UPLOAD_BYTES = __MAX_UPLOAD_BYTES__;
 
     dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
     dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
@@ -314,7 +322,15 @@ _UPLOAD_HTML = """<!DOCTYPE html>
 
     function uploadAll(files) {
       for (const file of files) {
-        if (file.type.startsWith('image/')) upload(file);
+        if (!file.type.startsWith('image/')) continue;
+        if (file.size > MAX_UPLOAD_BYTES) {
+          const row = document.createElement('div');
+          row.className = 'error';
+          row.textContent = file.name + ': file is too large. Max allowed is ' + Math.floor(MAX_UPLOAD_BYTES / (1024 * 1024)) + 'MB.';
+          urlsDiv.appendChild(row);
+          continue;
+        }
+        upload(file);
       }
     }
 
@@ -330,7 +346,8 @@ _UPLOAD_HTML = """<!DOCTYPE html>
         const data = await resp.json();
         if (data.error) throw new Error(data.error);
         allUrls.push(data.url);
-        row.innerHTML = '<code>' + data.url + '</code>' +
+        row.innerHTML = '<img class=\"thumb\" src=\"' + data.url + '\" alt=\"upload preview\">' +
+          '<code>' + data.url + '</code>' +
           '<button onclick="navigator.clipboard.writeText(\\'' + data.url + '\\')">Copy</button>';
         copyAllBtn.style.display = allUrls.length > 1 ? 'inline-block' : 'none';
         if (allUrls.length === 1) navigator.clipboard.writeText(data.url).catch(() => {});
@@ -347,6 +364,12 @@ _UPLOAD_HTML = """<!DOCTYPE html>
     });
   </script>
 </body></html>"""
+
+_UPLOAD_HTML = (
+    _UPLOAD_HTML_TEMPLATE
+    .replace("__MAX_UPLOAD_MB__", str(MAX_IMAGE_BYTES // (1024 * 1024)))
+    .replace("__MAX_UPLOAD_BYTES__", str(MAX_IMAGE_BYTES))
+)
 
 
 @mcp.custom_route("/upload", methods=["GET"])
@@ -375,12 +398,25 @@ async def http_upload(request: Request) -> Response:
             return JSONResponse({"error": "Empty request body"}, status_code=400)
 
     try:
+        _check_image_size_limit(raw, source="Uploaded image")
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=413)
+
+    try:
         normalized, mime = await _run_in_thread(_normalize_image, raw, max_dim=SOURCE_MAX_DIM, quality=92)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
     img = PILImage.open(BytesIO(normalized))
     w, h = img.size
+
+    if REQUIRE_DURABLE_UPLOADS and not (S3_BUCKET or GCS_BUCKET):
+        return JSONResponse({
+            "error": (
+                "Durable uploads are required but no cloud storage is configured. "
+                "Set S3_BUCKET or GCS_BUCKET, or disable REQUIRE_DURABLE_UPLOADS."
+            )
+        }, status_code=503)
 
     # Prefer cloud storage (durable URLs); fall back to in-memory store
     if S3_BUCKET or GCS_BUCKET:
@@ -394,6 +430,12 @@ async def http_upload(request: Request) -> Response:
                 "usage": "Paste this URL into Claude to use with any image tool",
             }, status_code=201)
         except Exception as e:
+            if REQUIRE_DURABLE_UPLOADS:
+                return JSONResponse({
+                    "error": (
+                        f"Cloud upload failed and durable uploads are required: {e}"
+                    )
+                }, status_code=503)
             log(f"Cloud upload failed, falling back to in-memory store: {e}\n")
 
     img_id = _store_image(normalized, mime)
@@ -496,25 +538,60 @@ def _fetch_url(url: str) -> tuple[bytes, str]:
     if hostname in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
         raise ValueError(f"Blocked request to localhost: {hostname}")
 
-    try:
-        resp = httpx.get(url, follow_redirects=True, timeout=30)
-        resp.raise_for_status()
-    except httpx.HTTPStatusError as e:
-        if e.response.status_code == 403:
-            hint = (
-                " If this is a Google Drive link, the file may not be publicly shared — "
-                "either share it with 'Anyone with the link' or upload it at the /upload page."
-            ) if "drive.google.com" in url else " The server was denied access to this URL."
-            raise ValueError(f"Image URL returned 403 (forbidden).{hint}")
-        if e.response.status_code == 404:
-            raise ValueError(
-                f"Image URL returned 404 — the image was not found. "
-                "It may have been deleted or the URL may be wrong."
-            )
-        raise ValueError(f"Failed to fetch image from URL: {e}")
-    except httpx.TimeoutException:
-        raise ValueError(f"Timed out fetching image from URL: {url}")
-    content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+    for attempt in range(FETCH_RETRIES + 1):
+        try:
+            timeout = httpx.Timeout(connect=5.0, read=20.0, write=20.0, pool=20.0)
+            with httpx.stream("GET", url, follow_redirects=True, timeout=timeout) as resp:
+                resp.raise_for_status()
+                content_type = resp.headers.get("content-type", "image/jpeg").split(";")[0].strip()
+
+                # Early fail before downloading large payloads when upstream advertises size.
+                content_length = resp.headers.get("content-length")
+                if content_length:
+                    try:
+                        if int(content_length) > MAX_IMAGE_BYTES:
+                            raise ValueError(
+                                f"Fetched image is too large ({int(content_length) / (1024 * 1024):.1f}MB). "
+                                f"Maximum allowed size is {MAX_IMAGE_BYTES // (1024 * 1024)}MB."
+                            )
+                    except ValueError:
+                        raise
+                    except Exception:
+                        # Ignore malformed Content-Length and fall back to streamed guard.
+                        pass
+
+                chunks: list[bytes] = []
+                total = 0
+                for chunk in resp.iter_bytes():
+                    total += len(chunk)
+                    if total > MAX_IMAGE_BYTES:
+                        raise ValueError(
+                            f"Fetched image is too large ({total / (1024 * 1024):.1f}MB). "
+                            f"Maximum allowed size is {MAX_IMAGE_BYTES // (1024 * 1024)}MB."
+                        )
+                    chunks.append(chunk)
+                body = b"".join(chunks)
+            break
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 403:
+                hint = (
+                    " If this is a Google Drive link, the file may not be publicly shared — "
+                    "either share it with 'Anyone with the link' or upload it at the /upload page."
+                ) if "drive.google.com" in url else " The server was denied access to this URL."
+                raise ValueError(f"Image URL returned 403 (forbidden).{hint}")
+            if e.response.status_code == 404:
+                raise ValueError(
+                    f"Image URL returned 404 — the image was not found. "
+                    "It may have been deleted or the URL may be wrong."
+                )
+            raise ValueError(f"Failed to fetch image from URL: {e}")
+        except ValueError:
+            raise
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            if attempt < FETCH_RETRIES:
+                continue
+            raise ValueError(f"Timed out or network error fetching image URL: {e}")
+
     if content_type == "text/html":
         if "drive.google.com" in url:
             raise ValueError(
@@ -527,7 +604,8 @@ def _fetch_url(url: str) -> tuple[bytes, str]:
             "URL returned an HTML page instead of an image. "
             "Check that the URL points directly to an image file, not a web page."
         )
-    return resp.content, content_type
+    _check_image_size_limit(body, source="Fetched image")
+    return body, content_type
 
 
 def _fix_base64_padding(s: str) -> str:
@@ -536,6 +614,21 @@ def _fix_base64_padding(s: str) -> str:
     if missing:
         s += "=" * (4 - missing)
     return s
+
+
+def _preview_text(text: str, max_chars: int = 180) -> str:
+    """Shorten long text for metadata/UI surfaces while preserving meaning."""
+    return text[:max_chars] + "..." if len(text) > max_chars else text
+
+
+def _check_image_size_limit(img_bytes: bytes, source: str = "image") -> None:
+    if len(img_bytes) > MAX_IMAGE_BYTES:
+        max_mb = MAX_IMAGE_BYTES // (1024 * 1024)
+        actual_mb = len(img_bytes) / (1024 * 1024)
+        raise ValueError(
+            f"{source} is too large ({actual_mb:.1f}MB). "
+            f"Maximum allowed size is {max_mb}MB."
+        )
 
 
 def _normalize_image(img_bytes: bytes, max_dim: int, quality: int = 85,
@@ -607,7 +700,9 @@ def _decode_raw(ref: str) -> tuple[bytes, str]:
     if ref.startswith("data:"):
         header, data = ref.split(",", 1)
         mime = header.split(";")[0].split(":")[1]
-        return base64.b64decode(_fix_base64_padding(data)), mime
+        decoded = base64.b64decode(_fix_base64_padding(data))
+        _check_image_size_limit(decoded, source="Data URI image")
+        return decoded, mime
     # Catch unsupported URL schemes (gs://, s3://, ftp://, file://, etc.) before they
     # fall through to base64 decoding and produce a confusing "truncated" error.
     try:
@@ -623,7 +718,9 @@ def _decode_raw(ref: str) -> tuple[bytes, str]:
     except Exception:
         pass
     # Raw base64
-    return base64.b64decode(_fix_base64_padding(ref)), "image/jpeg"
+    decoded = base64.b64decode(_fix_base64_padding(ref))
+    _check_image_size_limit(decoded, source="Base64 image")
+    return decoded, "image/jpeg"
 
 
 def _decode_reference(ref: str) -> tuple[bytes, str]:
@@ -940,13 +1037,32 @@ def _build_image_response(
     if len(generated) == 1:
         result.update(generated[0][1])
         result.pop("index", None)
-        render_md = f"![]({result.get('image_url', '')})"
+        single_url = result.get("image_url", "")
+        render_md = f"![]({single_url})\n\nURL: {single_url}"
+        display_urls = [result.get("image_url", "")]
     else:
         result["images"] = [{k: v for k, v in meta.items() if k != "index"} for _, meta in generated]
         render_md = "\n\n".join(
-            f"![Image {i + 1}]({img['image_url']})"
+            f"![Image {i + 1}]({img['image_url']})\nURL {i + 1}: {img['image_url']}"
             for i, img in enumerate(result["images"])
             if img.get("image_url")
+        )
+        display_urls = [img.get("image_url", "") for img in result["images"] if img.get("image_url")]
+
+    # Extra fields to help Claude include visible links/images in the main chat reply.
+    result["display_markdown"] = render_md
+    result["display_urls"] = display_urls
+    result["display_text_urls"] = "\n".join(display_urls)
+    if display_urls:
+        result["chat_response_template"] = (
+            "Here is the image result:\n\n"
+            f"{render_md}\n\n"
+            "Direct URL(s):\n"
+            f"{result['display_text_urls']}"
+        )
+        result["assistant_reply_hint"] = (
+            "Use `chat_response_template` exactly in the assistant reply. "
+            "If not possible, include both `display_markdown` and `display_text_urls`."
         )
 
     return render_md, json.dumps(result), thumbnails
@@ -1088,6 +1204,14 @@ async def upload_image(
     img = PILImage.open(BytesIO(normalized))
     w, h = img.size
 
+    if REQUIRE_DURABLE_UPLOADS and not (S3_BUCKET or GCS_BUCKET):
+        return json.dumps({
+            "error": (
+                "Durable uploads are required but no cloud storage is configured. "
+                "Set S3_BUCKET or GCS_BUCKET, or disable REQUIRE_DURABLE_UPLOADS."
+            )
+        })
+
     # Prefer cloud storage (durable URLs); fall back to in-memory store
     if S3_BUCKET or GCS_BUCKET:
         try:
@@ -1100,6 +1224,10 @@ async def upload_image(
                 "usage": "Pass this URL to any other tool's image parameter",
             })
         except Exception as e:
+            if REQUIRE_DURABLE_UPLOADS:
+                return json.dumps({
+                    "error": f"Cloud upload failed and durable uploads are required: {e}"
+                })
             log(f"Cloud upload failed, falling back to in-memory store: {e}\n")
 
     img_id = _store_image(normalized, norm_mime)
@@ -1228,10 +1356,10 @@ async def generate_image(
         "model": model_name,
         "aspect_ratio": aspect_ratio,
         "resolution": resolution,
-        "prompt_used": final_prompt[:200] + "..." if len(final_prompt) > 200 else final_prompt,
+        "prompt_used": _preview_text(final_prompt, 200),
     }
     if enhance_prompt or style:
-        result["original_prompt"] = prompt[:120] + "..." if len(prompt) > 120 else prompt
+        result["original_prompt"] = _preview_text(prompt, 120)
     if style:
         result["style"] = style
     if reference_images:
@@ -1360,7 +1488,7 @@ async def edit_image(
     if not generated:
         return json.dumps({"error": "Edit produced no output images.", "details": errors})
 
-    result = {"edit_mode": edit_mode, "prompt": prompt}
+    result = {"edit_mode": edit_mode, "prompt_preview": _preview_text(prompt, 180)}
     if reference_images:
         result["reference_count"] = len(reference_images)
     if errors:
@@ -1873,12 +2001,11 @@ def handle_image() -> str:
     return (
         "The user wants to use an image with NanoBanana tools but doesn't have a URL for it. "
         "Here's how to get one:\n\n"
-        "**Pasted or local image (bash available)**\n"
-        "In claude.ai, pasted images are saved to `/mnt/user-data/uploads/<filename>`. "
-        "Run this in bash:\n\n"
-        f"```\ncurl -s -F file=@/mnt/user-data/uploads/<filename> {upload_url}/upload\n```\n\n"
-        "Parse the returned `url` field and pass it to the tool.\n\n"
-        "**Pasted image (no bash)**\n"
+        "**Pasted/local image (preferred: Python data URI + upload_image)**\n"
+        "In claude.ai, pasted images are saved to `/mnt/user-data/uploads`. Use Python to encode "
+        "as a data URI, then call `upload_image(image=uri)`.\n\n"
+        "Do NOT use curl/wget for uploads in restricted sandboxes.\n\n"
+        "**Manual fallback**\n"
         f"Direct the user to upload manually:\n\n"
         f"> Please upload your image at: **{upload_url}/upload**\n"
         "> Drag it onto that page — it takes a second and gives you a URL to paste back here.\n\n"

@@ -22,6 +22,7 @@ import threading
 from io import BytesIO
 from unittest.mock import MagicMock, patch, AsyncMock
 
+import httpx
 import pytest
 from PIL import Image as PILImage
 
@@ -237,6 +238,41 @@ class TestSSRFProtection:
     def test_blocks_127(self):
         with pytest.raises(ValueError, match="Blocked"):
             server._fetch_url("http://127.0.0.1/secret")
+
+    def test_fetch_url_rejects_oversized_content_length_early(self):
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.headers = {
+            "content-type": "image/jpeg",
+            "content-length": str(server.MAX_IMAGE_BYTES + 1),
+        }
+        mock_resp.iter_bytes.return_value = []
+        ctx = MagicMock()
+        ctx.__enter__.return_value = mock_resp
+        ctx.__exit__.return_value = False
+
+        with patch.object(server.httpx, "stream", return_value=ctx):
+            with pytest.raises(ValueError, match="too large"):
+                server._fetch_url("https://example.com/big.jpg")
+
+    def test_fetch_url_retries_once_on_timeout(self):
+        good_resp = MagicMock()
+        good_resp.raise_for_status.return_value = None
+        good_resp.headers = {"content-type": "image/jpeg"}
+        good_resp.iter_bytes.return_value = [b"abc123"]
+        good_ctx = MagicMock()
+        good_ctx.__enter__.return_value = good_resp
+        good_ctx.__exit__.return_value = False
+
+        with patch.object(server, "FETCH_RETRIES", 1), \
+             patch.object(
+                 server.httpx,
+                 "stream",
+                 side_effect=[httpx.TimeoutException("read timeout"), good_ctx],
+             ):
+            body, mime = server._fetch_url("https://example.com/retry.jpg")
+        assert body == b"abc123"
+        assert mime == "image/jpeg"
 
 
 # ---------------------------------------------------------------------------
@@ -629,6 +665,8 @@ class TestEditImageFlow:
         metadata = _parse_result(result)
         assert metadata["edit_mode"] == "inpaint-insertion"
         assert "image_url" in metadata
+        assert "prompt_preview" in metadata
+        assert "prompt" not in metadata
 
     @pytest.mark.asyncio
     async def test_bad_edit_mode(self):
@@ -899,6 +937,124 @@ class TestEmptyImageUploadInstructions:
 
 
 # ---------------------------------------------------------------------------
+# 17b. Size-limit guards (prevent oversized payload overflow paths)
+# ---------------------------------------------------------------------------
+
+class TestImageSizeLimits:
+    def test_check_image_size_limit_rejects_oversized_payload(self):
+        with patch.object(server, "MAX_IMAGE_BYTES", 10):
+            with pytest.raises(ValueError, match="too large"):
+                server._check_image_size_limit(b"x" * 11, source="Uploaded image")
+
+    def test_decode_raw_data_uri_respects_max_size(self):
+        raw = b"0123456789ABCDEF"
+        b64 = base64.b64encode(raw).decode()
+        data_uri = f"data:image/jpeg;base64,{b64}"
+        with patch.object(server, "MAX_IMAGE_BYTES", 8):
+            with pytest.raises(ValueError, match="too large"):
+                server._decode_raw(data_uri)
+
+
+class TestDurableUploadMode:
+    @pytest.mark.asyncio
+    async def test_http_upload_requires_cloud_when_durable_required(self):
+        req = MagicMock()
+        req.headers = {"content-type": "application/octet-stream"}
+        req.body = AsyncMock(return_value=_make_test_image(64, 64))
+
+        with patch.object(server, "REQUIRE_DURABLE_UPLOADS", True), \
+             patch.object(server, "S3_BUCKET", None), \
+             patch.object(server, "GCS_BUCKET", None):
+            resp = await server.http_upload(req)
+
+        assert resp.status_code == 503
+        data = json.loads(resp.body)
+        assert "Durable uploads are required" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_http_upload_returns_503_when_cloud_fails_in_durable_mode(self):
+        req = MagicMock()
+        req.headers = {"content-type": "application/octet-stream"}
+        req.body = AsyncMock(return_value=_make_test_image(64, 64))
+
+        with patch.object(server, "REQUIRE_DURABLE_UPLOADS", True), \
+             patch.object(server, "S3_BUCKET", "test-bucket"), \
+             patch.object(server, "GCS_BUCKET", None), \
+             patch.object(server, "_upload_to_cloud", side_effect=Exception("s3 unavailable")):
+            resp = await server.http_upload(req)
+
+        assert resp.status_code == 503
+        data = json.loads(resp.body)
+        assert "Cloud upload failed" in data["error"]
+
+
+# ---------------------------------------------------------------------------
+# 17c. End-user journey simulations
+# ---------------------------------------------------------------------------
+
+class TestEndUserJourneys:
+    @pytest.mark.asyncio
+    async def test_upload_endpoint_then_edit_image_chain(self):
+        """Simulate a typical user journey:
+        1) upload image via /upload
+        2) use returned URL in edit_image
+        3) receive markdown + JSON + ImageContent preview list
+        """
+        req = MagicMock()
+        req.headers = {"content-type": "application/octet-stream"}
+        req.body = AsyncMock(return_value=_make_test_image(128, 128))
+
+        upload_resp = await server.http_upload(req)
+        assert upload_resp.status_code == 201
+        upload_data = json.loads(upload_resp.body)
+        assert "url" in upload_data and upload_data["url"].startswith("http")
+
+        # Mock Gemini edit response
+        mock_part = MagicMock()
+        mock_part.inline_data = MagicMock()
+        mock_part.inline_data.mime_type = "image/png"
+        mock_part.inline_data.data = _make_test_image(256, 256, fmt="PNG")
+        mock_candidate = MagicMock()
+        mock_candidate.content.parts = [mock_part]
+        mock_response = MagicMock()
+        mock_response.candidates = [mock_candidate]
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch.object(server, "_get_client", return_value=mock_client):
+            result = await server.edit_image(
+                image=upload_data["url"],
+                prompt="replace background with soft studio gradient",
+                ctx=MagicMock(),
+            )
+
+        assert isinstance(result, list)
+        assert result[0].startswith("![](") or result[0].startswith("![Image")
+        meta = json.loads(result[1])
+        assert "image_url" in meta
+        assert isinstance(result[2], MCPImage)
+
+    @pytest.mark.asyncio
+    async def test_upload_endpoint_accepts_multipart_file_field(self):
+        """Simulate browser /upload multipart form path."""
+        file_obj = MagicMock()
+        file_obj.read = AsyncMock(return_value=_make_test_image(96, 96))
+        form = MagicMock()
+        form.get.side_effect = lambda k: file_obj if k == "file" else None
+        form.close = AsyncMock(return_value=None)
+
+        req = MagicMock()
+        req.headers = {"content-type": "multipart/form-data; boundary=abc"}
+        req.form = AsyncMock(return_value=form)
+
+        resp = await server.http_upload(req)
+        assert resp.status_code == 201
+        data = json.loads(resp.body)
+        assert "url" in data
+        assert data["url"].startswith("http")
+
+
+# ---------------------------------------------------------------------------
 # 18. Chaining — generate then edit using nanobanana:// URL
 # ---------------------------------------------------------------------------
 
@@ -1044,6 +1200,12 @@ class TestCloudOutputKeyConsistency:
         meta = json.loads(json_str)
         assert meta["image_url"].startswith("http"), "image_url must be http URL for chaining"
         assert "data:" not in meta["image_url"], "image_url must not be a data URI"
+        assert "\n\nURL: " in render_md
+        assert meta["display_markdown"] == render_md
+        assert meta["display_urls"] == [meta["image_url"]]
+        assert meta["display_text_urls"] == meta["image_url"]
+        assert "chat_response_template" in meta
+        assert meta["display_text_urls"] in meta["chat_response_template"]
         assert len(thumbnails) == 1
         assert isinstance(thumbnails[0], bytes)
 
@@ -1055,6 +1217,10 @@ class TestCloudOutputKeyConsistency:
         meta = json.loads(json_str)
         assert "images" in meta
         assert len(meta["images"]) == 3
+        assert meta["display_markdown"] == render_md
+        assert len(meta["display_urls"]) == 3
+        assert meta["display_text_urls"].count("http") == 3
+        assert "chat_response_template" in meta
         assert len(thumbnails) == 3
         for img in meta["images"]:
             assert "image_url" in img
