@@ -258,7 +258,10 @@ mcp = FastMCP(
         "Default aspect ratio 4:5, resolution 1K.\n\n"
         "## Rendering images — CRITICAL\n"
         "Every image tool result begins with a standalone markdown image link (e.g. `![](https://...)`).\n"
-        "Copy that value verbatim into your reply — do not paraphrase, skip, or describe the image in text instead.\n"
+        "In your assistant reply, include BOTH:\n"
+        "1) `display_markdown` exactly as returned.\n"
+        "2) `display_urls` as direct clickable URL text on a new line.\n"
+        "Do not paraphrase, skip, or replace these with a text-only summary.\n"
         "To chain a generated image into another tool, use the `image_url` from the JSON metadata section."
     ).format(upload_url=_get_upload_base_url()),
     host=os.environ.get("HOST", "0.0.0.0"),
@@ -1030,12 +1033,23 @@ def _build_image_response(
         result.update(generated[0][1])
         result.pop("index", None)
         render_md = f"![]({result.get('image_url', '')})"
+        display_urls = [result.get("image_url", "")]
     else:
         result["images"] = [{k: v for k, v in meta.items() if k != "index"} for _, meta in generated]
         render_md = "\n\n".join(
             f"![Image {i + 1}]({img['image_url']})"
             for i, img in enumerate(result["images"])
             if img.get("image_url")
+        )
+        display_urls = [img.get("image_url", "") for img in result["images"] if img.get("image_url")]
+
+    # Extra fields to help Claude include visible links/images in the main chat reply.
+    result["display_markdown"] = render_md
+    result["display_urls"] = display_urls
+    if display_urls:
+        result["assistant_reply_hint"] = (
+            "Include `display_markdown` in the assistant reply, then include the direct URL(s): "
+            + ", ".join(display_urls)
         )
 
     return render_md, json.dumps(result), thumbnails

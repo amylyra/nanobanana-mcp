@@ -1198,6 +1198,8 @@ class TestCloudOutputKeyConsistency:
         meta = json.loads(json_str)
         assert meta["image_url"].startswith("http"), "image_url must be http URL for chaining"
         assert "data:" not in meta["image_url"], "image_url must not be a data URI"
+        assert meta["display_markdown"] == render_md
+        assert meta["display_urls"] == [meta["image_url"]]
         assert len(thumbnails) == 1
         assert isinstance(thumbnails[0], bytes)
 
@@ -1209,6 +1211,8 @@ class TestCloudOutputKeyConsistency:
         meta = json.loads(json_str)
         assert "images" in meta
         assert len(meta["images"]) == 3
+        assert meta["display_markdown"] == render_md
+        assert len(meta["display_urls"]) == 3
         assert len(thumbnails) == 3
         for img in meta["images"]:
             assert "image_url" in img
