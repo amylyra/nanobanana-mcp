@@ -260,7 +260,7 @@ mcp = FastMCP(
         "Every image tool result begins with a standalone markdown image link (e.g. `![](https://...)`).\n"
         "In your assistant reply, include BOTH:\n"
         "1) `display_markdown` exactly as returned.\n"
-        "2) `display_urls` as direct clickable URL text on a new line.\n"
+        "2) `display_text_urls` exactly as returned (plain direct URLs).\n"
         "Do not paraphrase, skip, or replace these with a text-only summary.\n"
         "To chain a generated image into another tool, use the `image_url` from the JSON metadata section."
     ).format(upload_url=_get_upload_base_url()),
@@ -1032,12 +1032,13 @@ def _build_image_response(
     if len(generated) == 1:
         result.update(generated[0][1])
         result.pop("index", None)
-        render_md = f"![]({result.get('image_url', '')})"
+        single_url = result.get("image_url", "")
+        render_md = f"![]({single_url})\n\nURL: {single_url}"
         display_urls = [result.get("image_url", "")]
     else:
         result["images"] = [{k: v for k, v in meta.items() if k != "index"} for _, meta in generated]
         render_md = "\n\n".join(
-            f"![Image {i + 1}]({img['image_url']})"
+            f"![Image {i + 1}]({img['image_url']})\nURL {i + 1}: {img['image_url']}"
             for i, img in enumerate(result["images"])
             if img.get("image_url")
         )
@@ -1046,10 +1047,10 @@ def _build_image_response(
     # Extra fields to help Claude include visible links/images in the main chat reply.
     result["display_markdown"] = render_md
     result["display_urls"] = display_urls
+    result["display_text_urls"] = "\n".join(display_urls)
     if display_urls:
         result["assistant_reply_hint"] = (
-            "Include `display_markdown` in the assistant reply, then include the direct URL(s): "
-            + ", ".join(display_urls)
+            "Include `display_markdown` in the assistant reply and copy `display_text_urls` exactly."
         )
 
     return render_md, json.dumps(result), thumbnails
