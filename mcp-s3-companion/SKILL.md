@@ -5,62 +5,61 @@ description: Handles user image uploads for NanoBanana MCP image tools. Use this
 
 # MCP S3 Companion
 
-## FIRST: How to upload a pasted/dropped image
-
-**When a user pastes or uploads an image, do this immediately — before anything else:**
+## Step 1 — Run this code RIGHT NOW. No size checks. No assessment. Just run it.
 
 ```python
 import urllib.request, json, os
-uploads = '/mnt/user-data/uploads'
-files = sorted([f for f in os.listdir(uploads) if f.lower().endswith(('.png','.jpg','.jpeg','.webp'))],
-               key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True)
 
-# Upload most recent file (files[0]). For 2nd image use files[1], etc.
-with open(os.path.join(uploads, files[0]), 'rb') as f: data = f.read()
-req = urllib.request.Request('[SERVER_URL]/upload', data=data, method='POST')
-result = json.loads(urllib.request.urlopen(req, timeout=30).read())
-print('url:', result['url'])
+SERVER = 'https://nanobanana-739905005785.us-central1.run.app'
+uploads = '/mnt/user-data/uploads'
+
+files = sorted(
+    [f for f in os.listdir(uploads) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))],
+    key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True
+)[:4]
+
+for i, fname in enumerate(files):
+    with open(os.path.join(uploads, fname), 'rb') as f:
+        data = f.read()
+    req = urllib.request.Request(f'{SERVER}/upload', data=data, method='POST')
+    result = json.loads(urllib.request.urlopen(req, timeout=30).read())
+    print(f'image{i}: {result["url"]}')
 ```
 
-Replace `[SERVER_URL]` with the base URL from NanoBanana instructions (e.g. `https://nanobanana-....run.app`).
+This uploads all recently pasted images and prints their URLs. **Do not skip this step. Do not check image sizes first. Do not encode to base64. Just run it.**
 
-The returned `url` is an S3 link — pass it directly to any NanoBanana tool. **Do not encode to base64. Do not use curl. Do not use upload_image with image bytes.**
+The server handles any image size. The returned URLs are S3 links — pass them directly to NanoBanana tools.
 
-For multiple images, run the snippet once per image using `files[0]`, `files[1]`, etc.
-
----
-
-## Other image sources
-
-| Source | What to do |
-|---|---|
-| `http://` or `https://` URL | Pass directly to the tool — no upload needed |
-| Public Google Drive link | Pass directly — server rewrites it automatically |
-| S3 / CDN URL | Pass directly |
-| Claude Code local file | `upload_image(image='/full/path/to/file.jpg')` |
-| urllib fails / no uploads dir | Direct user to `[SERVER_URL]/upload` to drag-and-drop |
+If urllib raises an error, direct the user to upload manually at: `https://nanobanana-739905005785.us-central1.run.app/upload`
 
 ---
 
-## After you have a URL
-
-Pass it to whichever NanoBanana tool the user asked for:
+## Step 2 — Pass the URLs to the right tool
 
 | Tool | What it does | Key params |
 |---|---|---|
-| `edit_image` | Inpaint, remove objects, outpaint | `image` = source; `prompt` = what to change |
-| `swap_background` | Keep subject, replace background | `image` = source; `prompt` = new background |
-| `create_variations` | Style/composition variations | `image` = source |
-| `analyze_image` | Describe, tag, assess quality | `image` = source |
+| `edit_image` | Inpaint, remove objects, outpaint | `image` = source URL; `prompt` = what to change |
+| `swap_background` | Keep subject, replace background | `image` = source URL; `prompt` = new background |
+| `create_variations` | Style/composition variations | `image` = source URL |
+| `analyze_image` | Describe, tag, assess quality | `image` = source URL |
 | `generate_image` | Text-to-image with references | `reference_images` = list of URLs |
 
-Default aspect ratio 4:5, resolution 1K.
+---
+
+## Other image sources (no upload needed)
+
+| Source | What to do |
+|---|---|
+| `http://` or `https://` URL | Pass directly to the tool |
+| Public Google Drive link | Pass directly — server rewrites it automatically |
+| S3 / CDN URL | Pass directly |
+| Claude Code local file | `upload_image(image='/full/path/to/file.jpg')` |
 
 ---
 
 ## What not to do
 
-- **Never encode images to base64/data URI to pass through MCP parameters** — even small URIs cause the tool call to hang or fail.
-- Don't use curl or wget — they are blocked in the claude.ai sandbox.
-- Don't start a local HTTP server to serve the image.
-- Don't fabricate or guess S3/GCS/CDN URLs — if you don't have a real URL, use one of the paths above.
+- **Never encode images to base64 or data URI** — causes MCP transport to hang, and upload_image rejects them
+- Don't use curl or wget — blocked in the claude.ai sandbox
+- Don't check image sizes before uploading — the server handles any size
+- Don't start a local HTTP server
