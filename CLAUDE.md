@@ -1,58 +1,57 @@
-# NanoBanana MCP — Claude Instructions
+# NanoBanana MCP — Operator Notes
 
-## Deployment
+## Deploy target
 
-**Always deploy to the `nanobanana` service, not `nanobanana-mcp`.**
+Always deploy to service `nanobanana` in `us-central1`.
 
-```
+```bash
 gcloud run deploy nanobanana --source . --region us-central1
 ```
 
-- Service name: `nanobanana`
-- Region: `us-central1`
-- Project: `stellar-builder-492016-s8`
-- URL: `https://nanobanana-739905005785.us-central1.run.app`
+Project: `stellar-builder-492016-s8`
 
-The service already has `GEMINI_API_KEY`, `S3_BUCKET`, and other env vars configured in Cloud Run — do not pass them on the command line.
+Before deploy, validate service exists:
 
-Before deploying, always run `gcloud run services list` to confirm the target service exists and the name matches.
+```bash
+gcloud run services list
+```
+
+## Current behavior summary
+
+- Image generation tools return mixed content:
+  - `render_md` (standalone markdown links)
+  - `json_str` metadata
+  - `ImageContent` thumbnails for tool pane rendering
+- Tool pane inline rendering is reliable.
+- Claude chat reply inline rendering is not guaranteed and can show **"Show Image"** consent gating.
+
+## Why uploads look "stuck"
+
+Most failures are from unsupported upload paths in client sandboxes (for example, trying curl/wget to inaccessible endpoints).
+
+Preferred sequence:
+
+1. URL already available → pass directly.
+2. Local/pasted image → encode to data URI with Python, then call `upload_image`.
+3. Manual fallback → open `{PUBLIC_URL}/upload` and drag-drop.
+
+## Runtime requirements
+
+- `PUBLIC_URL` must be set in Cloud Run for externally reachable image URLs.
+- Use `S3_BUCKET` or `GCS_BUCKET` for durable image links.
+- Without cloud storage, `/images/{id}` entries expire after `STORE_TTL` (default 1 hour).
 
 ## Testing
 
-Run the full test suite before deploying:
-
-```
+```bash
 python -m pytest test_simulation.py -x -q
 ```
 
-All 186 tests must pass. `conftest.py` provides async test support without requiring `pytest-asyncio`.
+`conftest.py` handles async test execution.
 
-## Architecture
+## Code map
 
-- `server.py` — FastMCP server (single file)
-- `test_simulation.py` — unit/integration tests (mock Gemini, real PIL/store logic)
-- `conftest.py` — pytest hook that runs `@pytest.mark.asyncio` tests without the `pytest-asyncio` plugin
-- Cloud Run serves both the MCP endpoint (`/mcp`) and a direct upload page (`/upload`)
-
-## Tool output contract
-
-Image-generating tools (`generate_image`, `edit_image`, `swap_background`, `create_variations`) return a mixed list (Attempt 10):
-
-```
-[render_md, json_str, Image(thumb1), Image(thumb2), ...]
-```
-
-- **`render_md`** — standalone markdown image link(s): `"![](url)"` (single) or `"![Image 1](url1)\n\n![Image 2](url2)"` (multi). First item so Claude sees it as the primary result.
-- **`json_str`** — JSON metadata for tool chaining: `image_url`, `size_kb`, `expires_in`, etc.
-- **`Image` objects** — 512px JPEG `ImageContent` blocks for tool pane previews (render inline in the tool result pane, no consent gate).
-
-**Known limitation:** When Claude includes `render_md` in its reply, claude.ai shows clickable "Show Image" boxes rather than rendering inline. `ImageContent` renders inline in the tool pane without a consent gate. See `IMAGE_DISPLAY_ATTEMPTS.md` for the full history.
-
-## Key design decisions
-
-- **`structured_output=False`** on all image tools — required to prevent `PydanticSerializationError` when FastMCP serialises the mixed `[str, Image, ...]` return list.
-- **JSON-first ordering** — `json_str` is the first list element so clients that only read the first content block still get usable metadata.
-- **Thumbnails in ImageContent** — 512px max, quality 75; keeps payload small while being visible inline.
-- **Full-size in `image_url`** — the `/images/` store or S3 URL always points to the full-resolution JPEG.
-- **`stateless_http=True`** — required for Cloud Run (no sticky sessions across instances).
-- **`S3_BUCKET` env var** — when set, images are uploaded to S3 synchronously during `_build_image_response`. URLs are plain `https://bucket.s3.region.amazonaws.com/prefix/uuid.jpg` (no presigning) so claude.ai detects them as images.
+- `server.py`: FastMCP server and HTTP upload/image endpoints.
+- `test_simulation.py`: unit/integration tests with mocked Gemini and real PIL/store behavior.
+- `TROUBLESHOOTING.md`: incident-style debugging guide.
+- `OPTIMIZATION_PLAN.md`: prioritized cleanup and architecture roadmap.

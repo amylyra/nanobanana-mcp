@@ -13,10 +13,31 @@ import inspect
 
 import pytest
 
+_SESSION_LOOP: asyncio.AbstractEventLoop | None = None
+
 
 def pytest_configure(config: pytest.Config) -> None:
     """Register local markers used by the suite."""
     config.addinivalue_line("markers", "asyncio: run test as an asyncio coroutine")
+
+
+def pytest_sessionstart(session: pytest.Session) -> None:
+    """Provide a default event loop for sync tests that call get_event_loop()."""
+    global _SESSION_LOOP
+    _SESSION_LOOP = asyncio.new_event_loop()
+    asyncio.set_event_loop(_SESSION_LOOP)
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    global _SESSION_LOOP
+    if _SESSION_LOOP is None:
+        return
+    try:
+        _SESSION_LOOP.run_until_complete(_SESSION_LOOP.shutdown_asyncgens())
+    finally:
+        _SESSION_LOOP.close()
+        _SESSION_LOOP = None
+        asyncio.set_event_loop(None)
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -43,6 +64,8 @@ def pytest_pyfunc_call(pyfuncitem: pytest.Function) -> bool | None:
         try:
             loop.run_until_complete(loop.shutdown_asyncgens())
         finally:
-            asyncio.set_event_loop(None)
+            # Keep a default loop available for sync tests that call
+            # asyncio.get_event_loop() directly.
+            asyncio.set_event_loop(_SESSION_LOOP)
             loop.close()
     return True
