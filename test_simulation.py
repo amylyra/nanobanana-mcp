@@ -22,6 +22,7 @@ import threading
 from io import BytesIO
 from unittest.mock import MagicMock, patch, AsyncMock
 
+import httpx
 import pytest
 from PIL import Image as PILImage
 
@@ -202,6 +203,14 @@ class TestDecodeRaw:
         assert data == img
         assert mime == "image/jpeg"
 
+    def test_data_uri_with_wrapped_lines_and_quotes(self):
+        img = _make_test_image(10, 10)
+        b64 = base64.b64encode(img).decode()
+        wrapped = f"\\n\\\"{b64[:40]}\\n{b64[40:]}\\\"\\n"
+        data, mime = server._decode_raw(f"data:image/jpeg;base64,{wrapped}")
+        assert data == img
+        assert mime == "image/jpeg"
+
     def test_raw_base64(self):
         img = _make_test_image(10, 10)
         b64 = base64.b64encode(img).decode()
@@ -237,6 +246,41 @@ class TestSSRFProtection:
     def test_blocks_127(self):
         with pytest.raises(ValueError, match="Blocked"):
             server._fetch_url("http://127.0.0.1/secret")
+
+    def test_fetch_url_rejects_oversized_content_length_early(self):
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.headers = {
+            "content-type": "image/jpeg",
+            "content-length": str(server.MAX_IMAGE_BYTES + 1),
+        }
+        mock_resp.iter_bytes.return_value = []
+        ctx = MagicMock()
+        ctx.__enter__.return_value = mock_resp
+        ctx.__exit__.return_value = False
+
+        with patch.object(server.httpx, "stream", return_value=ctx):
+            with pytest.raises(ValueError, match="too large"):
+                server._fetch_url("https://example.com/big.jpg")
+
+    def test_fetch_url_retries_once_on_timeout(self):
+        good_resp = MagicMock()
+        good_resp.raise_for_status.return_value = None
+        good_resp.headers = {"content-type": "image/jpeg"}
+        good_resp.iter_bytes.return_value = [b"abc123"]
+        good_ctx = MagicMock()
+        good_ctx.__enter__.return_value = good_resp
+        good_ctx.__exit__.return_value = False
+
+        with patch.object(server, "FETCH_RETRIES", 1), \
+             patch.object(
+                 server.httpx,
+                 "stream",
+                 side_effect=[httpx.TimeoutException("read timeout"), good_ctx],
+             ):
+            body, mime = server._fetch_url("https://example.com/retry.jpg")
+        assert body == b"abc123"
+        assert mime == "image/jpeg"
 
 
 # ---------------------------------------------------------------------------
@@ -629,6 +673,8 @@ class TestEditImageFlow:
         metadata = _parse_result(result)
         assert metadata["edit_mode"] == "inpaint-insertion"
         assert "image_url" in metadata
+        assert "prompt_preview" in metadata
+        assert "prompt" not in metadata
 
     @pytest.mark.asyncio
     async def test_bad_edit_mode(self):
@@ -899,6 +945,136 @@ class TestEmptyImageUploadInstructions:
 
 
 # ---------------------------------------------------------------------------
+# 17b. Size-limit guards (prevent oversized payload overflow paths)
+# ---------------------------------------------------------------------------
+
+class TestImageSizeLimits:
+    def test_check_image_size_limit_rejects_oversized_payload(self):
+        with patch.object(server, "MAX_IMAGE_BYTES", 10):
+            with pytest.raises(ValueError, match="too large"):
+                server._check_image_size_limit(b"x" * 11, source="Uploaded image")
+
+    def test_decode_raw_data_uri_respects_max_size(self):
+        raw = b"0123456789ABCDEF"
+        b64 = base64.b64encode(raw).decode()
+        data_uri = f"data:image/jpeg;base64,{b64}"
+        with patch.object(server, "MAX_IMAGE_BYTES", 8):
+            with pytest.raises(ValueError, match="too large"):
+                server._decode_raw(data_uri)
+
+    @pytest.mark.asyncio
+    async def test_upload_image_rejects_too_large_data_uri_chars(self):
+        mock_ctx = MagicMock()
+        with patch.object(server, "MAX_DATA_URI_CHARS", 20):
+            result = await server.upload_image(
+                ctx=mock_ctx,
+                image="data:image/jpeg;base64," + ("A" * 40),
+            )
+        data = json.loads(result)
+        assert "error" in data
+        assert "Data URI is too large" in data["error"]
+
+
+class TestDurableUploadMode:
+    @pytest.mark.asyncio
+    async def test_http_upload_requires_cloud_when_durable_required(self):
+        req = MagicMock()
+        req.headers = {"content-type": "application/octet-stream"}
+        req.body = AsyncMock(return_value=_make_test_image(64, 64))
+
+        with patch.object(server, "REQUIRE_DURABLE_UPLOADS", True), \
+             patch.object(server, "S3_BUCKET", None), \
+             patch.object(server, "GCS_BUCKET", None):
+            resp = await server.http_upload(req)
+
+        assert resp.status_code == 503
+        data = json.loads(resp.body)
+        assert "Durable uploads are required" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_http_upload_returns_503_when_cloud_fails_in_durable_mode(self):
+        req = MagicMock()
+        req.headers = {"content-type": "application/octet-stream"}
+        req.body = AsyncMock(return_value=_make_test_image(64, 64))
+
+        with patch.object(server, "REQUIRE_DURABLE_UPLOADS", True), \
+             patch.object(server, "S3_BUCKET", "test-bucket"), \
+             patch.object(server, "GCS_BUCKET", None), \
+             patch.object(server, "_upload_to_cloud", side_effect=Exception("s3 unavailable")):
+            resp = await server.http_upload(req)
+
+        assert resp.status_code == 503
+        data = json.loads(resp.body)
+        assert "Cloud upload failed" in data["error"]
+
+
+# ---------------------------------------------------------------------------
+# 17c. End-user journey simulations
+# ---------------------------------------------------------------------------
+
+class TestEndUserJourneys:
+    @pytest.mark.asyncio
+    async def test_upload_endpoint_then_edit_image_chain(self):
+        """Simulate a typical user journey:
+        1) upload image via /upload
+        2) use returned URL in edit_image
+        3) receive markdown + JSON + ImageContent preview list
+        """
+        req = MagicMock()
+        req.headers = {"content-type": "application/octet-stream"}
+        req.body = AsyncMock(return_value=_make_test_image(128, 128))
+
+        upload_resp = await server.http_upload(req)
+        assert upload_resp.status_code == 201
+        upload_data = json.loads(upload_resp.body)
+        assert "url" in upload_data and upload_data["url"].startswith("http")
+
+        # Mock Gemini edit response
+        mock_part = MagicMock()
+        mock_part.inline_data = MagicMock()
+        mock_part.inline_data.mime_type = "image/png"
+        mock_part.inline_data.data = _make_test_image(256, 256, fmt="PNG")
+        mock_candidate = MagicMock()
+        mock_candidate.content.parts = [mock_part]
+        mock_response = MagicMock()
+        mock_response.candidates = [mock_candidate]
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch.object(server, "_get_client", return_value=mock_client):
+            result = await server.edit_image(
+                image=upload_data["url"],
+                prompt="replace background with soft studio gradient",
+                ctx=MagicMock(),
+            )
+
+        assert isinstance(result, list)
+        assert result[0].startswith("![](") or result[0].startswith("![Image")
+        meta = json.loads(result[1])
+        assert "image_url" in meta
+        assert isinstance(result[2], MCPImage)
+
+    @pytest.mark.asyncio
+    async def test_upload_endpoint_accepts_multipart_file_field(self):
+        """Simulate browser /upload multipart form path."""
+        file_obj = MagicMock()
+        file_obj.read = AsyncMock(return_value=_make_test_image(96, 96))
+        form = MagicMock()
+        form.get.side_effect = lambda k: file_obj if k == "file" else None
+        form.close = AsyncMock(return_value=None)
+
+        req = MagicMock()
+        req.headers = {"content-type": "multipart/form-data; boundary=abc"}
+        req.form = AsyncMock(return_value=form)
+
+        resp = await server.http_upload(req)
+        assert resp.status_code == 201
+        data = json.loads(resp.body)
+        assert "url" in data
+        assert data["url"].startswith("http")
+
+
+# ---------------------------------------------------------------------------
 # 18. Chaining — generate then edit using nanobanana:// URL
 # ---------------------------------------------------------------------------
 
@@ -1044,6 +1220,12 @@ class TestCloudOutputKeyConsistency:
         meta = json.loads(json_str)
         assert meta["image_url"].startswith("http"), "image_url must be http URL for chaining"
         assert "data:" not in meta["image_url"], "image_url must not be a data URI"
+        assert "\n\nURL: " in render_md
+        assert meta["display_markdown"] == render_md
+        assert meta["display_urls"] == [meta["image_url"]]
+        assert meta["display_text_urls"] == meta["image_url"]
+        assert "chat_response_template" in meta
+        assert meta["display_text_urls"] in meta["chat_response_template"]
         assert len(thumbnails) == 1
         assert isinstance(thumbnails[0], bytes)
 
@@ -1055,6 +1237,10 @@ class TestCloudOutputKeyConsistency:
         meta = json.loads(json_str)
         assert "images" in meta
         assert len(meta["images"]) == 3
+        assert meta["display_markdown"] == render_md
+        assert len(meta["display_urls"]) == 3
+        assert meta["display_text_urls"].count("http") == 3
+        assert "chat_response_template" in meta
         assert len(thumbnails) == 3
         for img in meta["images"]:
             assert "image_url" in img
@@ -1463,6 +1649,19 @@ class TestDataUriInTools:
         assert "url" in data, "upload_image must return a url for the re-hosted image"
         assert data["url"].startswith("http")
 
+    @pytest.mark.asyncio
+    async def test_upload_image_accepts_local_file_path(self, tmp_path):
+        """Claude Code/local-server path: upload_image should accept local file paths."""
+        img_path = tmp_path / "sample.jpg"
+        img_path.write_bytes(_make_test_image(80, 80))
+        mock_ctx = MagicMock()
+
+        result = await server.upload_image(ctx=mock_ctx, image=str(img_path))
+        data = _parse_result(result)
+        assert "error" not in data
+        assert "url" in data
+        assert data["url"].startswith("http")
+
 
 # ===========================================================================
 # CONTEXT-AWARE OUTPUT CONTRACT TESTS
@@ -1696,6 +1895,7 @@ class TestDefaultOutputBehavior:
             assert "/images/" in meta["image_url"], "must return /images/ URL"
             assert "amazonaws.com" not in meta["image_url"]
             assert "expires_in" in meta
+            assert meta["storage_backend"] == "local"
         finally:
             server.S3_BUCKET = orig_s3
 
@@ -1728,6 +1928,7 @@ class TestDefaultOutputBehavior:
         assert meta["image_url"] == fake_s3_url, "S3 URL must be returned as image_url"
         assert "amazonaws.com" in meta["image_url"]
         assert "expires_in" not in meta, "S3 URLs don't expire"
+        assert meta["storage_backend"] == "s3"
         # MCPImage still returned for inline display
         assert isinstance(result, list)
         assert isinstance(result[2], MCPImage)
@@ -2519,6 +2720,22 @@ class TestS3UrlCompleteness:
         assert "/images/" in meta["image_url"], "Must fall back to local /images/ URL"
         assert "amazonaws.com" not in meta["image_url"]
         assert "expires_in" in meta, "Fallback URL must have expiry warning"
+
+    @pytest.mark.asyncio
+    async def test_s3_failure_errors_when_durable_required(self):
+        """If durable uploads are required, S3 failure must return an error (no local fallback)."""
+        mock_client = MagicMock()
+        mock_client.models.generate_content.return_value = self._mock_gemini_response()
+
+        with patch.object(server, "_get_client", return_value=mock_client), \
+             patch.object(server, "S3_BUCKET", "bucket"), \
+             patch.object(server, "REQUIRE_DURABLE_UPLOADS", True), \
+             patch.object(server, "_upload_to_s3", side_effect=Exception("S3 auth failed")):
+            result = await server.generate_image("cat")
+
+        data = _parse_result(result)
+        assert "error" in data
+        assert "durable uploads are required" in data["error"].lower()
 
     @pytest.mark.asyncio
     async def test_swap_background_returns_s3_url(self):
@@ -3541,6 +3758,70 @@ class TestDnsUploadFailureScenario:
             "not to use it even when it ignores server instructions"
         )
 
+    def test_upload_image_error_marks_invalid_payload_non_retryable(self):
+        """Invalid payloads must be marked non-retryable so clients do not loop
+        forever retrying the same malformed input."""
+        import asyncio
+        mock_ctx = MagicMock()
+
+        async def _run():
+            return await server.upload_image(ctx=mock_ctx, image="not-a-url-or-data-uri")
+
+        result = asyncio.get_event_loop().run_until_complete(_run())
+        data = json.loads(result)
+        assert data.get("retryable") is False, (
+            "Invalid upload payload errors must set retryable=false to prevent "
+            "infinite retry loops in clients."
+        )
+        assert "next_step" in data and "/upload" in data["next_step"], (
+            "Invalid upload payload errors should provide a concrete fallback "
+            "(/upload or local file path), not just a generic failure."
+        )
+
+    def test_instructions_say_do_not_retry_same_payload(self):
+        """Instructions should explicitly tell clients not to keep retrying the
+        exact same failing payload, which causes the 'stuck at upload' behavior."""
+        instructions = self._get_instructions().lower()
+        assert "do not retry the same payload" in instructions, (
+            "Instructions must explicitly include 'Do NOT retry the same payload' "
+            "to break upload retry loops."
+        )
+
+    @pytest.mark.asyncio
+    async def test_upload_image_oversized_data_uri_is_non_retryable_with_next_step(self):
+        """Oversized inline payloads should fail fast with non-retryable guidance
+        and a concrete fallback so clients switch flow instead of retrying."""
+        mock_ctx = MagicMock()
+        huge_uri = "data:image/jpeg;base64," + ("A" * (server.MAX_DATA_URI_CHARS + 1))
+        result = await server.upload_image(ctx=mock_ctx, image=huge_uri)
+        data = json.loads(result)
+        assert "error" in data
+        assert data.get("retryable") is False, (
+            "Oversized data URI failures must be non-retryable to prevent looped retries."
+        )
+        assert "next_step" in data and "/upload" in data["next_step"], (
+            "Oversized data URI failures should direct users to /upload fallback."
+        )
+
+    @pytest.mark.asyncio
+    async def test_upload_image_fetch_failure_is_non_retryable_with_next_step(self):
+        """When upstream fetch fails (e.g., DNS/network), upload_image should return
+        a non-retryable structured error with an actionable fallback."""
+        mock_ctx = MagicMock()
+        with patch.object(server, "_acquire_image", side_effect=ValueError("DNS failure")):
+            result = await server.upload_image(
+                ctx=mock_ctx,
+                image="https://example.com/failing-image.jpg",
+            )
+        data = json.loads(result)
+        assert "error" in data
+        assert data.get("retryable") is False, (
+            "Fetch failures should be marked non-retryable for identical payload retry attempts."
+        )
+        assert "next_step" in data and "/upload" in data["next_step"], (
+            "Fetch failures should include /upload fallback guidance."
+        )
+
     def test_instructions_show_claude_ai_web_python_snippet(self):
         """Instructions must include the /mnt/user-data/uploads snippet for
         claude.ai web users — this is the ONLY working path to upload pasted images."""
@@ -3582,6 +3863,28 @@ class TestDnsUploadFailureScenario:
             "If data URIs are rejected, Claude tries curl which always returns empty output."
         )
         assert "url" in data, "Successful upload must return a url field"
+
+
+class TestS3CompanionSkillGuidance:
+    """Regression checks for the local skill guidance used by Claude Code."""
+
+    def _skill_text(self) -> str:
+        with open("mcp-s3-companion/SKILL.md", "r", encoding="utf-8") as f:
+            return f.read()
+
+    def test_skill_prefers_direct_local_path_upload(self):
+        """Skill should explicitly prioritize direct local path upload before
+        any data URI encoding to reduce upload cutoffs/timeouts."""
+        text = self._skill_text().lower()
+        assert "preferred: direct local file path" in text
+        assert "upload_image(image='/full/path/to/file.jpg')" in text
+        assert "do not encode local file paths into data uris first" in text
+
+    def test_skill_requires_separate_upload_calls_for_multiple_images(self):
+        """Skill should instruct one-image-at-a-time uploads so the assistant
+        does not batch huge payloads and get cut off mid-response."""
+        text = self._skill_text().lower()
+        assert "upload each image in separate tool calls" in text
 
 
 if __name__ == "__main__":

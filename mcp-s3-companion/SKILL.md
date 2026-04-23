@@ -41,45 +41,52 @@ Pass it directly to the tool — same as Path 1. The server fetches any `https:/
 
 ---
 
-### Path 4 — User pasted or uploaded an image and bash tools are available
+### Path 4 — User pasted/uploaded image (preferred: direct local file path to `upload_image`)
 
-When a user pastes an image into Claude.ai or drops one, you can access the image bytes through bash. **Do not try to pass the base64 string as an MCP parameter — it gets truncated at ~30K characters.** Do not start a local HTTP server — background processes don't persist between bash commands in this environment.
+When a real local file path is available (Claude Code/local server), call `upload_image` with the path **directly**.
+Do this first, one image at a time:
 
-Instead, write the image to a temp file and POST it directly to the NanoBanana upload endpoint:
+`upload_image(image='/full/path/to/file.jpg')`
+
+**Do not encode local file paths into data URIs first** unless direct path upload fails.
+Large inline payloads can be slow and may cause assistant cutoffs.
+
+Only if direct path upload is unavailable, use Python to convert the image into a compact data URI, then call `upload_image(image=uri)`.
 
 ```python
-# Step 1: save image bytes to a temp file
-import base64, sys
+import os, base64
+from io import BytesIO
+from PIL import Image
 
-# Get the image bytes — encode what you see in the conversation
-# (In Claude.ai bash, you can write the image bytes you've accessed to a file)
-img_bytes = ...  # however you obtained the bytes
-with open('/tmp/nb_upload.jpg', 'wb') as f:
-    f.write(img_bytes)
+uploads = '/mnt/user-data/uploads'
+files = sorted([f for f in os.listdir(uploads) if f.lower().endswith(('.png','.jpg','.jpeg','.webp'))],
+               key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True)
+img = Image.open(os.path.join(uploads, files[0]))
+if max(img.size) > 1024:
+    img.thumbnail((1024, 1024), Image.LANCZOS)
+img = img.convert('RGB')
+buf = BytesIO()
+img.save(buf, format='JPEG', quality=70, optimize=True)
+uri = 'data:image/jpeg;base64,' + base64.b64encode(buf.getvalue()).decode()
+print('uri_chars=', len(uri), uri[:80] + '...')
 ```
 
-```bash
-# Step 2: POST to the NanoBanana upload endpoint and capture the URL
-curl -s -F file=@/tmp/nb_upload.jpg [SERVER_URL]/upload
-```
+Then pass `uri` to `upload_image`. Use returned `url` in downstream tools.
 
-The response is JSON: `{"url": "https://..../images/abc123", "expires_in": "1 hour", ...}`
+If `uri_chars` is large (for example >300k), do **not** pass it through MCP tool parameters.  
+Use `[SERVER_URL]/upload` and paste the returned URL instead (especially when uploading 2+ images).
 
-Parse the `url` field and pass it to the tool. If the curl returns an error or the network is blocked, fall back to Path 5.
-
-`[SERVER_URL]` is the base URL from the NanoBanana MCP server instructions (everything before `/upload`).
+When multiple images are needed, upload each image in separate tool calls and wait for each returned URL before calling the next tool.
 
 ---
 
-### Path 5 — No URL, no bash, or curl to server is blocked
+### Path 5 — No URL and Python path unavailable
 
-Direct the user to the upload page immediately:
+Direct the user to the upload page:
 
-> I can see your image! To use it with the NanoBanana tools I need a URL for it.
-> Please upload it at: **[SERVER_URL]/upload**
-> Drag your image onto that page — it takes a second and gives you a URL to paste back here.
+> I can see your image. To use it with NanoBanana tools, please upload it at **[SERVER_URL]/upload** and paste back the returned URL.
 
-`[SERVER_URL]` is the base URL from the NanoBanana MCP server instructions (everything before `/upload`).
+`[SERVER_URL]` is the base URL from NanoBanana instructions.
 
 ---
 
@@ -101,7 +108,7 @@ Default aspect ratio 4:5, resolution 1K.
 
 ## What not to do
 
-- Don't pass a base64 data URI as an MCP tool parameter for large images — it gets truncated at the MCP call boundary (~30K chars). Write to file and curl instead.
-- Don't start a local HTTP server to serve the image — background processes don't persist between bash commands in Claude.ai's environment.
+- Don't rely on curl/wget upload flows in restricted sandboxes; prefer Python data URI -> `upload_image` or the `/upload` page.
+- Don't start a local HTTP server to serve the image.
 - Don't fabricate or guess S3/GCS/CDN URLs — if you don't have a real URL, use one of the paths above.
 - Don't pass API endpoints, web page URLs, or MCP service URLs as image parameters.
