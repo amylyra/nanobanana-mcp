@@ -3604,16 +3604,16 @@ class TestDnsUploadFailureScenario:
         assert "/upload" in instructions, \
             "Instructions must reference the /upload endpoint"
 
-    def test_instructions_prescribe_python_pil_path_as_fallback(self):
-        """Instructions must describe the Python PIL → base64 → upload_image workflow
-        as a fallback for when urllib fails."""
+    def test_instructions_warn_against_data_uri(self):
+        """Instructions must explicitly warn against encoding to data URI / base64,
+        since passing large MCP parameters hangs the transport."""
         instructions = self._get_instructions()
-        assert "pil" in instructions.lower() or "from pil" in instructions.lower(), \
-            "Instructions must mention PIL (Pillow) for image encoding as fallback"
-        assert "base64" in instructions.lower(), \
-            "Instructions must mention base64 encoding"
-        assert "upload_image" in instructions.lower(), \
-            "Instructions must name upload_image as the tool to call after encoding"
+        lowered = instructions.lower()
+        # Must warn against data URI / base64 encoding
+        assert "never" in lowered or "do not" in lowered or "not" in lowered, \
+            "Instructions must contain a prohibition"
+        assert "base64" in lowered or "data uri" in lowered or "data:image" in lowered, \
+            "Instructions must warn against base64/data URI encoding"
 
     def test_instructions_mention_upload_page_as_fallback(self):
         """Instructions must mention the /upload page so Claude can direct users there
