@@ -1167,7 +1167,7 @@ def _upload_error(message: str, next_step: str | None = None) -> str:
 @mcp.tool()
 async def upload_image(
     ctx: Context,
-    image: Annotated[str, Field(max_length=5000)],
+    image: Annotated[str, Field(pattern=r"^(https?://|/)")],
 ) -> str:
     """Re-host an image to a server URL for use in other tools.
 
@@ -1206,15 +1206,18 @@ async def upload_image(
         and not _is_url(image)
         and os.path.isfile(image)
     )
-    if is_data_uri and len(image) > MAX_DATA_URI_CHARS:
+    if is_data_uri:
         return _upload_error(
             (
-                f"Data URI is too large ({len(image):,} chars). "
-                f"Maximum inline size is {MAX_DATA_URI_CHARS:,} chars."
+                "upload_image does NOT accept data URIs or base64-encoded images. "
+                "Passing base64 through MCP parameters hangs the transport — there is no size that works. "
+                "For pasted images in claude.ai, use the urllib POST snippet from server instructions: "
+                "read the file from /mnt/user-data/uploads and POST it to /upload to get a URL. "
+                "Do NOT compress and retry with a smaller data URI."
             ),
-            next_step=f"Use drag-and-drop upload instead: {upload_url}",
+            next_step=f"Use urllib POST to {upload_url} (see server instructions for the snippet)",
         )
-    if not _is_url(image) and not is_data_uri and not is_local_file:
+    if not _is_url(image) and not is_local_file:
         return _upload_error(
             (
                 "upload_image accepts http/https URLs or local file paths. "
