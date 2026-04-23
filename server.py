@@ -235,6 +235,8 @@ mcp = FastMCP(
         "   If uri_chars is very large (e.g. >300k), DO NOT call upload_image with that data URI.\n"
         "   Use {upload_url}/upload instead, especially for multiple images.\n"
         "   Then call upload_image(image=uri) only for compact data URIs.\n"
+        "   If upload_image returns an error, DO NOT retry the same payload repeatedly.\n"
+        "   Switch to local file path upload or {upload_url}/upload.\n"
         "   If uploads directory doesn't exist, ask user to visit {upload_url}/upload to drag-and-drop.\n\n"
         "Never fabricate URLs. Never start a local HTTP server.\n\n"
         "## Tools\n"
@@ -1167,6 +1169,13 @@ def _score_image(client, img_bytes: bytes, prompt: str) -> dict:
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
+def _upload_error(message: str, next_step: str | None = None) -> str:
+    payload = {"error": message, "retryable": False}
+    if next_step:
+        payload["next_step"] = next_step
+    return json.dumps(payload)
+
+
 @mcp.tool()
 async def upload_image(
     ctx: Context,
@@ -1227,28 +1236,29 @@ async def upload_image(
         and os.path.isfile(image)
     )
     if is_data_uri and len(image) > MAX_DATA_URI_CHARS:
-        return json.dumps({
-            "error": (
+        return _upload_error(
+            (
                 f"Data URI is too large ({len(image):,} chars). "
-                f"Maximum inline size is {MAX_DATA_URI_CHARS:,} chars. "
-                f"Use drag-and-drop upload instead: {upload_url}"
-            )
-        })
+                f"Maximum inline size is {MAX_DATA_URI_CHARS:,} chars."
+            ),
+            next_step=f"Use drag-and-drop upload instead: {upload_url}",
+        )
     if not _is_url(image) and not is_data_uri and not is_local_file:
-        return json.dumps({
-            "error": (
+        return _upload_error(
+            (
                 "upload_image accepts http/https URLs, local file paths, or data URIs (data:image/jpeg;base64,...). "
                 "Do NOT use curl — DNS is blocked. "
+                "Do NOT retry the same invalid payload. "
                 "For local files, use the Python code tool to encode: "
                 "from PIL import Image; from io import BytesIO; import base64; "
                 "img=Image.open('/path/to/file.jpg'); "
                 "img.thumbnail((1024,1024), Image.LANCZOS); img=img.convert('RGB'); "
                 "buf=BytesIO(); img.save(buf,'JPEG',quality=70,optimize=True); "
                 "uri='data:image/jpeg;base64,'+base64.b64encode(buf.getvalue()).decode(); "
-                "then call upload_image(image=uri). "
-                f"Or user can drag-and-drop at: {upload_url}"
-            )
-        })
+                "then call upload_image(image=uri)."
+            ),
+            next_step=f"Or user can drag-and-drop at: {upload_url}",
+        )
 
     try:
         if is_local_file:
@@ -1261,20 +1271,23 @@ async def upload_image(
         else:
             normalized, norm_mime = await _acquire_image(image, ctx, purpose="image")
     except ValueError as e:
-        return json.dumps({"error": str(e)})
+        return _upload_error(str(e), next_step=f"Try /upload: {upload_url}")
     except Exception as e:
-        return json.dumps({"error": f"Failed to read local image file: {e}"})
+        return _upload_error(
+            f"Failed to read local image file: {e}",
+            next_step="Check that the path exists and points to an image file.",
+        )
 
     img = PILImage.open(BytesIO(normalized))
     w, h = img.size
 
     if REQUIRE_DURABLE_UPLOADS and not (S3_BUCKET or GCS_BUCKET):
-        return json.dumps({
-            "error": (
+        return _upload_error(
+            (
                 "Durable uploads are required but no cloud storage is configured. "
                 "Set S3_BUCKET or GCS_BUCKET, or disable REQUIRE_DURABLE_UPLOADS."
             )
-        })
+        )
 
     # Prefer cloud storage (durable URLs); fall back to in-memory store
     if S3_BUCKET or GCS_BUCKET:
@@ -1289,9 +1302,9 @@ async def upload_image(
             })
         except Exception as e:
             if REQUIRE_DURABLE_UPLOADS:
-                return json.dumps({
-                    "error": f"Cloud upload failed and durable uploads are required: {e}"
-                })
+                return _upload_error(
+                    f"Cloud upload failed and durable uploads are required: {e}"
+                )
             log(f"Cloud upload failed, falling back to in-memory store: {e}\n")
 
     img_id = _store_image(normalized, norm_mime)
