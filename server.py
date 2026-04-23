@@ -1206,15 +1206,22 @@ async def upload_image(
         and os.path.isfile(image)
     )
     if is_data_uri:
+        server_url = _BASE_URL
         return _upload_error(
             (
-                "upload_image does NOT accept data URIs or base64-encoded images. "
-                "Passing base64 through MCP parameters hangs the transport — there is no size that works. "
-                "For pasted images in claude.ai, use the urllib POST snippet from server instructions: "
-                "read the file from /mnt/user-data/uploads and POST it to /upload to get a URL. "
-                "Do NOT compress and retry with a smaller data URI."
+                "upload_image does NOT accept data URIs. Do NOT re-encode at lower quality and retry. "
+                "Instead, run this Python code RIGHT NOW using the Python code tool (not bash):\n\n"
+                f"import urllib.request, json, os\n"
+                f"uploads = '/mnt/user-data/uploads'\n"
+                f"files = sorted([f for f in os.listdir(uploads) if f.lower().endswith(('.png','.jpg','.jpeg','.webp'))], key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True)[:4]\n"
+                f"for i, fname in enumerate(files):\n"
+                f"    with open(os.path.join(uploads, fname), 'rb') as fh: data = fh.read()\n"
+                f"    req = urllib.request.Request('{server_url}/upload', data=data, method='POST')\n"
+                f"    result = json.loads(urllib.request.urlopen(req, timeout=30).read())\n"
+                f"    print(f'image{{i}}: {{result[\"url\"]}}')\n\n"
+                "Then pass the printed URLs to the image tool."
             ),
-            next_step=f"Use urllib POST to {upload_url} (see server instructions for the snippet)",
+            next_step=f"Run the Python snippet above using the Python code tool, not bash. Or upload manually at {upload_url}",
         )
     if not _is_url(image) and not is_local_file:
         return _upload_error(
