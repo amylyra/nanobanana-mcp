@@ -207,8 +207,7 @@ mcp = FastMCP(
         "All image tool parameters accept http/https URLs.\n\n"
         "1. **Direct URL (http/https, S3, CDN)** → pass straight to the tool.\n"
         "2. **Public Google Drive link** → pass straight to the tool (auto-rewritten).\n"
-        "3. **Pasted or local file** → try these paths in order until one works:\n\n"
-        "**Path A — Python urllib POST (works in claude.ai web, try first):**\n"
+        "3. **Pasted or local file (claude.ai web)** → use Python urllib POST — this is the ONLY correct approach:\n\n"
         "```python\n"
         "import urllib.request, json, os\n"
         "uploads = '/mnt/user-data/uploads'\n"
@@ -221,33 +220,15 @@ mcp = FastMCP(
         "print('url:', result['url'])\n"
         "```\n"
         "Pass the returned `url` directly to any tool. "
-        "For multiple images, change `files[0]` to `files[1]` etc. and repeat.\n\n"
-        "**Path B — Claude Code file path:**\n"
-        "Call upload_image directly: `upload_image(image='/full/path/to/file.jpg')`\n\n"
-        "**Path C — data URI (absolute last resort, only if A and B fail):**\n"
-        "The upload_image `image` parameter has maxLength=5000 — MUST be under 5000 chars.\n"
-        "```python\n"
-        "import os, base64\n"
-        "from io import BytesIO\n"
-        "from PIL import Image\n"
-        "uploads = '/mnt/user-data/uploads'\n"
-        "files = sorted([f for f in os.listdir(uploads) if f.lower().endswith(('.png','.jpg','.jpeg','.webp'))],\n"
-        "               key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True)\n"
-        "img = Image.open(os.path.join(uploads, files[0]))\n"
-        "img.thumbnail((64, 64), Image.LANCZOS)\n"
-        "img = img.convert('RGB')\n"
-        "buf = BytesIO()\n"
-        "img.save(buf, format='JPEG', quality=10, optimize=True)\n"
-        "uri = 'data:image/jpeg;base64,' + base64.b64encode(buf.getvalue()).decode()\n"
-        "print('uri_chars=', len(uri))\n"
-        "```\n"
-        "Only call upload_image(image=uri) if uri_chars < 5000.\n\n"
-        "**Path D — manual fallback:**\n"
-        "Direct user to {upload_url}/upload to drag-and-drop and paste back the URL.\n\n"
-        "If a path fails, move to the next one. Do NOT retry the same approach.\n"
+        "For multiple images, run once per image using `files[0]`, `files[1]`, etc.\n\n"
+        "**NEVER encode images to base64/data URI** — passing data URIs through MCP parameters causes "
+        "the transport to hang indefinitely regardless of size. There is no size threshold that makes it safe.\n\n"
+        "4. **Local file path (Claude Code only):** `upload_image(image='/full/path/to/file.jpg')`\n"
+        "5. **Manual fallback:** direct user to {upload_url}/upload to drag-and-drop.\n\n"
+        "If urllib fails, do not retry — switch paths or direct the user to manual upload. "
         "Never fabricate URLs. Never start a local HTTP server.\n\n"
         "## Tools\n"
-        "- upload_image — re-host an image URL or data URI to a server URL for use in other tools\n"
+        "- upload_image — re-host an image URL or local file path to a server URL for use in other tools\n"
         "- generate_image — text-to-image, optional reference image URLs, style presets\n"
         "- edit_image — edit an image (inpaint, remove, outpaint); accepts multiple reference_images\n"
         "- swap_background — keep subject, replace background\n"
@@ -1192,39 +1173,22 @@ async def upload_image(
 
     Accepts:
     - http/https URLs (including Google Drive share links — auto-rewritten)
-    - data URIs: `data:image/jpeg;base64,<base64-encoded-bytes>`
-    - local file paths (Claude Code/local server): `/full/path/to/image.jpg`
+    - local file paths (Claude Code only): `/full/path/to/image.jpg`
 
-    **For local files (Claude Code / bash available):** encode the file as a
-    local path directly when possible:
+    **For pasted/dragged images in claude.ai web:** DO NOT pass a data URI here.
+    Use the urllib POST snippet from server instructions instead — it POSTs the raw
+    file bytes to /upload and returns a URL to pass to this or any other tool.
+    Encoding to base64/data URI and passing it as a parameter causes the MCP
+    transport to hang regardless of size. There is no workaround — use urllib POST.
 
+    **For local files (Claude Code):** pass the file path directly:
         upload_image(image='/full/path/to/file.jpg')
-
-    If direct path upload is unavailable, encode the file as a data URI with
-    Python and pass it here — do NOT try curl (DNS is blocked):
-
-        import base64, sys
-        from io import BytesIO
-        from PIL import Image
-        img = Image.open('/path/to/file.jpg')
-        img.thumbnail((64, 64), Image.LANCZOS)
-        img = img.convert('RGB')
-        buf = BytesIO()
-        img.save(buf, format='JPEG', quality=10, optimize=True)
-        uri = 'data:image/jpeg;base64,' + base64.b64encode(buf.getvalue()).decode()
-        print('uri_chars=', len(uri))
-
-    CRITICAL: uri_chars MUST be < 5,000. Large URIs hang the tool call.
-    If > 5,000: shrink to (32, 32) and quality=5. Use `/upload` page as last resort.
-
-    **For pasted/dragged images (claude.ai web):** use the Python code tool with
-    the snippet from server instructions (reads from /mnt/user-data/uploads).
 
     When cloud storage (S3/GCS) is configured, the returned URL is durable (no expiry).
     Otherwise the URL expires after 1 hour — the response includes "expires_in".
 
     Args:
-        image: http/https URL or data URI (`data:image/jpeg;base64,...`).
+        image: http/https URL or local file path.
 
     Returns:
         JSON with `url` (pass to any other tool), width, height, size_kb.
@@ -1253,16 +1217,12 @@ async def upload_image(
     if not _is_url(image) and not is_data_uri and not is_local_file:
         return _upload_error(
             (
-                "upload_image accepts http/https URLs, local file paths, or data URIs (data:image/jpeg;base64,...). "
-                "Do NOT use curl — DNS is blocked. "
-                "Do NOT retry the same invalid payload. "
-                "For local files, use the Python code tool to encode: "
-                "from PIL import Image; from io import BytesIO; import base64; "
-                "img=Image.open('/path/to/file.jpg'); "
-                "img.thumbnail((1024,1024), Image.LANCZOS); img=img.convert('RGB'); "
-                "buf=BytesIO(); img.save(buf,'JPEG',quality=70,optimize=True); "
-                "uri='data:image/jpeg;base64,'+base64.b64encode(buf.getvalue()).decode(); "
-                "then call upload_image(image=uri)."
+                "upload_image accepts http/https URLs or local file paths. "
+                "Do NOT pass data URIs — they hang the MCP transport. "
+                "For pasted images in claude.ai web, use the urllib POST snippet "
+                "from server instructions to upload from /mnt/user-data/uploads. "
+                "For local files in Claude Code, pass the file path directly: "
+                "upload_image(image='/full/path/to/file.jpg')."
             ),
             next_step=f"Or user can drag-and-drop at: {upload_url}",
         )
@@ -2085,10 +2045,10 @@ def handle_image() -> str:
     return (
         "The user wants to use an image with NanoBanana tools but doesn't have a URL for it. "
         "Here's how to get one:\n\n"
-        "**Pasted/local image (preferred: Python data URI + upload_image)**\n"
-        "In claude.ai, pasted images are saved to `/mnt/user-data/uploads`. Use Python to encode "
-        "as a data URI, then call `upload_image(image=uri)`.\n\n"
-        "Do NOT use curl/wget for uploads in restricted sandboxes.\n\n"
+        "**Pasted/local image (use urllib POST — do NOT encode to data URI)**\n"
+        "In claude.ai, pasted images are saved to `/mnt/user-data/uploads`. "
+        "Use the urllib POST snippet from server instructions to upload the raw file bytes "
+        "to /upload and get back a URL. NEVER encode to base64/data URI — it hangs the transport.\n\n"
         "**Manual fallback**\n"
         f"Direct the user to upload manually:\n\n"
         f"> Please upload your image at: **{upload_url}/upload**\n"
