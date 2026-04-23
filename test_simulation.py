@@ -963,16 +963,15 @@ class TestImageSizeLimits:
                 server._decode_raw(data_uri)
 
     @pytest.mark.asyncio
-    async def test_upload_image_rejects_too_large_data_uri_chars(self):
+    async def test_upload_image_rejects_all_data_uris(self):
         mock_ctx = MagicMock()
-        with patch.object(server, "MAX_DATA_URI_CHARS", 20):
-            result = await server.upload_image(
-                ctx=mock_ctx,
-                image="data:image/jpeg;base64," + ("A" * 40),
-            )
+        result = await server.upload_image(
+            ctx=mock_ctx,
+            image="data:image/jpeg;base64," + ("A" * 40),
+        )
         data = json.loads(result)
         assert "error" in data
-        assert "Data URI is too large" in data["error"]
+        assert "data URI" in data["error"] or "base64" in data["error"]
 
 
 class TestDurableUploadMode:
@@ -1636,8 +1635,8 @@ class TestDataUriInTools:
         assert "error" not in data
 
     @pytest.mark.asyncio
-    async def test_upload_image_accepts_data_uri(self):
-        """upload_image now accepts data URIs — the correct path for Claude Code local files."""
+    async def test_upload_image_rejects_data_uri(self):
+        """upload_image must reject data URIs — passing base64 through MCP parameters hangs the transport."""
         img = _make_test_image(100, 100)
         b64 = base64.b64encode(img).decode()
         data_uri = f"data:image/jpeg;base64,{b64}"
@@ -1645,9 +1644,8 @@ class TestDataUriInTools:
 
         result = await server.upload_image(ctx=mock_ctx, image=data_uri)
         data = _parse_result(result)
-        assert "error" not in data, "data URI must be accepted by upload_image"
-        assert "url" in data, "upload_image must return a url for the re-hosted image"
-        assert data["url"].startswith("http")
+        assert "error" in data, "upload_image must reject data URIs"
+        assert data.get("retryable") is False, "data URI rejection must be non-retryable"
 
     @pytest.mark.asyncio
     async def test_upload_image_accepts_local_file_path(self, tmp_path):
@@ -3825,11 +3823,10 @@ class TestDnsUploadFailureScenario:
         )
 
     @pytest.mark.asyncio
-    async def test_upload_image_accepts_data_uri_not_just_http(self):
-        """upload_image must accept data URIs — if it rejects them, Claude falls back
-        to curl which always fails with empty output (Image #29 root cause)."""
+    async def test_upload_image_rejects_data_uri_with_urllib_guidance(self):
+        """upload_image must reject data URIs — passing base64 through MCP parameters
+        hangs the transport. The error must direct Claude to use urllib POST instead."""
         mock_ctx = MagicMock()
-        # Minimal valid 1×1 white JPEG as a data URI
         from PIL import Image as PILImage
         from io import BytesIO
         buf = BytesIO()
@@ -3839,11 +3836,13 @@ class TestDnsUploadFailureScenario:
 
         result = await server.upload_image(ctx=mock_ctx, image=data_uri)
         data = json.loads(result)
-        assert "error" not in data, (
-            f"upload_image must accept data URIs; got error: {data.get('error')}. "
-            "If data URIs are rejected, Claude tries curl which always returns empty output."
+        assert "error" in data, "upload_image must reject data URIs"
+        assert data.get("retryable") is False, "rejection must be non-retryable to stop retry loops"
+        # Error message must guide toward urllib POST
+        combined = (data.get("error", "") + data.get("next_step", "")).lower()
+        assert "urllib" in combined or "/upload" in combined, (
+            "Rejection error must guide Claude toward urllib POST or /upload page"
         )
-        assert "url" in data, "Successful upload must return a url field"
 
 
 if __name__ == "__main__":
