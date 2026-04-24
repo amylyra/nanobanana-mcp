@@ -1,5 +1,6 @@
 # NanoBanana MCP
 
+[![SafeSkill 93/100](https://img.shields.io/badge/SafeSkill-93%2F100_Verified%20Safe-brightgreen)](https://safeskill.dev/scan/amylyra-nanobanana-mcp)
 A production-focused MCP server for image generation, editing, and analysis in Claude, powered by Gemini image models.
 
 > **Current status (April 22, 2026):**
