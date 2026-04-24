@@ -1190,7 +1190,7 @@ def _upload_error(message: str, next_step: str | None = None) -> str:
 @mcp.tool()
 async def upload_image(
     ctx: Context,
-    image: Annotated[str, AfterValidator(_validate_image_param)],
+    image: Annotated[str, Field(pattern=r"^(https?://|/)"), AfterValidator(_validate_image_param)],
 ) -> str:
     """Re-host an image to a server URL for use in other tools.
 
