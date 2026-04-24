@@ -5,8 +5,10 @@
 Always deploy to service `nanobanana` in `us-central1`.
 
 ```bash
-gcloud run deploy nanobanana --source . --region us-central1
+gcloud run deploy nanobanana --source . --region us-central1 --min-instances=1
 ```
+
+`--min-instances=1` is required. Without it, cold-start 503s break the urllib upload path.
 
 Project: `stellar-builder-492016-s8`
 
@@ -31,9 +33,12 @@ Most failures are from unsupported upload paths in client sandboxes (for example
 
 Preferred sequence:
 
-1. URL already available → pass directly.
-2. Local/pasted image → encode to data URI with Python, then call `upload_image`.
-3. Manual fallback → open `{PUBLIC_URL}/upload` and drag-drop.
+1. URL already available → pass directly to the tool.
+2. Pasted/local image in claude.ai web → run the urllib POST snippet (reads `/mnt/user-data/uploads/`, POSTs raw bytes to `/upload`, gets back a URL).
+3. Local file in Claude Code → `upload_image(image='/full/path/to/file.jpg')`.
+4. Manual fallback → open `{PUBLIC_URL}/upload` and drag-drop.
+
+**Never encode to base64/data URI** — passing large data URIs as MCP parameters hangs the transport before the server can reject them. The `Field(pattern=r"^(https?://|/)")` constraint blocks data URIs client-side.
 
 ## Runtime requirements
 

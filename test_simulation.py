@@ -3845,5 +3845,87 @@ class TestDnsUploadFailureScenario:
         )
 
 
+    @pytest.mark.asyncio
+    async def test_not_local_file_error_includes_urllib_snippet(self):
+        """Production path: Claude tries /mnt/user-data/uploads/file.jpg (matches pattern),
+        but os.path.isfile() returns False on Cloud Run, hitting the 'not a URL or local file'
+        error. That error MUST include the full urllib snippet inline — not just 'see server
+        instructions' — so Claude runs it immediately without searching elsewhere."""
+        mock_ctx = MagicMock()
+        # Simulate the path Claude tries after the pattern blocks data URI
+        result = await server.upload_image(
+            ctx=mock_ctx,
+            image="/mnt/user-data/uploads/some_pasted_image.jpg",
+        )
+        data = json.loads(result)
+        assert "error" in data, "Non-existent local path must return error"
+        error_text = data.get("error", "") + data.get("next_step", "")
+        # Must include the urllib snippet directly
+        assert "urllib" in error_text, (
+            "Error for non-existent local path must include urllib snippet inline. "
+            "This is the error Claude reads in the production flow after pattern blocks data URI."
+        )
+        assert "/mnt/user-data/uploads" in error_text, (
+            "Error must include the uploads directory so Claude knows where to read files from."
+        )
+        assert "/upload" in error_text, (
+            "Error must reference the /upload endpoint for the urllib POST target."
+        )
+        assert data.get("retryable") is False, (
+            "Error must be non-retryable to prevent Claude from looping."
+        )
+
+    @pytest.mark.asyncio
+    async def test_not_local_file_error_includes_server_url(self):
+        """The urllib snippet in the 'not a local file' error must contain the
+        actual server URL, not a placeholder like [SERVER_URL] or {upload_url}."""
+        mock_ctx = MagicMock()
+        result = await server.upload_image(
+            ctx=mock_ctx,
+            image="/mnt/user-data/uploads/image.png",
+        )
+        data = json.loads(result)
+        error_text = data.get("error", "") + data.get("next_step", "")
+        # Must have a real URL, not an unformatted placeholder
+        assert "[SERVER_URL]" not in error_text, "Error must not contain [SERVER_URL] placeholder"
+        assert "{upload_url}" not in error_text, "Error must not contain {upload_url} placeholder"
+        assert "http" in error_text, (
+            "Error must include a real http(s) URL for the urllib POST target"
+        )
+
+    @pytest.mark.asyncio
+    async def test_production_upload_flow_sequence(self):
+        """Integration test modeling the actual production flow:
+        1. data URI → blocked by pattern (Pydantic, never reaches function body)
+        2. local path → pattern accepts, os.path.isfile False → 'not local file' error with snippet
+        3. urllib POSTs raw bytes → /upload endpoint → returns URL → success
+
+        Steps 1-2 are function-body tests (bypassing pattern). Step 3 uses http_upload."""
+        mock_ctx = MagicMock()
+
+        # Step 2: local path that doesn't exist on server → must include urllib snippet
+        result = await server.upload_image(
+            ctx=mock_ctx,
+            image="/mnt/user-data/uploads/photo.jpg",
+        )
+        data = json.loads(result)
+        assert "urllib" in data.get("error", ""), (
+            "Step 2 error must contain urllib snippet for Claude to follow"
+        )
+
+        # Step 3: simulate urllib POSTing raw bytes to /upload → must succeed
+        req = MagicMock()
+        req.headers = {"content-type": "application/octet-stream"}
+        req.body = AsyncMock(return_value=_make_test_image(64, 64))
+        upload_resp = await server.http_upload(req)
+        assert upload_resp.status_code == 201, (
+            "Step 3 raw-bytes POST to /upload must return 201"
+        )
+        upload_data = json.loads(upload_resp.body)
+        assert "url" in upload_data and upload_data["url"].startswith("http"), (
+            "Step 3 must return a real http URL for Claude to pass to image tools"
+        )
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -30,7 +30,7 @@ from io import BytesIO
 from typing import Annotated
 from urllib.parse import urlparse
 
-from pydantic import AfterValidator, Field
+from pydantic import Field
 
 log = sys.stderr.write
 
@@ -194,30 +194,6 @@ _BASE_URL = _compute_base_url()
 
 def _get_upload_base_url() -> str:
     return _BASE_URL
-
-
-# ---------------------------------------------------------------------------
-# upload_image argument validator — fires before function body, gives Claude
-# a friendly error with the exact urllib snippet to run instead.
-# ---------------------------------------------------------------------------
-def _validate_image_param(v: str) -> str:
-    if v.startswith("data:"):
-        server_url = _get_upload_base_url()
-        raise ValueError(
-            "upload_image does NOT accept data URIs. Do NOT re-encode at lower quality and retry. "
-            "Instead, run this Python code using the Python code tool (not bash):\n"
-            f"import urllib.request, json, os\n"
-            f"uploads = '/mnt/user-data/uploads'\n"
-            f"files = sorted([f for f in os.listdir(uploads) if f.lower().endswith(('.png','.jpg','.jpeg','.webp'))], "
-            f"key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True)[:4]\n"
-            f"for i, fname in enumerate(files):\n"
-            f"    with open(os.path.join(uploads, fname), 'rb') as fh: data = fh.read()\n"
-            f"    req = urllib.request.Request('{server_url}/upload', data=data, method='POST')\n"
-            f"    result = json.loads(urllib.request.urlopen(req, timeout=30).read())\n"
-            f"    print(f'image{{i}}: {{result[\"url\"]}}')\n"
-            "Then pass the printed URLs to the image tool."
-        )
-    return v
 
 
 # ---------------------------------------------------------------------------
@@ -1190,7 +1166,7 @@ def _upload_error(message: str, next_step: str | None = None) -> str:
 @mcp.tool()
 async def upload_image(
     ctx: Context,
-    image: Annotated[str, Field(pattern=r"^(https?://|/)"), AfterValidator(_validate_image_param)],
+    image: Annotated[str, Field(pattern=r"^(https?://|/)")],
 ) -> str:
     """Re-host an image to a server URL for use in other tools.
 
@@ -1248,16 +1224,24 @@ async def upload_image(
             next_step=f"Run the Python snippet above using the Python code tool, not bash. Or upload manually at {upload_url}",
         )
     if not _is_url(image) and not is_local_file:
+        server_url = _BASE_URL
         return _upload_error(
             (
-                "upload_image accepts http/https URLs or local file paths. "
-                "Do NOT pass data URIs — they hang the MCP transport. "
-                "For pasted images in claude.ai web, use the urllib POST snippet "
-                "from server instructions to upload from /mnt/user-data/uploads. "
-                "For local files in Claude Code, pass the file path directly: "
-                "upload_image(image='/full/path/to/file.jpg')."
+                "upload_image accepts http/https URLs or local file paths only. "
+                "The path you provided does not exist on this server. "
+                "For pasted images in claude.ai web, run this Python code RIGHT NOW "
+                "using the Python code tool (not bash):\n\n"
+                f"import urllib.request, json, os\n"
+                f"uploads = '/mnt/user-data/uploads'\n"
+                f"files = sorted([f for f in os.listdir(uploads) if f.lower().endswith(('.png','.jpg','.jpeg','.webp'))], key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True)[:4]\n"
+                f"for i, fname in enumerate(files):\n"
+                f"    with open(os.path.join(uploads, fname), 'rb') as fh: data = fh.read()\n"
+                f"    req = urllib.request.Request('{server_url}/upload', data=data, method='POST')\n"
+                f"    result = json.loads(urllib.request.urlopen(req, timeout=30).read())\n"
+                f"    print(f'image{{i}}: {{result[\"url\"]}}')\n\n"
+                "Then pass the printed URLs to the image tool."
             ),
-            next_step=f"Or user can drag-and-drop at: {upload_url}",
+            next_step=f"Run the Python snippet above using the Python code tool. Or upload manually at {upload_url}",
         )
 
     try:
