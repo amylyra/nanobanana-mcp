@@ -30,7 +30,7 @@ from io import BytesIO
 from typing import Annotated
 from urllib.parse import urlparse
 
-from pydantic import Field
+from pydantic import AfterValidator, Field
 
 log = sys.stderr.write
 
@@ -194,6 +194,30 @@ _BASE_URL = _compute_base_url()
 
 def _get_upload_base_url() -> str:
     return _BASE_URL
+
+
+# ---------------------------------------------------------------------------
+# upload_image argument validator — fires before function body, gives Claude
+# a friendly error with the exact urllib snippet to run instead.
+# ---------------------------------------------------------------------------
+def _validate_image_param(v: str) -> str:
+    if v.startswith("data:"):
+        server_url = _get_upload_base_url()
+        raise ValueError(
+            "upload_image does NOT accept data URIs. Do NOT re-encode at lower quality and retry. "
+            "Instead, run this Python code using the Python code tool (not bash):\n"
+            f"import urllib.request, json, os\n"
+            f"uploads = '/mnt/user-data/uploads'\n"
+            f"files = sorted([f for f in os.listdir(uploads) if f.lower().endswith(('.png','.jpg','.jpeg','.webp'))], "
+            f"key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True)[:4]\n"
+            f"for i, fname in enumerate(files):\n"
+            f"    with open(os.path.join(uploads, fname), 'rb') as fh: data = fh.read()\n"
+            f"    req = urllib.request.Request('{server_url}/upload', data=data, method='POST')\n"
+            f"    result = json.loads(urllib.request.urlopen(req, timeout=30).read())\n"
+            f"    print(f'image{{i}}: {{result[\"url\"]}}')\n"
+            "Then pass the printed URLs to the image tool."
+        )
+    return v
 
 
 # ---------------------------------------------------------------------------
@@ -1166,7 +1190,7 @@ def _upload_error(message: str, next_step: str | None = None) -> str:
 @mcp.tool()
 async def upload_image(
     ctx: Context,
-    image: Annotated[str, Field(pattern=r"^(https?://|/)")],
+    image: Annotated[str, AfterValidator(_validate_image_param)],
 ) -> str:
     """Re-host an image to a server URL for use in other tools.
 
