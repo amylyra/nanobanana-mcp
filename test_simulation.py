@@ -1674,6 +1674,18 @@ class TestUploadSnippetsByEnvironment:
         assert "/mnt/user-data/uploads" in snippet
         assert "urllib.request" in snippet
 
+    def test_urllib_snippet_also_targets_cowork_session_path(self):
+        """The auto-discovery snippet must include Cowork's per-session uploads
+        directory under ~/Library/Application Support/Claude/local-agent-mode-sessions/."""
+        snippet = server._urllib_snippet()
+        assert "local-agent-mode-sessions" in snippet, (
+            "snippet must look in Cowork's session uploads directory"
+        )
+        assert "glob" in snippet, "snippet must glob for the active Cowork session folder"
+        # Both candidates present so one snippet works in either env
+        assert "/mnt/user-data/uploads" in snippet
+        assert "candidates" in snippet
+
     @pytest.mark.asyncio
     async def test_data_uri_error_includes_both_environment_snippets(self):
         """The data-URI rejection should show both web (urllib) and Claude Code (curl)

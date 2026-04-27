@@ -67,19 +67,20 @@ The upload path depends on **where the MCP is running** and **where the file liv
 
 | Environment | Tool | File source | Path |
 |---|---|---|---|
-| claude.ai web (co-work) | Python | `/mnt/user-data/uploads/` | urllib POST snippet → `/upload` |
+| claude.ai web | Python | `/mnt/user-data/uploads/` | urllib POST snippet → `/upload` |
+| Claude Cowork (Mac) | Python | `~/Library/Application Support/Claude/local-agent-mode-sessions/<session>/uploads/` | same urllib snippet → `/upload` (auto-discovers folder) |
 | Claude Code (CLI) — remote MCP | Bash | user's real filesystem | `curl --data-binary "@/path"` → `/upload` |
 | Claude Code (CLI) — local stdio MCP | n/a | user's real filesystem | `upload_image(image='/path')` reads it server-side |
 | Any | n/a | n/a | `{PUBLIC_URL}/upload` (manual) or `{PUBLIC_URL}/app` (full UI) |
 
 Helpers in `server.py`:
 
-- `_urllib_snippet()` — claude.ai web Python snippet. Reads most recent files from `/mnt/user-data/uploads/`.
+- `_urllib_snippet()` — Python snippet for claude.ai web AND Claude Cowork. Auto-discovers the uploads folder by trying `/mnt/user-data/uploads`, then the most recently modified `~/Library/Application Support/Claude/local-agent-mode-sessions/*/uploads`. One snippet works in both environments.
 - `_claude_code_snippet(path=...)` — Claude Code Bash curl one-liner. Substitutes the user-provided path when available so the agent runs it verbatim.
 
 Both are returned together in `upload_image` data-URI / not-found errors so the agent picks the one matching its environment.
 
-Most "stuck" uploads come from picking the wrong path (e.g. running the Python snippet under Bash, or expecting Cloud Run to see a `/Users/...` path).
+Most "stuck" uploads come from picking the wrong path (e.g. running the Python snippet under Bash, or expecting Cloud Run to see a `/Users/...` path). Adding new Cowork platforms (Windows/Linux) means appending more glob patterns to `_urllib_snippet`'s `candidates` list — keep the order: most-specific path first.
 
 ## Runtime requirements
 
