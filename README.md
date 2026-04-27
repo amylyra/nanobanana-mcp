@@ -6,42 +6,45 @@ A production MCP server for image generation, editing, and analysis in Claude, p
 
 ---
 
-## What works ✓
+## What works
 
 | Feature | Status |
 |---|---|
-| Generate images from text | ✓ Working |
-| Edit images (inpaint, outpaint, remove objects) | ✓ Working |
-| Swap backgrounds | ✓ Working |
-| Create variations | ✓ Working |
-| Analyze / compare images | ✓ Working |
-| Upload pasted images (urllib POST flow) | ✓ Working |
-| Upload via drag-drop at `/upload` | ✓ Working |
-| Image thumbnails in tool pane | ✓ Working |
-| S3 durable image storage | ✓ Working |
+| Generate images from text | Working |
+| Edit images (inpaint, outpaint, remove objects) | Working |
+| Swap backgrounds | Working |
+| Create variations | Working |
+| Analyze / compare images | Working |
+| Upload pasted images (urllib POST flow) | Working |
+| Upload via drag-drop at `/upload` | Working |
+| Image thumbnails in tool pane (1024px) | Working |
+| S3 durable image storage | Working |
+| Web app at `/app` (no MCP needed) | Working |
+| REST API (`/api/generate`, `/api/edit`, etc.) | Working |
 
-## Known limitations ✗
+## Known limitations
 
 | Issue | Detail |
 |---|---|
-| Claude chat inline images | claude.ai shows **"Show Image"** click-to-reveal boxes instead of true inline rendering. Tool pane previews are reliable; chat reply images require a click. This is a claude.ai client-side consent gate — not fixable from the server. |
-| Python snippet run as bash | When Claude runs the urllib upload snippet via the bash tool (instead of the Python code tool), it fails with an ImageMagick error. Claude recovers by retrying as `python3` — two steps instead of one. |
+| Claude chat inline images | claude.ai shows "Show Image" click-to-reveal boxes instead of true inline rendering. Tool pane previews are reliable; chat reply images require a click. This is a claude.ai client-side consent gate — not fixable from the server. |
+| Python snippet run as bash | When Claude runs the urllib upload snippet via the bash tool (instead of the Python code tool), it fails with `/bin/sh: Bad for loop variable`. Server instructions explicitly say "use the Python tool, NOT bash" and explain the symptom. Claude usually recovers on second try. |
+| Sandbox 503s | claude.ai's sandbox sometimes cannot reach Cloud Run (transient). The urllib snippet retries 3 times with exponential backoff. If all fail, the user is directed to `/upload` or `/app`. |
 
 ---
 
 ## How image input works
 
-All tool parameters accept `http://https://` URLs only. Three paths to get images in:
+All tool parameters accept `http/https` URLs only. Paths to get images in:
 
 ### Path 1 — You already have a URL
 Pass it directly to any tool. Google Drive share links are auto-rewritten.
 
 ### Path 2 — Pasted image in claude.ai web (primary path)
 
-Claude runs this Python snippet automatically using the Python code tool:
+Claude runs this Python snippet using the Python code tool (not bash):
 
 ```python
-import urllib.request, json, os
+import urllib.request, json, os, time
 
 SERVER = 'https://nanobanana-739905005785.us-central1.run.app'
 uploads = '/mnt/user-data/uploads'
@@ -52,16 +55,22 @@ files = sorted(
 )[:4]
 
 for i, fname in enumerate(files):
-    with open(os.path.join(uploads, fname), 'rb') as f:
-        data = f.read()
+    with open(os.path.join(uploads, fname), 'rb') as fh:
+        data = fh.read()
     req = urllib.request.Request(f'{SERVER}/upload', data=data, method='POST')
-    result = json.loads(urllib.request.urlopen(req, timeout=30).read())
-    print(f'image{i}: {result["url"]}')
+    for attempt in range(3):
+        try:
+            result = json.loads(urllib.request.urlopen(req, timeout=30).read())
+            print(f'image{i}: {result["url"]}')
+            break
+        except Exception as e:
+            if attempt < 2: time.sleep(2 ** attempt)
+            else: print(f'image{i}: FAILED after 3 attempts: {e}. Upload manually at {SERVER}/upload')
 ```
 
-This POSTs raw bytes to `/upload`, which normalizes via PIL, uploads to S3, and returns a durable URL.
+This POSTs raw bytes to `/upload`, which normalizes via PIL, uploads to S3, and returns a durable URL. The snippet retries up to 3 times with exponential backoff for transient 503s.
 
-**Never encode to base64/data URI.** Passing large data URIs as MCP parameters hangs the transport layer before the server can reject them. The server's `Field(pattern=r"^(https?://|/)")` constraint blocks data URIs client-side.
+**Never encode to base64/data URI.** Passing large data URIs as MCP parameters hangs the transport layer before the server can reject them. `upload_image` has no Pydantic constraints so its error handler can fire and return the urllib snippet inline.
 
 ### Path 3 — Local file (Claude Code)
 
@@ -73,17 +82,20 @@ upload_image(image='/full/path/to/file.jpg')
 
 Open `https://nanobanana-739905005785.us-central1.run.app/upload`, drag-and-drop, paste returned URL.
 
+### Path 5 — Web app (no MCP needed)
+
+Open `https://nanobanana-739905005785.us-central1.run.app/app` for a full UI with upload, generate, edit, swap background, variations, and inline results with download buttons.
+
 ---
 
 ## Why Claude sometimes needs two tries to upload
 
 When a pasted image is in `/mnt/user-data/uploads/`:
 
-1. Claude calls `upload_image(image="data:image/...")` → pattern blocks it (Pydantic, cryptic error)
-2. Claude tries `upload_image(image="/mnt/user-data/uploads/file.jpg")` → pattern accepts, but path doesn't exist on Cloud Run → error response includes **full urllib snippet inline**
-3. Claude runs the urllib snippet → `/upload` receives raw bytes → S3 URL returned → success
+1. Claude calls `upload_image(image="data:image/...")` → function body detects data URI, returns error with urllib snippet inline
+2. Claude runs the urllib snippet → `/upload` receives raw bytes → S3 URL returned → success
 
-The "not a local file" error now includes the urllib snippet directly so Claude doesn't have to search server instructions for it.
+The data URI error response includes the full urllib snippet directly so Claude doesn't have to search server instructions for it. The `upload_image` parameter has no Pydantic constraints (no `pattern`, no `max_length`) specifically so the error handler can fire and guide recovery.
 
 ---
 
@@ -115,13 +127,29 @@ The "not a local file" error now includes the urllib snippet directly so Claude 
 
 ## Output format
 
-Image tools return three things in every response:
+Image tools return content blocks in this order:
 
-- `chat_response_template` — markdown image links for Claude's reply (`![](https://...)`)
-- `json_str` — structured metadata (`image_url`, `size_kb`, `width`, `height`) for tool chaining
-- `ImageContent` — inline thumbnail previews for the tool pane
+1. `ImageContent` — 1024px JPEG thumbnails visible in the tool pane
+2. `render_md` — markdown image embeds (`![](url)`) + `[Download image](url)` links
+3. `json_str` — JSON metadata (`image_url`, `size_kb`) for tool chaining
 
-To chain a generated image into another tool, use `image_url` from the JSON section.
+To chain a generated image into another tool, use `image_url` from the JSON metadata.
+
+---
+
+## REST API
+
+The server also exposes JSON REST endpoints (with CORS) for the web app and programmatic use:
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/upload` | POST | Upload raw image bytes, get back a URL |
+| `/api/generate` | POST | Generate images from a prompt |
+| `/api/edit` | POST | Edit an image with a prompt |
+| `/api/swap-background` | POST | Swap an image's background |
+| `/api/variations` | POST | Create variations of an image |
+| `/api/styles` | GET | List available style presets |
+| `/app` | GET | Full web UI (NanoBanana Studio) |
 
 ---
 
@@ -140,7 +168,7 @@ export GEMINI_API_KEY="your-key"
 python server.py
 ```
 
-Endpoints: `http://localhost:8080/mcp` (MCP), `http://localhost:8080/upload` (upload page)
+Endpoints: `http://localhost:8080/mcp` (MCP), `http://localhost:8080/upload` (upload page), `http://localhost:8080/app` (web UI)
 
 ### Cloud Run deployment
 
@@ -182,17 +210,7 @@ REQUIRE_DURABLE_UPLOADS=true
 python -m pytest test_simulation.py -x -q
 ```
 
-212 tests. Run before every deploy.
-
----
-
-## Key learnings about claude.ai + MCP
-
-- **Data URI transport hang**: Large JSON bodies in MCP HTTP POST requests cause the claude.ai transport to hang indefinitely. The server never sees the request — it dies in transit. Fix: `Field(pattern=r"^(https?://|/)")` rejects data URIs client-side (Pydantic) before the body is sent.
-- **Error-driven recovery is more reliable than pre-flight instructions**: Claude ignores upfront instructions but reliably reads tool error responses. Putting the urllib snippet in the error message that Claude actually receives is what makes the flow work.
-- **Python code tool vs bash**: Claude sometimes picks the bash tool to run Python snippets. Bash interprets `import` as the ImageMagick `import` binary. Claude recovers by retrying as `python3`. No fix yet — acceptable two-step behavior.
-- **`/mnt/user-data/uploads/`**: Where claude.ai stores pasted/dropped files, accessible via the Python code tool.
-- **`min-instances=1`**: Required for Cloud Run — cold starts cause 503 on the urllib upload path.
+225 tests. Run before every deploy.
 
 ---
 

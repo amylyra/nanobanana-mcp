@@ -6,6 +6,7 @@ Use this runbook when users report:
 - "Upload is stuck forever"
 - "Image generated but not visible in Claude reply"
 - "Tool returned URL but chain step fails"
+- "Bad for loop variable" errors
 
 ---
 
@@ -14,9 +15,10 @@ Use this runbook when users report:
 ### Typical causes
 
 1. Client tried unsupported upload path (for example curl/wget in blocked sandbox).
-2. `PUBLIC_URL` misconfigured (wrong service URL or old deployment URL).
-3. `/upload` endpoint reachable internally but not publicly.
-4. Returned URL points to expiring in-memory store and object expired before reuse.
+2. Claude passed a data URI which hangs MCP transport before the server sees it.
+3. Claude ran the urllib snippet in bash instead of the Python tool.
+4. `PUBLIC_URL` misconfigured (wrong service URL or old deployment URL).
+5. Returned URL points to expiring in-memory store and object expired before reuse.
 
 ### Fast checks
 
@@ -31,39 +33,55 @@ Use this runbook when users report:
 ### Fixes
 
 - Set exact Cloud Run URL in `PUBLIC_URL`.
-- Prefer data URI -> `upload_image` flow for pasted/local images.
+- **Never use data URIs** — they hang MCP transport. Use the urllib POST snippet or `/upload` page.
 - Configure `S3_BUCKET` or `GCS_BUCKET` for durable URLs.
+- Direct users to `{PUBLIC_URL}/app` for a web UI that bypasses MCP entirely.
 
 ---
 
-## 2) Claude response does not show inline image
+## 2) "Bad for loop variable" / bash errors
 
-### Expected behavior today
+### Cause
 
-- Tool pane should show image previews (from `ImageContent`).
-- Chat reply may show markdown links with **"Show Image"** gate instead of immediate inline display.
+Claude ran the Python urllib snippet using the bash/shell tool instead of the Python code execution tool. Bash interprets `import` as the ImageMagick binary and fails on Python `for` syntax.
 
-This is currently client behavior; server can strongly encourage but not force chat-surface rendering.
+### Fix
+
+Server instructions explicitly say "use the **Python** tool (NOT bash, NOT shell — Python only, or it will fail with 'Bad for loop variable')". Claude usually recovers on the next attempt by using `python3`.
+
+If it keeps failing, direct the user to `{PUBLIC_URL}/upload` or `{PUBLIC_URL}/app`.
+
+---
+
+## 3) Claude response does not show inline image
+
+### Expected behavior
+
+- Tool pane shows image previews (1024px `ImageContent` thumbnails).
+- Chat reply may show markdown links with "Show Image" gate instead of immediate inline display.
+- Claude creates downloadable image artifacts (JPG) in the Artifacts panel.
+
+This is claude.ai client behavior; the server can encourage but not force chat-surface rendering.
 
 ### Fast checks
 
 1. Confirm tool output contains `render_md` + `image_url`.
 2. Confirm URL is publicly accessible and returns actual image bytes.
-3. Confirm at least one `ImageContent` preview is present in tool result pane.
+3. Confirm at least one `ImageContent` preview is present in tool result.
 
-### Mitigation strategy
+### Mitigation
 
-- Keep returning `ImageContent` previews for guaranteed visual result.
-- Also return `render_md` first so Claude can copy into reply when possible.
-- Set user expectation in docs/UI that chat may require click-to-reveal.
+- `ImageContent` thumbnails (first in response) provide guaranteed visual result in tool pane.
+- `render_md` with `![](url)` and `[Download image](url)` follows for Claude's chat reply.
+- Server instructions tell Claude to always include both embed and download link in chat.
 
 ---
 
-## 3) Generated URL works once, then fails in follow-up
+## 4) Generated URL works once, then fails in follow-up
 
 ### Cause
 
-Using local `/images/{id}` storage without cloud backing can expire or be evicted.
+Using local `/images/{id}` storage without cloud backing — images can expire or be evicted.
 
 ### Fix
 
@@ -72,10 +90,10 @@ Using local `/images/{id}` storage without cloud backing can expire or be evicte
 
 ---
 
-## 4) Recommended production baseline
+## 5) Recommended production baseline
 
 1. `PUBLIC_URL` set correctly.
 2. `S3_BUCKET` configured (preferred) for durable assets.
-3. Keep current mixed output contract: `[render_md, json_str, ImageContent...]`.
-4. Document Claude chat rendering limitation prominently.
-
+3. `--min-instances=1` on Cloud Run to prevent cold-start 503s.
+4. Tool response order: `[ImageContent..., render_md, json_str]`.
+5. Document Claude chat rendering limitation prominently.
