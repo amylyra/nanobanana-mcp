@@ -39,33 +39,43 @@ All tool parameters accept `http/https` URLs only. Paths to get images in:
 ### Path 1 — You already have a URL
 Pass it directly to any tool. Google Drive share links are auto-rewritten.
 
-### Path 2 — Pasted image in claude.ai web (primary path)
+### Path 2 — Pasted image in claude.ai web OR Claude Cowork (primary path)
 
-Claude runs this Python snippet using the Python code tool (not bash):
+Claude runs this Python snippet using the Python code tool (not bash). The snippet auto-discovers the uploads folder:
+
+- claude.ai web sandbox: `/mnt/user-data/uploads/`
+- Claude Cowork (Mac): `~/Library/Application Support/Claude/local-agent-mode-sessions/<session>/uploads/`
 
 ```python
-import urllib.request, json, os, time
+import urllib.request, json, os, time, glob
 
 SERVER = 'https://nanobanana-739905005785.us-central1.run.app'
-uploads = '/mnt/user-data/uploads'
 
-files = sorted(
-    [f for f in os.listdir(uploads) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))],
-    key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True
-)[:4]
+candidates = ['/mnt/user-data/uploads'] + sorted(
+    glob.glob(os.path.expanduser('~/Library/Application Support/Claude/local-agent-mode-sessions/*/uploads')),
+    key=os.path.getmtime, reverse=True
+)
+uploads = next((p for p in candidates if os.path.isdir(p)), None)
 
-for i, fname in enumerate(files):
-    with open(os.path.join(uploads, fname), 'rb') as fh:
-        data = fh.read()
-    req = urllib.request.Request(f'{SERVER}/upload', data=data, method='POST')
-    for attempt in range(3):
-        try:
-            result = json.loads(urllib.request.urlopen(req, timeout=30).read())
-            print(f'image{i}: {result["url"]}')
-            break
-        except Exception as e:
-            if attempt < 2: time.sleep(2 ** attempt)
-            else: print(f'image{i}: FAILED after 3 attempts: {e}. Upload manually at {SERVER}/upload')
+if not uploads:
+    print(f'No uploads folder found. Upload manually at {SERVER}/upload')
+else:
+    files = sorted(
+        [f for f in os.listdir(uploads) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))],
+        key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True
+    )[:4]
+    for i, fname in enumerate(files):
+        with open(os.path.join(uploads, fname), 'rb') as fh:
+            data = fh.read()
+        req = urllib.request.Request(f'{SERVER}/upload', data=data, method='POST')
+        for attempt in range(3):
+            try:
+                result = json.loads(urllib.request.urlopen(req, timeout=30).read())
+                print(f'image{i}: {result["url"]}')
+                break
+            except Exception as e:
+                if attempt < 2: time.sleep(2 ** attempt)
+                else: print(f'image{i}: FAILED after 3 attempts: {e}. Upload manually at {SERVER}/upload')
 ```
 
 This POSTs raw bytes to `/upload`, which normalizes via PIL, uploads to S3, and returns a durable URL. The snippet retries up to 3 times with exponential backoff for transient 503s.
@@ -104,7 +114,7 @@ Open `https://nanobanana-739905005785.us-central1.run.app/app` for a full UI wit
 
 ## Why Claude sometimes needs two tries to upload
 
-When a pasted image is in `/mnt/user-data/uploads/`:
+When a pasted image is in `/mnt/user-data/uploads/` or the Cowork session uploads folder:
 
 1. Claude calls `upload_image(image="data:image/...")` → function body detects data URI, returns error with urllib snippet inline
 2. Claude runs the urllib snippet → `/upload` receives raw bytes → S3 URL returned → success

@@ -212,24 +212,33 @@ mcp = FastMCP(
         "1. **Direct URL (http/https, S3, CDN)** → pass straight to the tool.\n"
         "2. **Public Google Drive link** → pass straight to the tool (auto-rewritten).\n\n"
         "### Pasted / dragged image — pick the path for YOUR environment\n\n"
-        "**A. claude.ai web (Claude co-work) — Python tool, files in /mnt/user-data/uploads/**\n\n"
-        "Run this with the **Python** tool (NOT bash/shell — fails with 'Bad for loop variable'):\n\n"
+        "**A. claude.ai web OR Claude Cowork — Python tool (auto-discovers uploads folder)**\n\n"
+        "Works for both claude.ai web (`/mnt/user-data/uploads/`) and Cowork "
+        "(`~/Library/Application Support/Claude/local-agent-mode-sessions/<session>/uploads/`). "
+        "Run with the **Python** tool (NOT bash/shell — fails with 'Bad for loop variable'):\n\n"
         "```python\n"
-        "import urllib.request, json, os, time\n"
-        "uploads = '/mnt/user-data/uploads'\n"
-        "files = sorted([f for f in os.listdir(uploads) if f.lower().endswith(('.png','.jpg','.jpeg','.webp'))],\n"
-        "               key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True)[:4]\n"
-        "for i, fname in enumerate(files):\n"
-        "    with open(os.path.join(uploads, fname), 'rb') as fh: data = fh.read()\n"
-        "    req = urllib.request.Request('{upload_url}/upload', data=data, method='POST')\n"
-        "    for attempt in range(3):\n"
-        "        try:\n"
-        "            result = json.loads(urllib.request.urlopen(req, timeout=30).read())\n"
-        "            print(f'image{{i}}: {{result[\"url\"]}}')\n"
-        "            break\n"
-        "        except Exception as e:\n"
-        "            if attempt < 2: time.sleep(2 ** attempt)\n"
-        "            else: print(f'image{{i}}: FAILED after 3 attempts: {{e}}. Upload manually at {upload_url}/upload')\n"
+        "import urllib.request, json, os, time, glob\n"
+        "SERVER = '{upload_url}'\n"
+        "candidates = ['/mnt/user-data/uploads'] + sorted(\n"
+        "    glob.glob(os.path.expanduser('~/Library/Application Support/Claude/local-agent-mode-sessions/*/uploads')),\n"
+        "    key=os.path.getmtime, reverse=True)\n"
+        "uploads = next((p for p in candidates if os.path.isdir(p)), None)\n"
+        "if not uploads:\n"
+        "    print(f'No uploads folder found. Upload manually at {{SERVER}}/upload')\n"
+        "else:\n"
+        "    files = sorted([f for f in os.listdir(uploads) if f.lower().endswith(('.png','.jpg','.jpeg','.webp'))],\n"
+        "                   key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True)[:4]\n"
+        "    for i, fname in enumerate(files):\n"
+        "        with open(os.path.join(uploads, fname), 'rb') as fh: data = fh.read()\n"
+        "        req = urllib.request.Request(f'{{SERVER}}/upload', data=data, method='POST')\n"
+        "        for attempt in range(3):\n"
+        "            try:\n"
+        "                result = json.loads(urllib.request.urlopen(req, timeout=30).read())\n"
+        "                print(f'image{{i}}: {{result[\"url\"]}}')\n"
+        "                break\n"
+        "            except Exception as e:\n"
+        "                if attempt < 2: time.sleep(2 ** attempt)\n"
+        "                else: print(f'image{{i}}: FAILED after 3 attempts: {{e}}. Upload manually at {{SERVER}}/upload')\n"
         "```\n\n"
         "**B. Claude Code (CLI) — Bash tool, real local filesystem**\n\n"
         "If the user gives you a real path on their machine, just upload it via curl:\n\n"
@@ -1736,29 +1745,41 @@ def _score_image(client, img_bytes: bytes, prompt: str) -> dict:
 # Tools
 # ---------------------------------------------------------------------------
 def _urllib_snippet() -> str:
-    """Upload snippet for **claude.ai web** (Python tool, /mnt/user-data/uploads/).
+    """Upload snippet for **claude.ai web AND Claude Cowork** (Python tool).
 
-    Reads the most recent images from the sandbox uploads dir and POSTs raw bytes
-    to /upload. Has no access to the user's real filesystem — that's Claude Code's
-    job (see `_claude_code_snippet`).
+    Auto-discovers the uploads folder by trying known paths in order:
+      1. /mnt/user-data/uploads — claude.ai web sandbox
+      2. ~/Library/Application Support/Claude/local-agent-mode-sessions/<session>/uploads
+         — Claude Cowork (Mac); picks the most recently modified session.
+
+    Falls back to a manual-upload message if neither is found. Has no access to
+    arbitrary user filesystem paths — that's Claude Code's job (see
+    `_claude_code_snippet`).
     """
     server_url = _BASE_URL
     return (
-        "import urllib.request, json, os, time\n"
-        "uploads = '/mnt/user-data/uploads'\n"
-        "files = sorted([f for f in os.listdir(uploads) if f.lower().endswith(('.png','.jpg','.jpeg','.webp'))], "
-        "key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True)[:4]\n"
-        "for i, fname in enumerate(files):\n"
-        "    with open(os.path.join(uploads, fname), 'rb') as fh: data = fh.read()\n"
-        f"    req = urllib.request.Request('{server_url}/upload', data=data, method='POST')\n"
-        "    for attempt in range(3):\n"
-        "        try:\n"
-        "            result = json.loads(urllib.request.urlopen(req, timeout=30).read())\n"
-        "            print(f'image{i}: {result[\"url\"]}')\n"
-        "            break\n"
-        "        except Exception as e:\n"
-        "            if attempt < 2: time.sleep(2 ** attempt)\n"
-        f"            else: print(f'image{{i}}: FAILED after 3 attempts: {{e}}. Upload manually at {server_url}/upload')\n"
+        "import urllib.request, json, os, time, glob\n"
+        f"SERVER = '{server_url}'\n"
+        "candidates = ['/mnt/user-data/uploads'] + sorted(\n"
+        "    glob.glob(os.path.expanduser('~/Library/Application Support/Claude/local-agent-mode-sessions/*/uploads')),\n"
+        "    key=os.path.getmtime, reverse=True)\n"
+        "uploads = next((p for p in candidates if os.path.isdir(p)), None)\n"
+        "if not uploads:\n"
+        "    print(f'No uploads folder found. Upload manually at {SERVER}/upload')\n"
+        "else:\n"
+        "    files = sorted([f for f in os.listdir(uploads) if f.lower().endswith(('.png','.jpg','.jpeg','.webp'))],\n"
+        "                   key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True)[:4]\n"
+        "    for i, fname in enumerate(files):\n"
+        "        with open(os.path.join(uploads, fname), 'rb') as fh: data = fh.read()\n"
+        "        req = urllib.request.Request(f'{SERVER}/upload', data=data, method='POST')\n"
+        "        for attempt in range(3):\n"
+        "            try:\n"
+        "                result = json.loads(urllib.request.urlopen(req, timeout=30).read())\n"
+        "                print(f'image{i}: {result[\"url\"]}')\n"
+        "                break\n"
+        "            except Exception as e:\n"
+        "                if attempt < 2: time.sleep(2 ** attempt)\n"
+        "                else: print(f'image{i}: FAILED after 3 attempts: {e}. Upload manually at {SERVER}/upload')\n"
     )
 
 
@@ -1804,8 +1825,9 @@ async def upload_image(
     regardless of size. Use one of the upload paths below instead.
 
     Pick the path for your environment:
-    - **claude.ai web (co-work):** Python tool + /mnt/user-data/uploads/ + the
-      urllib snippet from server instructions.
+    - **claude.ai web OR Claude Cowork:** Python tool + the auto-discovering urllib
+      snippet from server instructions (handles both /mnt/user-data/uploads/ and
+      ~/Library/Application Support/Claude/local-agent-mode-sessions/<session>/uploads/).
     - **Claude Code (CLI):** Bash tool + curl --data-binary "@/path" to /upload.
     - **Local stdio MCP:** call this tool with the file path directly:
         upload_image(image='/full/path/to/file.jpg')
@@ -1840,13 +1862,13 @@ async def upload_image(
         return _upload_error(
             "upload_image does NOT accept data URIs. Do NOT re-encode at lower quality and retry.\n\n"
             "Pick the option for your environment:\n\n"
-            "**A. claude.ai web (co-work) — run this with the Python tool (NOT bash):**\n\n"
+            "**A. claude.ai web OR Claude Cowork — run this with the Python tool (NOT bash):**\n\n"
             f"{_urllib_snippet()}\n"
             "**B. Claude Code (CLI) — run this with the Bash tool:**\n\n"
             f"{_claude_code_snippet(cc_path)}\n\n"
             f"**C. Manual upload:** {upload_endpoint}  •  **Full web app:** {webapp_url}",
             next_step=(
-                "claude.ai web → run snippet A with the Python tool. "
+                "claude.ai web / Cowork → run snippet A with the Python tool. "
                 "Claude Code → run snippet B with the Bash tool. "
                 f"Or send the user to {upload_endpoint} (drag-drop) or {webapp_url} (full UI)."
             ),
@@ -1857,13 +1879,13 @@ async def upload_image(
             "The path you provided does not exist on this server "
             "(this is normal when the MCP runs remotely — the server can't see your local filesystem).\n\n"
             "Pick the option for your environment:\n\n"
-            "**A. claude.ai web (co-work) — run this with the Python tool (NOT bash):**\n\n"
+            "**A. claude.ai web OR Claude Cowork — run this with the Python tool (NOT bash):**\n\n"
             f"{_urllib_snippet()}\n"
             "**B. Claude Code (CLI) — run this with the Bash tool:**\n\n"
             f"{_claude_code_snippet(cc_path)}\n\n"
             f"**C. Manual upload:** {upload_endpoint}  •  **Full web app:** {webapp_url}",
             next_step=(
-                "claude.ai web → run snippet A with the Python tool. "
+                "claude.ai web / Cowork → run snippet A with the Python tool. "
                 "Claude Code → run snippet B with the Bash tool. "
                 f"Or send the user to {upload_endpoint} (drag-drop) or {webapp_url} (full UI)."
             ),
@@ -2705,9 +2727,10 @@ def handle_image() -> str:
         "The user wants to use an image with NanoBanana tools but doesn't have a URL for it. "
         "Here's how to get one:\n\n"
         "**Pasted/local image (use urllib POST — do NOT encode to data URI)**\n"
-        "In claude.ai, pasted images are saved to `/mnt/user-data/uploads`. "
-        "Use the urllib POST snippet from server instructions to upload the raw file bytes "
-        "to /upload and get back a URL. NEVER encode to base64/data URI — it hangs the transport.\n\n"
+        "Pasted images are saved to `/mnt/user-data/uploads/` (claude.ai web) or "
+        "`~/Library/Application Support/Claude/local-agent-mode-sessions/<session>/uploads/` (Cowork). "
+        "The urllib POST snippet from server instructions auto-discovers either location and uploads "
+        "the raw bytes to /upload to get back a URL. NEVER encode to base64/data URI — it hangs the transport.\n\n"
         "**Manual fallback**\n"
         f"Direct the user to upload manually:\n\n"
         f"> Please upload your image at: **{upload_url}/upload**\n"
