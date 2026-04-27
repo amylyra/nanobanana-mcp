@@ -72,17 +72,31 @@ This POSTs raw bytes to `/upload`, which normalizes via PIL, uploads to S3, and 
 
 **Never encode to base64/data URI.** Passing large data URIs as MCP parameters hangs the transport layer before the server can reject them. `upload_image` has no Pydantic constraints so its error handler can fire and return the urllib snippet inline.
 
-### Path 3 — Local file (Claude Code)
+### Path 3 — Claude Code (CLI) with the remote MCP
+
+The remote Cloud Run server can't read your local filesystem, so Claude Code uploads the file via curl using the Bash tool:
+
+```bash
+curl -fsS -X POST --data-binary "@/full/path/to/image.jpg" \
+  "https://nanobanana-739905005785.us-central1.run.app/upload" \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('url') or d)"
+```
+
+The returned URL goes straight into any other tool. `upload_image` returns this snippet inline whenever a path doesn't resolve on the server, so the agent can copy-run it.
+
+### Path 4 — Local stdio MCP (any client)
+
+When the MCP runs locally as a stdio subprocess (not Cloud Run), the server *can* read the user's filesystem, so the direct path works:
 
 ```python
 upload_image(image='/full/path/to/file.jpg')
 ```
 
-### Path 4 — Manual upload page
+### Path 5 — Manual upload page
 
 Open `https://nanobanana-739905005785.us-central1.run.app/upload`, drag-and-drop, paste returned URL.
 
-### Path 5 — Web app (no MCP needed)
+### Path 6 — Web app (no MCP needed)
 
 Open `https://nanobanana-739905005785.us-central1.run.app/app` for a full UI with upload, generate, edit, swap background, variations, and inline results with download buttons.
 

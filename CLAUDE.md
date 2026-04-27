@@ -27,23 +27,44 @@ gcloud run services list
 - Tool pane inline rendering is reliable.
 - Claude chat reply inline rendering is not guaranteed (consent gating). Download links are the reliable fallback.
 
+## Intake before generate_image
+
+The agent must confirm `aspect_ratio` and `resolution` with the user before calling `generate_image` when they haven't already specified one. Single-message intake:
+
+- Aspect ratio: `1:1, 2:3, 3:2, 3:4, 4:3, 4:5 (default), 5:4, 9:16, 16:9, 21:9`
+- Resolution: `1K (default), 2K, 4K`
+
+Lives in two places — both must stay aligned:
+- Server `instructions` block (`## Intake before generate_image — REQUIRED`)
+- `generate_image` docstring (`INTAKE REQUIRED:` paragraph + per-arg notes)
+
+Skip cases (no intake needed): user already named a ratio/resolution; re-generating at known settings; chaining from another tool with fixed values; calling `edit_image`, `swap_background`, or `create_variations` (they default to source-image shape).
+
 ## Upload constraints
 
 - `upload_image` has **no** Pydantic constraints (no `pattern`, no `max_length`) — this is intentional so the data URI and invalid-path error handlers can fire and return the urllib recovery snippet.
 - All other image params (`edit_image`, `swap_background`, `create_variations`, `analyze_image`) use `Field(max_length=2048)` to block oversized payloads before the function body.
 - **Never encode to base64/data URI** — passing large data URIs as MCP parameters hangs the transport before the server can reject them.
 
-## Why uploads look "stuck"
+## Upload paths by environment
 
-Most failures are from unsupported upload paths in client sandboxes (for example, trying curl/wget to inaccessible endpoints).
+The upload path depends on **where the MCP is running** and **where the file lives**. The remote Cloud Run server can't read the user's local filesystem, so each client has its own snippet.
 
-Preferred sequence:
+| Environment | Tool | File source | Path |
+|---|---|---|---|
+| claude.ai web (co-work) | Python | `/mnt/user-data/uploads/` | urllib POST snippet → `/upload` |
+| Claude Code (CLI) — remote MCP | Bash | user's real filesystem | `curl --data-binary "@/path"` → `/upload` |
+| Claude Code (CLI) — local stdio MCP | n/a | user's real filesystem | `upload_image(image='/path')` reads it server-side |
+| Any | n/a | n/a | `{PUBLIC_URL}/upload` (manual) or `{PUBLIC_URL}/app` (full UI) |
 
-1. URL already available → pass directly to the tool.
-2. Pasted/local image in claude.ai web → run the urllib POST snippet (reads `/mnt/user-data/uploads/`, POSTs raw bytes to `/upload`, gets back a URL).
-3. Local file in Claude Code → `upload_image(image='/full/path/to/file.jpg')`.
-4. Manual fallback → open `{PUBLIC_URL}/upload` and drag-drop.
-5. Full web app → `{PUBLIC_URL}/app` for upload + generate/edit/swap/variations in one UI.
+Helpers in `server.py`:
+
+- `_urllib_snippet()` — claude.ai web Python snippet. Reads most recent files from `/mnt/user-data/uploads/`.
+- `_claude_code_snippet(path=...)` — Claude Code Bash curl one-liner. Substitutes the user-provided path when available so the agent runs it verbatim.
+
+Both are returned together in `upload_image` data-URI / not-found errors so the agent picks the one matching its environment.
+
+Most "stuck" uploads come from picking the wrong path (e.g. running the Python snippet under Bash, or expecting Cloud Run to see a `/Users/...` path).
 
 ## Runtime requirements
 

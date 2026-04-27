@@ -206,13 +206,14 @@ mcp = FastMCP(
         "## STOP — read before ANY image tool call\n"
         "NEVER pass base64 strings or data: URIs to any tool parameter. "
         "They are too large for MCP transport and WILL hang the connection. "
-        "If the user pastes/drags an image, run the urllib Python snippet below to upload it first.\n\n"
+        "Pick the upload path that matches your environment below.\n\n"
         "## Getting images into tools\n\n"
         "All image tool parameters accept http/https URLs.\n\n"
         "1. **Direct URL (http/https, S3, CDN)** → pass straight to the tool.\n"
-        "2. **Public Google Drive link** → pass straight to the tool (auto-rewritten).\n"
-        "3. **Pasted or local file (claude.ai web)** → run this snippet using the **Python** tool "
-        "(NOT bash, NOT shell — Python only, or it will fail with 'Bad for loop variable'):\n\n"
+        "2. **Public Google Drive link** → pass straight to the tool (auto-rewritten).\n\n"
+        "### Pasted / dragged image — pick the path for YOUR environment\n\n"
+        "**A. claude.ai web (Claude co-work) — Python tool, files in /mnt/user-data/uploads/**\n\n"
+        "Run this with the **Python** tool (NOT bash/shell — fails with 'Bad for loop variable'):\n\n"
         "```python\n"
         "import urllib.request, json, os, time\n"
         "uploads = '/mnt/user-data/uploads'\n"
@@ -229,16 +230,24 @@ mcp = FastMCP(
         "        except Exception as e:\n"
         "            if attempt < 2: time.sleep(2 ** attempt)\n"
         "            else: print(f'image{{i}}: FAILED after 3 attempts: {{e}}. Upload manually at {upload_url}/upload')\n"
-        "```\n"
-        "IMPORTANT: Execute this with the **Python code execution tool**. "
-        "Running it in bash/shell causes 'Bad for loop variable' errors.\n\n"
-        "If the snippet fails (503, network error), do not retry — immediately direct the user to "
-        "upload manually at {upload_url}/upload or use the full web app at {upload_url}/app.\n\n"
+        "```\n\n"
+        "**B. Claude Code (CLI) — Bash tool, real local filesystem**\n\n"
+        "If the user gives you a real path on their machine, just upload it via curl:\n\n"
+        "```bash\n"
+        'curl -fsS -X POST --data-binary "@/full/path/to/image.jpg" \\\n'
+        '  "{upload_url}/upload" \\\n'
+        "  | python3 -c \"import sys,json; d=json.load(sys.stdin); print(d.get('url') or d)\"\n"
+        "```\n\n"
+        "Faster path when this MCP is running locally as a stdio subprocess (the server can read "
+        "the user's filesystem directly): call `upload_image(image='/full/path/to/file.jpg')` and "
+        "the tool will read and re-host the file itself.\n\n"
         "**NEVER encode to base64/data URI** — the upload_image tool rejects them and MCP transport hangs.\n\n"
-        "4. **Local file path (Claude Code only):** `upload_image(image='/full/path/to/file.jpg')`\n"
-        "5. **Manual upload:** direct user to {upload_url}/upload to drag-and-drop.\n"
-        "6. **Full web app (no MCP needed):** {upload_url}/app — upload, generate, edit, swap backgrounds, "
+        "### Fallbacks (any environment)\n"
+        "3. **Manual upload:** direct user to {upload_url}/upload to drag-and-drop.\n"
+        "4. **Full web app (no MCP needed):** {upload_url}/app — upload, generate, edit, swap backgrounds, "
         "create variations, and download results. Best option for a smooth workflow.\n\n"
+        "If a snippet fails (503, network error), do not retry blindly — direct the user to "
+        "{upload_url}/upload or {upload_url}/app.\n\n"
         "Never fabricate URLs. Never start a local HTTP server.\n\n"
         "## Tools\n"
         "- upload_image — re-host an image URL or local file path to a server URL for use in other tools\n"
@@ -260,7 +269,19 @@ mcp = FastMCP(
         "**Multi-object swap** (objects from images B and C into image A): "
         "call edit_image(image=urlA, reference_images=[urlB, urlC], "
         "prompt='replace X with reference image 1 and Y with reference image 2').\n\n"
-        "Default aspect ratio 4:5, resolution 1K.\n\n"
+        "## Intake before generate_image — REQUIRED\n"
+        "Before calling `generate_image`, confirm aspect ratio and resolution with the user "
+        "if they haven't already specified one. Ask once, in a single message:\n\n"
+        "> Before I generate, two quick choices:\n"
+        "> • **Aspect ratio?** 1:1, 2:3, 3:2, 3:4, 4:3, 4:5 (default), 5:4, 9:16, 16:9, 21:9\n"
+        "> • **Resolution?** 1K (default), 2K, 4K\n"
+        ">\n"
+        "> Reply with your picks, or say 'defaults' for 4:5 / 1K.\n\n"
+        "Skip the intake when the user already named a ratio/resolution in the conversation, "
+        "when generating variations of a previously approved image at the same settings, "
+        "or when chaining from another tool that fixed those values. "
+        "`edit_image`, `swap_background`, and `create_variations` default to the source image's "
+        "shape — no intake needed unless the user wants to change it (e.g. outpaint to 16:9).\n\n"
         "## Presenting images to the user — CRITICAL\n"
         "The tool pane shows a small thumbnail. Your chat reply is the user-facing presentation.\n"
         "After every image tool call, your assistant reply MUST:\n"
@@ -1710,7 +1731,12 @@ def _score_image(client, img_bytes: bytes, prompt: str) -> dict:
 # Tools
 # ---------------------------------------------------------------------------
 def _urllib_snippet() -> str:
-    """Return the urllib upload snippet with retries for use in error messages."""
+    """Upload snippet for **claude.ai web** (Python tool, /mnt/user-data/uploads/).
+
+    Reads the most recent images from the sandbox uploads dir and POSTs raw bytes
+    to /upload. Has no access to the user's real filesystem — that's Claude Code's
+    job (see `_claude_code_snippet`).
+    """
     server_url = _BASE_URL
     return (
         "import urllib.request, json, os, time\n"
@@ -1731,6 +1757,24 @@ def _urllib_snippet() -> str:
     )
 
 
+def _claude_code_snippet(path: str | None = None) -> str:
+    """Upload snippet for **Claude Code** (Bash tool, real local filesystem).
+
+    Claude Code has shell access and can read the user's actual files, so curl
+    with --data-binary is the simplest path. When `path` is provided (e.g. the
+    agent already tried `upload_image(image='/Users/me/img.jpg')` and the file
+    doesn't exist on the remote server), it's substituted into the command;
+    otherwise the placeholder /full/path/to/image.jpg is used.
+    """
+    server_url = _BASE_URL
+    target = path if path else "/full/path/to/image.jpg"
+    return (
+        f'curl -fsS -X POST --data-binary "@{target}" \\\n'
+        f'  "{server_url}/upload" \\\n'
+        '  | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get(\'url\') or d)"'
+    )
+
+
 def _upload_error(message: str, next_step: str | None = None) -> str:
     payload = {"error": message, "retryable": False}
     if next_step:
@@ -1747,15 +1791,18 @@ async def upload_image(
 
     Accepts:
     - http/https URLs (including Google Drive share links — auto-rewritten)
-    - local file paths (Claude Code only): `/full/path/to/image.jpg`
+    - local file paths — works only when this MCP runs locally as a stdio
+      subprocess so the server can read the user's filesystem. For a remote
+      MCP (Cloud Run), use the curl snippet below instead.
 
-    **For pasted/dragged images in claude.ai web:** DO NOT pass a data URI here.
-    Use the urllib POST snippet from server instructions instead — it POSTs the raw
-    file bytes to /upload and returns a URL to pass to this or any other tool.
-    Encoding to base64/data URI and passing it as a parameter causes the MCP
-    transport to hang regardless of size. There is no workaround — use urllib POST.
+    DO NOT pass a data URI here. MCP transport hangs on large parameters
+    regardless of size. Use one of the upload paths below instead.
 
-    **For local files (Claude Code):** pass the file path directly:
+    Pick the path for your environment:
+    - **claude.ai web (co-work):** Python tool + /mnt/user-data/uploads/ + the
+      urllib snippet from server instructions.
+    - **Claude Code (CLI):** Bash tool + curl --data-binary "@/path" to /upload.
+    - **Local stdio MCP:** call this tool with the file path directly:
         upload_image(image='/full/path/to/file.jpg')
 
     When cloud storage (S3/GCS) is configured, the returned URL is durable (no expiry).
@@ -1773,31 +1820,48 @@ async def upload_image(
     if (image.startswith('"') and image.endswith('"')) or (image.startswith("'") and image.endswith("'")):
         image = image[1:-1]
 
-    upload_url = f"{_BASE_URL}/upload"
+    upload_endpoint = f"{_BASE_URL}/upload"
+    webapp_url = f"{_BASE_URL}/app"
     is_data_uri = image.startswith("data:")
     is_local_file = (
         not is_data_uri
         and not _is_url(image)
         and os.path.isfile(image)
     )
+    # Pass the user-provided path into the Claude Code snippet when present so
+    # the agent can run the curl command verbatim instead of editing a placeholder.
+    cc_path = image if (not is_data_uri and not _is_url(image)) else None
     if is_data_uri:
         return _upload_error(
             "upload_image does NOT accept data URIs. Do NOT re-encode at lower quality and retry.\n\n"
-            "Option A — run this with the **Python** tool (NOT bash/shell):\n\n"
+            "Pick the option for your environment:\n\n"
+            "**A. claude.ai web (co-work) — run this with the Python tool (NOT bash):**\n\n"
             f"{_urllib_snippet()}\n"
-            f"Option B — direct the user to upload at: {upload_url}/upload\n"
-            f"Option C — use the full web app (no MCP needed): {upload_url}/app",
-            next_step=f"Run the snippet above with the Python tool (not bash). Or direct user to {upload_url}/app",
+            "**B. Claude Code (CLI) — run this with the Bash tool:**\n\n"
+            f"{_claude_code_snippet(cc_path)}\n\n"
+            f"**C. Manual upload:** {upload_endpoint}  •  **Full web app:** {webapp_url}",
+            next_step=(
+                "claude.ai web → run snippet A with the Python tool. "
+                "Claude Code → run snippet B with the Bash tool. "
+                f"Or send the user to {upload_endpoint} (drag-drop) or {webapp_url} (full UI)."
+            ),
         )
     if not _is_url(image) and not is_local_file:
         return _upload_error(
             "upload_image accepts http/https URLs or local file paths only. "
-            "The path you provided does not exist on this server.\n\n"
-            "Option A — run this with the **Python** tool (NOT bash/shell):\n\n"
+            "The path you provided does not exist on this server "
+            "(this is normal when the MCP runs remotely — the server can't see your local filesystem).\n\n"
+            "Pick the option for your environment:\n\n"
+            "**A. claude.ai web (co-work) — run this with the Python tool (NOT bash):**\n\n"
             f"{_urllib_snippet()}\n"
-            f"Option B — direct the user to upload at: {upload_url}/upload\n"
-            f"Option C — use the full web app (no MCP needed): {upload_url}/app",
-            next_step=f"Run the snippet above with the Python tool (not bash). Or direct user to {upload_url}/app",
+            "**B. Claude Code (CLI) — run this with the Bash tool:**\n\n"
+            f"{_claude_code_snippet(cc_path)}\n\n"
+            f"**C. Manual upload:** {upload_endpoint}  •  **Full web app:** {webapp_url}",
+            next_step=(
+                "claude.ai web → run snippet A with the Python tool. "
+                "Claude Code → run snippet B with the Bash tool. "
+                f"Or send the user to {upload_endpoint} (drag-drop) or {webapp_url} (full UI)."
+            ),
         )
 
     try:
@@ -1811,7 +1875,7 @@ async def upload_image(
         else:
             normalized, norm_mime = await _acquire_image(image, ctx, purpose="image")
     except ValueError as e:
-        return _upload_error(str(e), next_step=f"Try /upload: {upload_url}")
+        return _upload_error(str(e), next_step=f"Try /upload: {upload_endpoint}")
     except Exception as e:
         return _upload_error(
             f"Failed to read local image file: {e}",
@@ -1879,14 +1943,22 @@ async def generate_image(
     Reference images guide the model on style, subject appearance, or composition.
     Only pass URLs — use upload_image first if needed.
 
+    INTAKE REQUIRED: Before calling this tool, confirm aspect_ratio and resolution
+    with the user if they haven't already specified one. Ask both in a single
+    message — see the "Intake before generate_image" section in server instructions.
+    Skip the intake only when the user already named a ratio/resolution, when
+    re-generating at known settings, or when chaining from another tool that
+    fixed those values.
+
     Args:
         prompt: What to generate. Describe subject, style, lighting, mood, etc.
         reference_images: Optional list of image URLs. Use upload_image first if needed.
         style: Optional style preset. Available: cinematic, product-photography,
                editorial, watercolor, flat-illustration, neon-noir, minimalist, vintage-film.
         enhance_prompt: If true, AI expands your prompt into a detailed generation prompt.
-        aspect_ratio: Output aspect ratio. Default: 4:5
-        resolution: Output resolution: 1K, 2K, 4K. Default: 1K
+        aspect_ratio: One of 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9.
+                      Default 4:5. Confirm with the user before calling.
+        resolution: 1K, 2K, or 4K. Default 1K. Confirm with the user before calling.
         quality: "default" (fast) or "pro" (higher quality). Default: default
         count: Number of images to generate (1–4). Default: 1
         qa: If true, AI-score each image. When count > 1, ranks by total score.
