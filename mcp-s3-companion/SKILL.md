@@ -96,10 +96,41 @@ Skip the intake only when the user already named values, when re-running at know
 
 ---
 
+## Private Google Drive files (use Drive MCP + raw POST)
+
+For Drive files the user owns but hasn't shared publicly, the auto-rewrite path doesn't work. Fetch the bytes via the Google Drive MCP and POST them to `/upload` directly. **Do NOT pass the bytes to `upload_image` as a data URI — that hangs the MCP transport.**
+
+1. Call the Google Drive MCP to download the file content. It returns base64-encoded bytes.
+2. In the Python code tool, decode the base64 and POST the raw bytes:
+
+```python
+import urllib.request, json, base64
+
+SERVER = 'https://nanobanana-739905005785.us-central1.run.app'
+
+# Paste the base64 string returned by the Google Drive MCP here.
+# If the response includes a `data:image/...;base64,` prefix, the script strips it.
+b64 = '...'
+
+if b64.startswith('data:'):
+    b64 = b64.split(',', 1)[1]
+data = base64.b64decode(b64)
+
+req = urllib.request.Request(f'{SERVER}/upload', data=data, method='POST')
+result = json.loads(urllib.request.urlopen(req, timeout=30).read())
+print(result['url'])
+```
+
+The bytes travel as the HTTP request body (not as an MCP parameter), so transport doesn't hang regardless of size. Use the returned URL with any other tool.
+
+---
+
 ## What not to do
 
-- **Never encode images to base64 or data URI** — causes MCP transport to hang, and upload_image rejects them
-- Don't use curl or wget — blocked in the claude.ai sandbox
-- Don't check image sizes before uploading — the server handles any size
-- Don't start a local HTTP server
-- Don't run the Python snippet in bash/shell — use the Python code tool
+- **Never encode images to base64 or data URI to pass through MCP parameters** — causes MCP transport to hang, and `upload_image` rejects them. (Base64 is fine when it's the HTTP request body, as in the private-Drive flow above.)
+- **Never fabricate or guess URLs** (S3, CDN, image hosts) — if you don't have a real URL from the user or a tool, use one of the upload paths.
+- **Don't pass API endpoints, web pages, or MCP service URLs** as image parameters — they aren't image bytes.
+- Don't use curl or wget — blocked in the claude.ai sandbox.
+- Don't check image sizes before uploading — the server handles any size.
+- Don't start a local HTTP server.
+- Don't run the Python snippet in bash/shell — use the Python code tool.
