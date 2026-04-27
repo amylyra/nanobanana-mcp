@@ -45,10 +45,13 @@ Per-tool support (mirror in docstrings + server instructions):
 | `edit_image` | configurable | **not supported** (Gemini API limitation) | source shape |
 | `swap_background` | configurable | **not supported** (Gemini API limitation) | source shape |
 
-Lives in three places — all must stay aligned:
+Lives in four places — all must stay aligned:
 - Server `instructions` block (`## Intake before any image-output tool — REQUIRED`)
 - Each tool's docstring (`INTAKE REQUIRED:` paragraph + per-arg notes)
+- `mcp-s3-companion/SKILL.md` (`Step 2 — Confirm aspect ratio BEFORE any image-output tool`)
 - This section
+
+The skill copy is critical: claude.ai web loads the skill before the MCP, and the skill's directive workflow can override MCP intake guidance if it doesn't mention intake itself.
 
 Skip cases (no intake needed): user already named values; re-running at known settings; chaining from a fixed-settings tool.
 

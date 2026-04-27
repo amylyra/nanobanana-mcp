@@ -44,7 +44,26 @@ Or use the full web app (no MCP needed): `https://nanobanana-739905005785.us-cen
 
 ---
 
-## Step 2 — Pass the URLs to the right tool
+## Step 2 — Confirm aspect ratio BEFORE any image-output tool — REQUIRED
+
+Image-output tools: `generate_image`, `edit_image`, `swap_background`, `create_variations`.
+Before calling any of them for the first time in a conversation, ask the user in a single message:
+
+> Before I {generate / edit / swap background / create variations}, two quick choices:
+> • **Aspect ratio?** 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9
+> • **Resolution?** 1K, 2K, 4K
+>
+> Defaults: 4:5 / 1K for new generations; same shape as the source image for edits, background swaps, and variations. Reply with your picks, or say 'defaults'.
+
+Per-tool support:
+- `generate_image`, `create_variations`: aspect_ratio + resolution.
+- `edit_image`, `swap_background`: aspect_ratio only — Gemini's edit API ignores resolution; output matches the source.
+
+Skip the intake only when the user already named values, when re-running at known settings, or when chaining from a fixed-settings tool. **Tools that don't output images** (`analyze_image`, `batch_analyze`, `compare_images`, `list_styles`, `upload_image`) **don't need intake — call them directly.**
+
+---
+
+## Step 3 — Pass the URLs to the right tool
 
 | Tool | What it does | Key params |
 |---|---|---|
