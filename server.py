@@ -269,7 +269,19 @@ mcp = FastMCP(
         "**Multi-object swap** (objects from images B and C into image A): "
         "call edit_image(image=urlA, reference_images=[urlB, urlC], "
         "prompt='replace X with reference image 1 and Y with reference image 2').\n\n"
-        "Default aspect ratio 4:5, resolution 1K.\n\n"
+        "## Intake before generate_image — REQUIRED\n"
+        "Before calling `generate_image`, confirm aspect ratio and resolution with the user "
+        "if they haven't already specified one. Ask once, in a single message:\n\n"
+        "> Before I generate, two quick choices:\n"
+        "> • **Aspect ratio?** 1:1, 2:3, 3:2, 3:4, 4:3, 4:5 (default), 5:4, 9:16, 16:9, 21:9\n"
+        "> • **Resolution?** 1K (default), 2K, 4K\n"
+        ">\n"
+        "> Reply with your picks, or say 'defaults' for 4:5 / 1K.\n\n"
+        "Skip the intake when the user already named a ratio/resolution in the conversation, "
+        "when generating variations of a previously approved image at the same settings, "
+        "or when chaining from another tool that fixed those values. "
+        "`edit_image`, `swap_background`, and `create_variations` default to the source image's "
+        "shape — no intake needed unless the user wants to change it (e.g. outpaint to 16:9).\n\n"
         "## Presenting images to the user — CRITICAL\n"
         "The tool pane shows a small thumbnail. Your chat reply is the user-facing presentation.\n"
         "After every image tool call, your assistant reply MUST:\n"
@@ -1931,14 +1943,22 @@ async def generate_image(
     Reference images guide the model on style, subject appearance, or composition.
     Only pass URLs — use upload_image first if needed.
 
+    INTAKE REQUIRED: Before calling this tool, confirm aspect_ratio and resolution
+    with the user if they haven't already specified one. Ask both in a single
+    message — see the "Intake before generate_image" section in server instructions.
+    Skip the intake only when the user already named a ratio/resolution, when
+    re-generating at known settings, or when chaining from another tool that
+    fixed those values.
+
     Args:
         prompt: What to generate. Describe subject, style, lighting, mood, etc.
         reference_images: Optional list of image URLs. Use upload_image first if needed.
         style: Optional style preset. Available: cinematic, product-photography,
                editorial, watercolor, flat-illustration, neon-noir, minimalist, vintage-film.
         enhance_prompt: If true, AI expands your prompt into a detailed generation prompt.
-        aspect_ratio: Output aspect ratio. Default: 4:5
-        resolution: Output resolution: 1K, 2K, 4K. Default: 1K
+        aspect_ratio: One of 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9.
+                      Default 4:5. Confirm with the user before calling.
+        resolution: 1K, 2K, or 4K. Default 1K. Confirm with the user before calling.
         quality: "default" (fast) or "pro" (higher quality). Default: default
         count: Number of images to generate (1–4). Default: 1
         qa: If true, AI-score each image. When count > 1, ranks by total score.

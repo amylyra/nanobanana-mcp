@@ -27,6 +27,19 @@ gcloud run services list
 - Tool pane inline rendering is reliable.
 - Claude chat reply inline rendering is not guaranteed (consent gating). Download links are the reliable fallback.
 
+## Intake before generate_image
+
+The agent must confirm `aspect_ratio` and `resolution` with the user before calling `generate_image` when they haven't already specified one. Single-message intake:
+
+- Aspect ratio: `1:1, 2:3, 3:2, 3:4, 4:3, 4:5 (default), 5:4, 9:16, 16:9, 21:9`
+- Resolution: `1K (default), 2K, 4K`
+
+Lives in two places — both must stay aligned:
+- Server `instructions` block (`## Intake before generate_image — REQUIRED`)
+- `generate_image` docstring (`INTAKE REQUIRED:` paragraph + per-arg notes)
+
+Skip cases (no intake needed): user already named a ratio/resolution; re-generating at known settings; chaining from another tool with fixed values; calling `edit_image`, `swap_background`, or `create_variations` (they default to source-image shape).
+
 ## Upload constraints
 
 - `upload_image` has **no** Pydantic constraints (no `pattern`, no `max_length`) — this is intentional so the data URI and invalid-path error handlers can fire and return the urllib recovery snippet.
