@@ -1653,6 +1653,55 @@ class TestDataUriInTools:
         assert data["url"].startswith("http")
 
 
+class TestUploadSnippetsByEnvironment:
+    """Each client environment has its own upload path. The error messages
+    must surface BOTH so the agent can pick the one that matches its tools."""
+
+    def test_claude_code_snippet_uses_curl_with_user_path(self):
+        snippet = server._claude_code_snippet("/Users/me/photo.jpg")
+        assert "curl" in snippet
+        assert "--data-binary" in snippet
+        assert "/Users/me/photo.jpg" in snippet
+        assert "/upload" in snippet
+
+    def test_claude_code_snippet_falls_back_to_placeholder(self):
+        snippet = server._claude_code_snippet(None)
+        assert "curl" in snippet
+        assert "/full/path/to/image.jpg" in snippet
+
+    def test_urllib_snippet_targets_co_work_uploads_dir(self):
+        snippet = server._urllib_snippet()
+        assert "/mnt/user-data/uploads" in snippet
+        assert "urllib.request" in snippet
+
+    @pytest.mark.asyncio
+    async def test_data_uri_error_includes_both_environment_snippets(self):
+        """The data-URI rejection should show both web (urllib) and Claude Code (curl)
+        snippets so an agent in either environment knows what to do."""
+        mock_ctx = MagicMock()
+        result = await server.upload_image(
+            ctx=mock_ctx,
+            image="data:image/jpeg;base64," + ("A" * 40),
+        )
+        err = json.loads(result)["error"]
+        assert "/mnt/user-data/uploads" in err, "missing claude.ai web snippet"
+        assert "curl" in err and "--data-binary" in err, "missing Claude Code snippet"
+
+    @pytest.mark.asyncio
+    async def test_missing_path_error_includes_both_snippets_and_user_path(self):
+        """When the path doesn't exist on the server, the curl snippet should
+        echo the user's exact path so they can run it verbatim."""
+        mock_ctx = MagicMock()
+        result = await server.upload_image(
+            ctx=mock_ctx,
+            image="/this/path/definitely/does/not/exist.jpg",
+        )
+        err = json.loads(result)["error"]
+        assert "/mnt/user-data/uploads" in err
+        assert "curl" in err
+        assert "/this/path/definitely/does/not/exist.jpg" in err
+
+
 # ===========================================================================
 # CONTEXT-AWARE OUTPUT CONTRACT TESTS
 #

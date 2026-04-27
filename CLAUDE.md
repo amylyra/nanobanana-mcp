@@ -33,17 +33,25 @@ gcloud run services list
 - All other image params (`edit_image`, `swap_background`, `create_variations`, `analyze_image`) use `Field(max_length=2048)` to block oversized payloads before the function body.
 - **Never encode to base64/data URI** — passing large data URIs as MCP parameters hangs the transport before the server can reject them.
 
-## Why uploads look "stuck"
+## Upload paths by environment
 
-Most failures are from unsupported upload paths in client sandboxes (for example, trying curl/wget to inaccessible endpoints).
+The upload path depends on **where the MCP is running** and **where the file lives**. The remote Cloud Run server can't read the user's local filesystem, so each client has its own snippet.
 
-Preferred sequence:
+| Environment | Tool | File source | Path |
+|---|---|---|---|
+| claude.ai web (co-work) | Python | `/mnt/user-data/uploads/` | urllib POST snippet → `/upload` |
+| Claude Code (CLI) — remote MCP | Bash | user's real filesystem | `curl --data-binary "@/path"` → `/upload` |
+| Claude Code (CLI) — local stdio MCP | n/a | user's real filesystem | `upload_image(image='/path')` reads it server-side |
+| Any | n/a | n/a | `{PUBLIC_URL}/upload` (manual) or `{PUBLIC_URL}/app` (full UI) |
 
-1. URL already available → pass directly to the tool.
-2. Pasted/local image in claude.ai web → run the urllib POST snippet (reads `/mnt/user-data/uploads/`, POSTs raw bytes to `/upload`, gets back a URL).
-3. Local file in Claude Code → `upload_image(image='/full/path/to/file.jpg')`.
-4. Manual fallback → open `{PUBLIC_URL}/upload` and drag-drop.
-5. Full web app → `{PUBLIC_URL}/app` for upload + generate/edit/swap/variations in one UI.
+Helpers in `server.py`:
+
+- `_urllib_snippet()` — claude.ai web Python snippet. Reads most recent files from `/mnt/user-data/uploads/`.
+- `_claude_code_snippet(path=...)` — Claude Code Bash curl one-liner. Substitutes the user-provided path when available so the agent runs it verbatim.
+
+Both are returned together in `upload_image` data-URI / not-found errors so the agent picks the one matching its environment.
+
+Most "stuck" uploads come from picking the wrong path (e.g. running the Python snippet under Bash, or expecting Cloud Run to see a `/Users/...` path).
 
 ## Runtime requirements
 
