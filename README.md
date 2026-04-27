@@ -151,13 +151,15 @@ The data URI error response includes the full urllib snippet directly so Claude 
 
 ## Output format
 
-Image tools return content blocks in this order:
+Image-output tools (`generate_image`, `edit_image`, `swap_background`, `create_variations`) return content blocks in this order:
 
 1. `ImageContent` — 1024px JPEG thumbnails visible in the tool pane
-2. `render_md` — markdown image embeds (`![](url)`) + `[Download image](url)` links
+2. `render_md` — markdown image embed(s) (`![](url)`) + `[Download image](url)` link(s) + a single trailing **Save to Google Drive?** nudge
 3. `json_str` — JSON metadata (`image_url`, `size_kb`) for tool chaining
 
 To chain a generated image into another tool, use `image_url` from the JSON metadata.
+
+**Save-to-Drive flow:** when the user replies *save* (or "save to drive"), the agent fetches bytes from the most recent `image_url` and calls the Google Drive MCP's `create_file` tool. If the Google Drive MCP isn't installed, the agent tells the user — it never fabricates a Drive URL.
 
 ---
 

@@ -1272,6 +1272,22 @@ class TestCloudOutputKeyConsistency:
             "instructions must reference the Google Drive MCP create_file tool"
         )
 
+    def test_instructions_explain_intake_requirements(self):
+        """Server instructions must teach the agent the intake form before any
+        image-output tool — aspect ratio options, resolution options, and the
+        per-tool support split (edit/swap don't accept resolution)."""
+        instructions = server.mcp.instructions
+        assert "Intake before any image-output tool" in instructions
+        # Aspect ratio options must be listed
+        for ratio in ("1:1", "4:5", "9:16", "21:9"):
+            assert ratio in instructions, f"missing aspect ratio {ratio} in intake"
+        # Resolution options must be listed
+        for res in ("1K", "2K", "4K"):
+            assert res in instructions, f"missing resolution {res} in intake"
+        # All four image-output tools must be named in the intake context
+        for tool in ("generate_image", "edit_image", "swap_background", "create_variations"):
+            assert tool in instructions, f"missing {tool} in instructions"
+
 
 # ---------------------------------------------------------------------------
 # 20. Empty reference image validation
