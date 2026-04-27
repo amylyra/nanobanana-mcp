@@ -1246,6 +1246,32 @@ class TestCloudOutputKeyConsistency:
             assert "image_url" in img
             assert img["image_url"].startswith("http")
 
+    def test_render_md_includes_save_to_drive_nudge_single(self):
+        """Single-image render_md must include the Save to Google Drive nudge so
+        the user can opt in by replying 'save'."""
+        jpeg = _make_test_image(100, 100)
+        render_md, _, _ = server._build_image_response({}, [(jpeg, {"index": 1})])
+        assert "Save to Google Drive" in render_md
+        assert "save" in render_md.lower()
+
+    def test_render_md_includes_save_to_drive_nudge_multi(self):
+        """Multi-image render_md must include the Save to Drive nudge once
+        (not duplicated per image)."""
+        imgs = [(_make_test_image(100, 100), {"index": i}) for i in range(3)]
+        render_md, _, _ = server._build_image_response({}, imgs)
+        assert render_md.count("Save to Google Drive") == 1, (
+            "nudge should appear exactly once at the end, not per-image"
+        )
+
+    def test_instructions_explain_save_to_drive_workflow(self):
+        """Server instructions must teach the agent how to handle 'save' replies:
+        fetch bytes, call Google Drive MCP create_file, return Drive link."""
+        instructions = server.mcp.instructions
+        assert "Save to Google Drive" in instructions
+        assert "create_file" in instructions, (
+            "instructions must reference the Google Drive MCP create_file tool"
+        )
+
 
 # ---------------------------------------------------------------------------
 # 20. Empty reference image validation

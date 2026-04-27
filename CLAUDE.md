@@ -22,10 +22,19 @@ gcloud run services list
 
 - Image generation tools return content blocks in this order:
   1. `ImageContent` thumbnails (1024px) — visible in tool pane
-  2. `render_md` — markdown image embeds + `[Download image](url)` links
+  2. `render_md` — markdown image embeds + `[Download image](url)` links + a single trailing **Save to Google Drive?** nudge
   3. `json_str` — metadata for tool chaining (`image_url`, `size_kb`, etc.)
 - Tool pane inline rendering is reliable.
 - Claude chat reply inline rendering is not guaranteed (consent gating). Download links are the reliable fallback.
+
+## Save to Google Drive
+
+The `render_md` from every image-output tool ends with a one-line nudge: `**Save to Google Drive?** Reply *save* and I'll upload via the Google Drive MCP.` When the user replies "save" / "save to drive", the agent fetches bytes from the most recent `image_url` and calls the Google Drive MCP's `create_file` tool. The nudge is generated in `_build_image_response()` (server.py) and the workflow is taught in three places — must stay aligned:
+- Server `instructions` block (`## Save to Google Drive — when the user replies 'save'`)
+- `mcp-s3-companion/SKILL.md` (Step 4)
+- This section
+
+Important: this is markdown-link UX, not a true clickable button. Markdown can't trigger an MCP call; the agent must read the user's "save" reply and act. If the Google Drive MCP isn't installed, tell the user — never fabricate a Drive URL.
 
 ## Intake before any image-output tool
 

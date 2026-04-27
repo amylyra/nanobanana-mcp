@@ -301,11 +301,21 @@ mcp = FastMCP(
         "After every image tool call, your assistant reply MUST:\n"
         "1. Show a markdown image embed `![](image_url)` for each image — use the URL from `image_url` in the JSON metadata.\n"
         "2. Show a clickable `[Download image](image_url)` link below each embed.\n"
-        "3. Add a brief, friendly description of what was generated or edited.\n"
+        "3. Carry the **Save to Google Drive?** nudge from the tool's render_md through to the user verbatim.\n"
+        "4. Add a brief, friendly description of what was generated or edited.\n"
         "Do NOT dump raw JSON in your reply — extract just the URL.\n"
         "Do NOT say 'here is your image' without the actual embed and download link.\n"
         "The download link is the user's reliable fallback when the embed doesn't render.\n"
-        "To chain a generated image into another tool, use the `image_url` from the JSON metadata."
+        "To chain a generated image into another tool, use the `image_url` from the JSON metadata.\n\n"
+        "## Save to Google Drive — when the user replies 'save'\n"
+        "Image-output tools end their render_md with a 'Save to Google Drive?' nudge. "
+        "If the user replies 'save', 'save to drive', 'save to google drive', or similar:\n"
+        "1. Fetch the image bytes from the most recent `image_url` (S3/GCS or `/images/<id>`) "
+        "using the Python tool: `urllib.request.urlopen(url, timeout=30).read()`.\n"
+        "2. Call the Google Drive MCP `create_file` tool with the bytes and a sensible filename "
+        "(e.g. `nanobanana-<short-prompt-or-timestamp>.jpg`, MIME `image/jpeg`).\n"
+        "3. Reply with the resulting Drive link so the user can open it.\n"
+        "If the Google Drive MCP isn't installed, tell the user — do not try to fabricate a Drive URL."
     ).format(upload_url=_get_upload_base_url()),
     host=os.environ.get("HOST", "0.0.0.0"),
     port=int(os.environ.get("PORT", 8080)),
@@ -1651,13 +1661,19 @@ def _build_image_response(
             if saved_path:
                 meta["saved_to"] = saved_path
 
+    save_nudge = (
+        "**Save to Google Drive?** Reply *save* and I'll upload "
+        "via the Google Drive MCP."
+    )
+
     if len(generated) == 1:
         result.update(generated[0][1])
         result.pop("index", None)
         single_url = result.get("image_url", "")
         render_md = (
             f"![]({single_url})\n\n"
-            f"[Download image]({single_url})"
+            f"[Download image]({single_url})\n\n"
+            f"{save_nudge}"
         )
     else:
         result["images"] = [{k: v for k, v in meta.items() if k != "index"} for _, meta in generated]
@@ -1669,7 +1685,7 @@ def _build_image_response(
                     f"![Image {i + 1}]({url})\n"
                     f"[Download image {i + 1}]({url})"
                 )
-        render_md = "\n\n".join(parts)
+        render_md = "\n\n".join(parts) + f"\n\n{save_nudge}"
 
     return render_md, json.dumps(result), thumbnails
 

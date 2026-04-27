@@ -85,6 +85,27 @@ Skip the intake only when the user already named values, when re-running at know
 
 ---
 
+## Step 4 — When the user replies "save", upload the image(s) to Google Drive
+
+Every image-output tool (`generate_image`, `edit_image`, `swap_background`, `create_variations`) ends its markdown response with:
+
+> **Save to Google Drive?** Reply *save* and I'll upload via the Google Drive MCP.
+
+When the user replies *save* / *save to drive* / *save to google drive* (or similar) right after an image-output tool call:
+
+1. Pick the `image_url`(s) from the most recent tool result's JSON metadata.
+2. In the Python tool, fetch the bytes from each URL:
+   ```python
+   import urllib.request
+   data = urllib.request.urlopen(image_url, timeout=30).read()
+   ```
+3. Call the **Google Drive MCP** `create_file` tool with those bytes and a descriptive filename (e.g. `nanobanana-<short-prompt-slug>.jpg`, MIME `image/jpeg`).
+4. Reply with the resulting Drive link so the user can open the file.
+
+If the Google Drive MCP isn't installed, tell the user — do not fabricate a Drive URL.
+
+---
+
 ## Other image sources (no upload needed)
 
 | Source | What to do |
