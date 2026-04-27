@@ -203,28 +203,42 @@ mcp = FastMCP(
     "nanobanana",
     instructions=(
         "NanoBanana image generation server. Powered by Gemini.\n\n"
+        "## STOP — read before ANY image tool call\n"
+        "NEVER pass base64 strings or data: URIs to any tool parameter. "
+        "They are too large for MCP transport and WILL hang the connection. "
+        "If the user pastes/drags an image, run the urllib Python snippet below to upload it first.\n\n"
         "## Getting images into tools\n\n"
         "All image tool parameters accept http/https URLs.\n\n"
         "1. **Direct URL (http/https, S3, CDN)** → pass straight to the tool.\n"
         "2. **Public Google Drive link** → pass straight to the tool (auto-rewritten).\n"
-        "3. **Pasted or local file (claude.ai web)** → run this Python snippet immediately. "
-        "Do NOT check image sizes first. Do NOT encode to base64. Just run it:\n\n"
+        "3. **Pasted or local file (claude.ai web)** → run this snippet using the **Python** tool "
+        "(NOT bash, NOT shell — Python only, or it will fail with 'Bad for loop variable'):\n\n"
         "```python\n"
-        "import urllib.request, json, os\n"
+        "import urllib.request, json, os, time\n"
         "uploads = '/mnt/user-data/uploads'\n"
         "files = sorted([f for f in os.listdir(uploads) if f.lower().endswith(('.png','.jpg','.jpeg','.webp'))],\n"
         "               key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True)[:4]\n"
         "for i, fname in enumerate(files):\n"
-        "    with open(os.path.join(uploads, fname), 'rb') as f: data = f.read()\n"
+        "    with open(os.path.join(uploads, fname), 'rb') as fh: data = fh.read()\n"
         "    req = urllib.request.Request('{upload_url}/upload', data=data, method='POST')\n"
-        "    result = json.loads(urllib.request.urlopen(req, timeout=30).read())\n"
-        "    print(f'image{{i}}: {{result[\"url\"]}}')\n"
+        "    for attempt in range(3):\n"
+        "        try:\n"
+        "            result = json.loads(urllib.request.urlopen(req, timeout=30).read())\n"
+        "            print(f'image{{i}}: {{result[\"url\"]}}')\n"
+        "            break\n"
+        "        except Exception as e:\n"
+        "            if attempt < 2: time.sleep(2 ** attempt)\n"
+        "            else: print(f'image{{i}}: FAILED after 3 attempts: {{e}}. Upload manually at {upload_url}/upload')\n"
         "```\n"
-        "The server handles any image size. Pass the printed URLs to any tool.\n\n"
+        "IMPORTANT: Execute this with the **Python code execution tool**. "
+        "Running it in bash/shell causes 'Bad for loop variable' errors.\n\n"
+        "If the snippet fails (503, network error), do not retry — immediately direct the user to "
+        "upload manually at {upload_url}/upload or use the full web app at {upload_url}/app.\n\n"
         "**NEVER encode to base64/data URI** — the upload_image tool rejects them and MCP transport hangs.\n\n"
         "4. **Local file path (Claude Code only):** `upload_image(image='/full/path/to/file.jpg')`\n"
-        "5. **Manual fallback:** direct user to {upload_url}/upload to drag-and-drop.\n\n"
-        "If urllib fails, do not retry — direct the user to manual upload. "
+        "5. **Manual upload:** direct user to {upload_url}/upload to drag-and-drop.\n"
+        "6. **Full web app (no MCP needed):** {upload_url}/app — upload, generate, edit, swap backgrounds, "
+        "create variations, and download results. Best option for a smooth workflow.\n\n"
         "Never fabricate URLs. Never start a local HTTP server.\n\n"
         "## Tools\n"
         "- upload_image — re-host an image URL or local file path to a server URL for use in other tools\n"
@@ -247,13 +261,16 @@ mcp = FastMCP(
         "call edit_image(image=urlA, reference_images=[urlB, urlC], "
         "prompt='replace X with reference image 1 and Y with reference image 2').\n\n"
         "Default aspect ratio 4:5, resolution 1K.\n\n"
-        "## Rendering images — CRITICAL\n"
-        "Every image tool result begins with a standalone markdown image link (e.g. `![](https://...)`).\n"
-        "In your assistant reply, include BOTH:\n"
-        "1) `chat_response_template` exactly as returned.\n"
-        "2) If unavailable, include `display_markdown` and `display_text_urls` exactly as returned.\n"
-        "Do not paraphrase, skip, or replace these with a text-only summary.\n"
-        "To chain a generated image into another tool, use the `image_url` from the JSON metadata section."
+        "## Presenting images to the user — CRITICAL\n"
+        "The tool pane shows a small thumbnail. Your chat reply is the user-facing presentation.\n"
+        "After every image tool call, your assistant reply MUST:\n"
+        "1. Show a markdown image embed `![](image_url)` for each image — use the URL from `image_url` in the JSON metadata.\n"
+        "2. Show a clickable `[Download image](image_url)` link below each embed.\n"
+        "3. Add a brief, friendly description of what was generated or edited.\n"
+        "Do NOT dump raw JSON in your reply — extract just the URL.\n"
+        "Do NOT say 'here is your image' without the actual embed and download link.\n"
+        "The download link is the user's reliable fallback when the embed doesn't render.\n"
+        "To chain a generated image into another tool, use the `image_url` from the JSON metadata."
     ).format(upload_url=_get_upload_base_url()),
     host=os.environ.get("HOST", "0.0.0.0"),
     port=int(os.environ.get("PORT", 8080)),
@@ -455,6 +472,559 @@ async def http_get_image(request: Request) -> Response:
     except ValueError:
         return JSONResponse({"error": "Image not found or expired"}, status_code=404)
     return Response(content=img_bytes, media_type=mime)
+
+
+# ---------------------------------------------------------------------------
+# REST API — JSON endpoints for the web app (bypass MCP protocol)
+# ---------------------------------------------------------------------------
+_CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+}
+
+
+class _DummyCtx:
+    """Minimal stand-in for mcp.Context — tool bodies never call ctx methods."""
+    async def info(self, msg: str) -> None: pass  # noqa: E704
+    async def report_progress(self, current: int, total: int) -> None: pass  # noqa: E704
+
+
+_dummy_ctx = _DummyCtx()
+
+
+def _api_json(tool_result) -> JSONResponse:
+    """Convert a tool function's return value to a clean JSON API response."""
+    if isinstance(tool_result, str):
+        try:
+            data = json.loads(tool_result)
+        except json.JSONDecodeError:
+            data = {"error": tool_result}
+        status = 400 if "error" in data else 200
+        return JSONResponse(data, status_code=status, headers=_CORS_HEADERS)
+    # List: [Image(...), ..., render_md_str, json_str]
+    json_str = tool_result[-1]
+    data = json.loads(json_str)
+    return JSONResponse(data, headers=_CORS_HEADERS)
+
+
+@mcp.custom_route("/api/styles", methods=["GET", "OPTIONS"])
+async def api_styles(request: Request) -> Response:
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers=_CORS_HEADERS)
+    return JSONResponse(sorted(STYLE_PRESETS.keys()), headers=_CORS_HEADERS)
+
+
+@mcp.custom_route("/api/generate", methods=["POST", "OPTIONS"])
+async def api_generate(request: Request) -> Response:
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers=_CORS_HEADERS)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400, headers=_CORS_HEADERS)
+    prompt = body.get("prompt", "").strip()
+    if not prompt:
+        return JSONResponse({"error": "prompt is required"}, status_code=400, headers=_CORS_HEADERS)
+    try:
+        result = await generate_image(
+            prompt=prompt,
+            reference_images=body.get("reference_images"),
+            style=body.get("style"),
+            aspect_ratio=body.get("aspect_ratio", "4:5"),
+            resolution=body.get("resolution", "1K"),
+            model=body.get("model", "fast"),
+            enhance_prompt=body.get("enhance_prompt", False),
+            qa=body.get("qa", False),
+            count=body.get("count", 1),
+        )
+        return _api_json(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS_HEADERS)
+
+
+@mcp.custom_route("/api/edit", methods=["POST", "OPTIONS"])
+async def api_edit(request: Request) -> Response:
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers=_CORS_HEADERS)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400, headers=_CORS_HEADERS)
+    prompt = body.get("prompt", "").strip()
+    image = body.get("image", "").strip()
+    if not prompt or not image:
+        return JSONResponse({"error": "prompt and image are required"}, status_code=400, headers=_CORS_HEADERS)
+    try:
+        result = await edit_image(
+            prompt=prompt,
+            ctx=_dummy_ctx,
+            image=image,
+            reference_images=body.get("reference_images"),
+            mask=body.get("mask"),
+            edit_mode=body.get("edit_mode", "inpaint-insertion"),
+            aspect_ratio=body.get("aspect_ratio"),
+            count=body.get("count", 1),
+        )
+        return _api_json(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS_HEADERS)
+
+
+@mcp.custom_route("/api/swap-background", methods=["POST", "OPTIONS"])
+async def api_swap_background(request: Request) -> Response:
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers=_CORS_HEADERS)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400, headers=_CORS_HEADERS)
+    background = body.get("background", "").strip()
+    image = body.get("image", "").strip()
+    if not background or not image:
+        return JSONResponse({"error": "background and image are required"}, status_code=400, headers=_CORS_HEADERS)
+    try:
+        result = await swap_background(
+            background=background,
+            ctx=_dummy_ctx,
+            image=image,
+            aspect_ratio=body.get("aspect_ratio"),
+            count=body.get("count", 1),
+        )
+        return _api_json(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS_HEADERS)
+
+
+@mcp.custom_route("/api/variations", methods=["POST", "OPTIONS"])
+async def api_variations(request: Request) -> Response:
+    if request.method == "OPTIONS":
+        return Response(status_code=204, headers=_CORS_HEADERS)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400, headers=_CORS_HEADERS)
+    image = body.get("image", "").strip()
+    if not image:
+        return JSONResponse({"error": "image is required"}, status_code=400, headers=_CORS_HEADERS)
+    try:
+        result = await create_variations(
+            ctx=_dummy_ctx,
+            image=image,
+            prompt=body.get("prompt"),
+            variation_strength=body.get("variation_strength", "medium"),
+            aspect_ratio=body.get("aspect_ratio"),
+            resolution=body.get("resolution", "1K"),
+            model=body.get("model", "fast"),
+            qa=body.get("qa", False),
+            count=body.get("count", 1),
+        )
+        return _api_json(result)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500, headers=_CORS_HEADERS)
+
+
+# ---------------------------------------------------------------------------
+# Web App — served at /app
+# ---------------------------------------------------------------------------
+_APP_HTML = """<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NanoBanana Studio</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:system-ui,-apple-system,sans-serif;background:#0f0f0f;color:#e8e8e8;min-height:100vh}
+header{background:#1a1a1a;border-bottom:1px solid #333;padding:16px 24px;display:flex;align-items:center;gap:12px}
+header h1{font-size:1.3em;font-weight:600;color:#f5a623}
+header span{font-size:.85em;color:#888}
+.container{max-width:960px;margin:0 auto;padding:24px}
+
+/* Upload zone */
+.upload-zone{border:2px dashed #444;border-radius:12px;padding:40px;text-align:center;cursor:pointer;
+  transition:all .2s;margin-bottom:24px;background:#1a1a1a}
+.upload-zone:hover,.upload-zone.drag-over{border-color:#f5a623;background:#1f1a10}
+.upload-zone p{color:#888;margin-top:8px;font-size:.9em}
+.upload-zone .icon{font-size:2em;margin-bottom:8px}
+input[type="file"]{display:none}
+
+/* Uploaded images strip */
+.uploads-strip{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:24px;min-height:0}
+.uploads-strip:empty{display:none}
+.upload-thumb{position:relative;width:80px;height:80px;border-radius:8px;overflow:hidden;cursor:pointer;
+  border:2px solid transparent;transition:border-color .2s;flex-shrink:0}
+.upload-thumb.selected{border-color:#f5a623}
+.upload-thumb img{width:100%;height:100%;object-fit:cover}
+.upload-thumb .url-tag{position:absolute;bottom:0;left:0;right:0;background:rgba(0,0,0,.7);
+  font-size:.55em;padding:2px 4px;color:#aaa;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* Tool tabs */
+.tabs{display:flex;gap:2px;margin-bottom:20px;background:#1a1a1a;border-radius:10px;padding:4px;border:1px solid #333}
+.tab{flex:1;padding:10px;text-align:center;border-radius:8px;cursor:pointer;font-size:.9em;
+  color:#888;transition:all .2s;font-weight:500}
+.tab:hover{color:#ccc}
+.tab.active{background:#f5a623;color:#000;font-weight:600}
+
+/* Tool forms */
+.tool-form{background:#1a1a1a;border:1px solid #333;border-radius:12px;padding:20px;margin-bottom:24px}
+.tool-form[hidden]{display:none}
+.field{margin-bottom:14px}
+.field label{display:block;font-size:.85em;color:#aaa;margin-bottom:4px;font-weight:500}
+.field input,.field select,.field textarea{width:100%;padding:10px 12px;background:#0f0f0f;border:1px solid #444;
+  border-radius:8px;color:#e8e8e8;font-size:.9em;font-family:inherit}
+.field textarea{resize:vertical;min-height:70px}
+.field input:focus,.field select:focus,.field textarea:focus{outline:none;border-color:#f5a623}
+.field select{appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23888' d='M6 8L1 3h10z'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 12px center}
+.row{display:flex;gap:12px}
+.row .field{flex:1}
+.selected-image{font-size:.8em;color:#f5a623;margin-bottom:10px;word-break:break-all}
+
+.btn{display:inline-flex;align-items:center;gap:8px;padding:12px 28px;border:none;border-radius:8px;
+  font-size:.95em;font-weight:600;cursor:pointer;transition:all .2s}
+.btn-primary{background:#f5a623;color:#000}
+.btn-primary:hover{background:#e09500}
+.btn-primary:disabled{background:#555;color:#888;cursor:not-allowed}
+.btn-sm{padding:8px 16px;font-size:.85em}
+.btn-outline{background:transparent;border:1px solid #555;color:#aaa}
+.btn-outline:hover{border-color:#f5a623;color:#f5a623}
+
+/* Status / spinner */
+.status{text-align:center;padding:30px;color:#888;font-size:.9em}
+.spinner{display:inline-block;width:24px;height:24px;border:3px solid #333;border-top-color:#f5a623;
+  border-radius:50%;animation:spin 1s linear infinite;margin-right:10px;vertical-align:middle}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Results */
+.results{margin-top:8px}
+.results h2{font-size:1.1em;color:#aaa;margin-bottom:16px;font-weight:500}
+.result-card{background:#1a1a1a;border:1px solid #333;border-radius:12px;overflow:hidden;margin-bottom:16px}
+.result-card img{width:100%;display:block;cursor:pointer}
+.result-card img:hover{opacity:.92}
+.result-actions{padding:12px 16px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.result-actions a{text-decoration:none}
+.result-url{font-size:.75em;color:#666;word-break:break-all;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.result-meta{font-size:.75em;color:#555;padding:0 16px 12px}
+
+/* Lightbox */
+.lightbox{position:fixed;inset:0;background:rgba(0,0,0,.9);z-index:100;display:flex;align-items:center;
+  justify-content:center;cursor:pointer}
+.lightbox[hidden]{display:none}
+.lightbox img{max-width:95vw;max-height:95vh;border-radius:8px}
+</style>
+</head>
+<body>
+<header>
+  <h1>NanoBanana Studio</h1>
+  <span>Image generation &amp; editing</span>
+</header>
+
+<div class="container">
+  <!-- Upload -->
+  <div class="upload-zone" id="dropZone">
+    <div class="icon">+</div>
+    <strong>Drop images here or click to browse</strong>
+    <p>Upload images to get URLs for editing, background swap, or variations</p>
+  </div>
+  <input type="file" id="fileInput" accept="image/*" multiple>
+  <div class="uploads-strip" id="uploads"></div>
+
+  <!-- Tabs -->
+  <div class="tabs" id="tabs">
+    <div class="tab active" data-tool="generate">Generate</div>
+    <div class="tab" data-tool="edit">Edit</div>
+    <div class="tab" data-tool="swap">Swap Background</div>
+    <div class="tab" data-tool="variations">Variations</div>
+  </div>
+
+  <!-- Generate form -->
+  <div class="tool-form" id="form-generate">
+    <div class="field"><label>Prompt</label>
+      <textarea id="gen-prompt" placeholder="Describe what to generate..."></textarea></div>
+    <div class="row">
+      <div class="field"><label>Style</label>
+        <select id="gen-style"><option value="">None</option></select></div>
+      <div class="field"><label>Aspect Ratio</label>
+        <select id="gen-ratio">
+          <option value="4:5" selected>4:5</option><option value="1:1">1:1</option>
+          <option value="3:2">3:2</option><option value="2:3">2:3</option>
+          <option value="16:9">16:9</option><option value="9:16">9:16</option>
+          <option value="3:4">3:4</option><option value="4:3">4:3</option>
+        </select></div>
+      <div class="field"><label>Count</label>
+        <select id="gen-count"><option>1</option><option>2</option><option>3</option><option>4</option></select></div>
+    </div>
+    <div class="row">
+      <div class="field"><label>Model</label>
+        <select id="gen-model"><option value="fast">Fast</option><option value="pro">Pro (higher quality)</option></select></div>
+      <div class="field"><label>Resolution</label>
+        <select id="gen-res"><option>1K</option><option>2K</option><option>4K</option></select></div>
+    </div>
+    <button class="btn btn-primary" onclick="doGenerate()">Generate</button>
+  </div>
+
+  <!-- Edit form -->
+  <div class="tool-form" id="form-edit" hidden>
+    <div class="selected-image" id="edit-selected">Select an uploaded image above, or paste a URL:</div>
+    <div class="field"><label>Image URL</label>
+      <input id="edit-image" placeholder="https://... (or click an upload above)"></div>
+    <div class="field"><label>Edit prompt</label>
+      <textarea id="edit-prompt" placeholder="Describe what to change..."></textarea></div>
+    <div class="row">
+      <div class="field"><label>Edit Mode</label>
+        <select id="edit-mode">
+          <option value="inpaint-insertion">Inpaint (add/replace)</option>
+          <option value="inpaint-removal">Remove object</option>
+          <option value="outpaint">Outpaint (expand)</option>
+        </select></div>
+      <div class="field"><label>Count</label>
+        <select id="edit-count"><option>1</option><option>2</option><option>3</option><option>4</option></select></div>
+    </div>
+    <button class="btn btn-primary" onclick="doEdit()">Edit Image</button>
+  </div>
+
+  <!-- Swap background form -->
+  <div class="tool-form" id="form-swap" hidden>
+    <div class="selected-image" id="swap-selected">Select an uploaded image above, or paste a URL:</div>
+    <div class="field"><label>Image URL</label>
+      <input id="swap-image" placeholder="https://... (or click an upload above)"></div>
+    <div class="field"><label>New background description</label>
+      <textarea id="swap-bg" placeholder="Describe the new background..."></textarea></div>
+    <div class="row">
+      <div class="field"><label>Count</label>
+        <select id="swap-count"><option>1</option><option>2</option><option>3</option><option>4</option></select></div>
+    </div>
+    <button class="btn btn-primary" onclick="doSwap()">Swap Background</button>
+  </div>
+
+  <!-- Variations form -->
+  <div class="tool-form" id="form-variations" hidden>
+    <div class="selected-image" id="var-selected">Select an uploaded image above, or paste a URL:</div>
+    <div class="field"><label>Image URL</label>
+      <input id="var-image" placeholder="https://... (or click an upload above)"></div>
+    <div class="field"><label>Guidance (optional)</label>
+      <textarea id="var-prompt" placeholder="Optional direction for variations..."></textarea></div>
+    <div class="row">
+      <div class="field"><label>Variation Strength</label>
+        <select id="var-strength">
+          <option value="subtle">Subtle</option><option value="medium" selected>Medium</option>
+          <option value="strong">Strong</option>
+        </select></div>
+      <div class="field"><label>Count</label>
+        <select id="var-count"><option>1</option><option>2</option><option>3</option><option>4</option></select></div>
+    </div>
+    <button class="btn btn-primary" onclick="doVariations()">Create Variations</button>
+  </div>
+
+  <!-- Status -->
+  <div class="status" id="status" hidden></div>
+
+  <!-- Results -->
+  <div class="results" id="results"></div>
+</div>
+
+<!-- Lightbox -->
+<div class="lightbox" id="lightbox" hidden onclick="this.hidden=true">
+  <img id="lightbox-img" src="">
+</div>
+
+<script>
+const API = window.location.origin;
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+const uploadsDiv = document.getElementById('uploads');
+const statusDiv = document.getElementById('status');
+const resultsDiv = document.getElementById('results');
+let uploadedUrls = [];
+let selectedUrl = '';
+
+// -- Upload --
+dropZone.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+dropZone.addEventListener('drop', e => { e.preventDefault(); dropZone.classList.remove('drag-over'); uploadFiles(e.dataTransfer.files); });
+fileInput.addEventListener('change', () => { uploadFiles(fileInput.files); fileInput.value = ''; });
+
+async function uploadFiles(files) {
+  for (const file of files) {
+    if (!file.type.startsWith('image/')) continue;
+    const data = await file.arrayBuffer();
+    showStatus('Uploading ' + file.name + '...');
+    try {
+      const resp = await fetch(API + '/upload', { method: 'POST', body: data });
+      const json = await resp.json();
+      if (json.url) {
+        uploadedUrls.push(json.url);
+        addUploadThumb(json.url);
+      } else {
+        showStatus('Upload failed: ' + (json.error || 'unknown'), true);
+        return;
+      }
+    } catch (e) {
+      showStatus('Upload failed: ' + e.message, true);
+      return;
+    }
+  }
+  hideStatus();
+}
+
+function addUploadThumb(url) {
+  const div = document.createElement('div');
+  div.className = 'upload-thumb';
+  div.innerHTML = '<img src="' + url + '"><div class="url-tag">' + url.split('/').pop() + '</div>';
+  div.onclick = () => selectUpload(url, div);
+  uploadsDiv.appendChild(div);
+}
+
+function selectUpload(url, el) {
+  selectedUrl = url;
+  document.querySelectorAll('.upload-thumb').forEach(t => t.classList.remove('selected'));
+  el.classList.add('selected');
+  // Fill in URL fields for current tool
+  ['edit-image','swap-image','var-image'].forEach(id => { document.getElementById(id).value = url; });
+  document.querySelectorAll('.selected-image').forEach(s => { s.textContent = 'Selected: ' + url; });
+}
+
+// -- Tabs --
+document.getElementById('tabs').addEventListener('click', e => {
+  const tab = e.target.closest('.tab');
+  if (!tab) return;
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  tab.classList.add('active');
+  document.querySelectorAll('.tool-form').forEach(f => f.hidden = true);
+  document.getElementById('form-' + tab.dataset.tool).hidden = false;
+});
+
+// -- Styles --
+fetch(API + '/api/styles').then(r => r.json()).then(styles => {
+  const sel = document.getElementById('gen-style');
+  styles.forEach(s => { const o = document.createElement('option'); o.value = s; o.textContent = s; sel.appendChild(o); });
+});
+
+// -- API calls --
+function showStatus(msg, isError) {
+  statusDiv.hidden = false;
+  statusDiv.innerHTML = (isError ? '' : '<span class="spinner"></span>') +
+    '<span style="color:' + (isError ? '#e57373' : '#888') + '">' + msg + '</span>';
+}
+function hideStatus() { statusDiv.hidden = true; }
+
+function disableButtons(yes) {
+  document.querySelectorAll('.btn-primary').forEach(b => b.disabled = yes);
+}
+
+async function callAPI(endpoint, body) {
+  disableButtons(true);
+  showStatus('Working... this may take 10\u201330 seconds');
+  try {
+    const resp = await fetch(API + endpoint, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+    });
+    const data = await resp.json();
+    hideStatus();
+    disableButtons(false);
+    if (data.error) { showStatus('Error: ' + data.error, true); disableButtons(false); return null; }
+    return data;
+  } catch (e) {
+    showStatus('Request failed: ' + e.message, true);
+    disableButtons(false);
+    return null;
+  }
+}
+
+function showResults(data) {
+  // data has image_url (single) or images (array)
+  const images = data.images ? data.images : [data];
+  const cards = images.map((img, i) => {
+    const url = img.image_url || '';
+    if (!url) return '';
+    const sizeKb = img.size_kb ? img.size_kb + ' KB' : '';
+    return '<div class="result-card">' +
+      '<img src="' + url + '" onclick="openLightbox(\\'' + url + '\\')" alt="Result ' + (i+1) + '">' +
+      '<div class="result-actions">' +
+        '<a href="' + url + '" download class="btn btn-sm btn-primary">Download</a>' +
+        '<button class="btn btn-sm btn-outline" onclick="copyUrl(\\'' + url + '\\')">Copy URL</button>' +
+        '<button class="btn btn-sm btn-outline" onclick="useAsInput(\\'' + url + '\\')">Use as input</button>' +
+        '<span class="result-url">' + url + '</span>' +
+      '</div>' +
+      (sizeKb ? '<div class="result-meta">' + sizeKb + '</div>' : '') +
+    '</div>';
+  }).join('');
+  resultsDiv.innerHTML = '<h2>Results</h2>' + cards + resultsDiv.innerHTML.replace(/^<h2>Results<\\/h2>/, '');
+}
+
+async function doGenerate() {
+  const data = await callAPI('/api/generate', {
+    prompt: document.getElementById('gen-prompt').value,
+    style: document.getElementById('gen-style').value || undefined,
+    aspect_ratio: document.getElementById('gen-ratio').value,
+    count: parseInt(document.getElementById('gen-count').value),
+    model: document.getElementById('gen-model').value,
+    resolution: document.getElementById('gen-res').value,
+    reference_images: selectedUrl ? [selectedUrl] : undefined,
+  });
+  if (data) showResults(data);
+}
+
+async function doEdit() {
+  const image = document.getElementById('edit-image').value.trim();
+  if (!image) { showStatus('Select or paste an image URL first', true); return; }
+  const data = await callAPI('/api/edit', {
+    prompt: document.getElementById('edit-prompt').value,
+    image: image,
+    edit_mode: document.getElementById('edit-mode').value,
+    count: parseInt(document.getElementById('edit-count').value),
+  });
+  if (data) showResults(data);
+}
+
+async function doSwap() {
+  const image = document.getElementById('swap-image').value.trim();
+  if (!image) { showStatus('Select or paste an image URL first', true); return; }
+  const data = await callAPI('/api/swap-background', {
+    image: image,
+    background: document.getElementById('swap-bg').value,
+    count: parseInt(document.getElementById('swap-count').value),
+  });
+  if (data) showResults(data);
+}
+
+async function doVariations() {
+  const image = document.getElementById('var-image').value.trim();
+  if (!image) { showStatus('Select or paste an image URL first', true); return; }
+  const data = await callAPI('/api/variations', {
+    image: image,
+    prompt: document.getElementById('var-prompt').value || undefined,
+    variation_strength: document.getElementById('var-strength').value,
+    count: parseInt(document.getElementById('var-count').value),
+  });
+  if (data) showResults(data);
+}
+
+function openLightbox(url) {
+  document.getElementById('lightbox-img').src = url;
+  document.getElementById('lightbox').hidden = false;
+}
+
+function copyUrl(url) {
+  navigator.clipboard.writeText(url).then(() => {
+    const btn = event.target; const orig = btn.textContent; btn.textContent = 'Copied!';
+    setTimeout(() => btn.textContent = orig, 1500);
+  });
+}
+
+function useAsInput(url) {
+  selectedUrl = url;
+  ['edit-image','swap-image','var-image'].forEach(id => { document.getElementById(id).value = url; });
+  document.querySelectorAll('.selected-image').forEach(s => { s.textContent = 'Selected: ' + url; });
+}
+</script>
+</body></html>"""
+
+
+@mcp.custom_route("/app", methods=["GET"])
+async def http_app(request: Request) -> HTMLResponse:
+    """Serve the NanoBanana Studio web app."""
+    return HTMLResponse(_APP_HTML)
 
 
 # ---------------------------------------------------------------------------
@@ -1006,12 +1576,9 @@ def _build_image_response(
     generated: list of (jpeg_bytes, per_image_metadata) tuples.
 
     Returns (render_md, json_str, thumbnails):
-    - render_md: standalone markdown image link(s) — "![](url)" for one image,
-      "![Image 1](url1)\\n\\n![Image 2](url2)" for multiple. This is the FIRST
-      item returned by tools so Claude treats it as the primary result and
-      includes it verbatim in its reply.
+    - render_md: markdown image embed(s) + download link(s)
     - json_str: JSON metadata for tool chaining (image_url, size_kb, etc.)
-    - thumbnails: 512px JPEG bytes for ImageContent blocks (tool pane previews)
+    - thumbnails: 1024px JPEG bytes for ImageContent blocks (tool pane previews)
     """
     base_url = _get_upload_base_url()
     thumbnails: list[bytes] = []
@@ -1023,7 +1590,6 @@ def _build_image_response(
             try:
                 s3_url = _upload_to_s3(jpeg_bytes, prefix=prefix)
                 meta["image_url"] = s3_url
-                meta["storage_backend"] = "s3"
             except Exception as e:
                 if REQUIRE_DURABLE_UPLOADS:
                     raise ValueError(
@@ -1032,20 +1598,18 @@ def _build_image_response(
                 log(f"[nanobanana] S3 upload failed, falling back to local URL: {e}\n")
                 meta["image_url"] = local_url
                 meta["expires_in"] = "1 hour"
-                meta["storage_backend"] = "local"
         else:
             meta["image_url"] = local_url
             meta["expires_in"] = "1 hour"
-            meta["storage_backend"] = "local"
-        # Build 512px thumbnail for ImageContent (tool pane preview)
+        # Build 1024px thumbnail for ImageContent (tool pane preview)
         from PIL import Image as PILImage
         pil = PILImage.open(BytesIO(jpeg_bytes))
-        if max(pil.size) > 512:
-            pil.thumbnail((512, 512), PILImage.LANCZOS)
+        if max(pil.size) > 1024:
+            pil.thumbnail((1024, 1024), PILImage.LANCZOS)
         if pil.mode != "RGB":
             pil = pil.convert("RGB")
         buf = BytesIO()
-        pil.save(buf, format="JPEG", quality=75, optimize=True)
+        pil.save(buf, format="JPEG", quality=85, optimize=True)
         thumbnails.append(buf.getvalue())
         if save_folder:
             saved_path = _save_to_folder(jpeg_bytes, save_folder, prefix)
@@ -1056,32 +1620,21 @@ def _build_image_response(
         result.update(generated[0][1])
         result.pop("index", None)
         single_url = result.get("image_url", "")
-        render_md = f"![]({single_url})\n\nURL: {single_url}"
-        display_urls = [result.get("image_url", "")]
+        render_md = (
+            f"![]({single_url})\n\n"
+            f"[Download image]({single_url})"
+        )
     else:
         result["images"] = [{k: v for k, v in meta.items() if k != "index"} for _, meta in generated]
-        render_md = "\n\n".join(
-            f"![Image {i + 1}]({img['image_url']})\nURL {i + 1}: {img['image_url']}"
-            for i, img in enumerate(result["images"])
-            if img.get("image_url")
-        )
-        display_urls = [img.get("image_url", "") for img in result["images"] if img.get("image_url")]
-
-    # Extra fields to help Claude include visible links/images in the main chat reply.
-    result["display_markdown"] = render_md
-    result["display_urls"] = display_urls
-    result["display_text_urls"] = "\n".join(display_urls)
-    if display_urls:
-        result["chat_response_template"] = (
-            "Here is the image result:\n\n"
-            f"{render_md}\n\n"
-            "Direct URL(s):\n"
-            f"{result['display_text_urls']}"
-        )
-        result["assistant_reply_hint"] = (
-            "Use `chat_response_template` exactly in the assistant reply. "
-            "If not possible, include both `display_markdown` and `display_text_urls`."
-        )
+        parts = []
+        for i, img in enumerate(result["images"]):
+            url = img.get("image_url", "")
+            if url:
+                parts.append(
+                    f"![Image {i + 1}]({url})\n"
+                    f"[Download image {i + 1}]({url})"
+                )
+        render_md = "\n\n".join(parts)
 
     return render_md, json.dumps(result), thumbnails
 
@@ -1156,6 +1709,28 @@ def _score_image(client, img_bytes: bytes, prompt: str) -> dict:
 # ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
+def _urllib_snippet() -> str:
+    """Return the urllib upload snippet with retries for use in error messages."""
+    server_url = _BASE_URL
+    return (
+        "import urllib.request, json, os, time\n"
+        "uploads = '/mnt/user-data/uploads'\n"
+        "files = sorted([f for f in os.listdir(uploads) if f.lower().endswith(('.png','.jpg','.jpeg','.webp'))], "
+        "key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True)[:4]\n"
+        "for i, fname in enumerate(files):\n"
+        "    with open(os.path.join(uploads, fname), 'rb') as fh: data = fh.read()\n"
+        f"    req = urllib.request.Request('{server_url}/upload', data=data, method='POST')\n"
+        "    for attempt in range(3):\n"
+        "        try:\n"
+        "            result = json.loads(urllib.request.urlopen(req, timeout=30).read())\n"
+        "            print(f'image{i}: {result[\"url\"]}')\n"
+        "            break\n"
+        "        except Exception as e:\n"
+        "            if attempt < 2: time.sleep(2 ** attempt)\n"
+        f"            else: print(f'image{{i}}: FAILED after 3 attempts: {{e}}. Upload manually at {server_url}/upload')\n"
+    )
+
+
 def _upload_error(message: str, next_step: str | None = None) -> str:
     payload = {"error": message, "retryable": False}
     if next_step:
@@ -1166,7 +1741,7 @@ def _upload_error(message: str, next_step: str | None = None) -> str:
 @mcp.tool()
 async def upload_image(
     ctx: Context,
-    image: Annotated[str, Field(pattern=r"^(https?://|/)")],
+    image: str,
 ) -> str:
     """Re-host an image to a server URL for use in other tools.
 
@@ -1206,42 +1781,23 @@ async def upload_image(
         and os.path.isfile(image)
     )
     if is_data_uri:
-        server_url = _BASE_URL
         return _upload_error(
-            (
-                "upload_image does NOT accept data URIs. Do NOT re-encode at lower quality and retry. "
-                "Instead, run this Python code RIGHT NOW using the Python code tool (not bash):\n\n"
-                f"import urllib.request, json, os\n"
-                f"uploads = '/mnt/user-data/uploads'\n"
-                f"files = sorted([f for f in os.listdir(uploads) if f.lower().endswith(('.png','.jpg','.jpeg','.webp'))], key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True)[:4]\n"
-                f"for i, fname in enumerate(files):\n"
-                f"    with open(os.path.join(uploads, fname), 'rb') as fh: data = fh.read()\n"
-                f"    req = urllib.request.Request('{server_url}/upload', data=data, method='POST')\n"
-                f"    result = json.loads(urllib.request.urlopen(req, timeout=30).read())\n"
-                f"    print(f'image{{i}}: {{result[\"url\"]}}')\n\n"
-                "Then pass the printed URLs to the image tool."
-            ),
-            next_step=f"Run the Python snippet above using the Python code tool, not bash. Or upload manually at {upload_url}",
+            "upload_image does NOT accept data URIs. Do NOT re-encode at lower quality and retry.\n\n"
+            "Option A — run this with the **Python** tool (NOT bash/shell):\n\n"
+            f"{_urllib_snippet()}\n"
+            f"Option B — direct the user to upload at: {upload_url}/upload\n"
+            f"Option C — use the full web app (no MCP needed): {upload_url}/app",
+            next_step=f"Run the snippet above with the Python tool (not bash). Or direct user to {upload_url}/app",
         )
     if not _is_url(image) and not is_local_file:
-        server_url = _BASE_URL
         return _upload_error(
-            (
-                "upload_image accepts http/https URLs or local file paths only. "
-                "The path you provided does not exist on this server. "
-                "For pasted images in claude.ai web, run this Python code RIGHT NOW "
-                "using the Python code tool (not bash):\n\n"
-                f"import urllib.request, json, os\n"
-                f"uploads = '/mnt/user-data/uploads'\n"
-                f"files = sorted([f for f in os.listdir(uploads) if f.lower().endswith(('.png','.jpg','.jpeg','.webp'))], key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True)[:4]\n"
-                f"for i, fname in enumerate(files):\n"
-                f"    with open(os.path.join(uploads, fname), 'rb') as fh: data = fh.read()\n"
-                f"    req = urllib.request.Request('{server_url}/upload', data=data, method='POST')\n"
-                f"    result = json.loads(urllib.request.urlopen(req, timeout=30).read())\n"
-                f"    print(f'image{{i}}: {{result[\"url\"]}}')\n\n"
-                "Then pass the printed URLs to the image tool."
-            ),
-            next_step=f"Run the Python snippet above using the Python code tool. Or upload manually at {upload_url}",
+            "upload_image accepts http/https URLs or local file paths only. "
+            "The path you provided does not exist on this server.\n\n"
+            "Option A — run this with the **Python** tool (NOT bash/shell):\n\n"
+            f"{_urllib_snippet()}\n"
+            f"Option B — direct the user to upload at: {upload_url}/upload\n"
+            f"Option C — use the full web app (no MCP needed): {upload_url}/app",
+            next_step=f"Run the snippet above with the Python tool (not bash). Or direct user to {upload_url}/app",
         )
 
     try:
@@ -1323,8 +1879,6 @@ async def generate_image(
     Reference images guide the model on style, subject appearance, or composition.
     Only pass URLs — use upload_image first if needed.
 
-    If save_folder is provided, images are also saved as JPEG files in that directory.
-
     Args:
         prompt: What to generate. Describe subject, style, lighting, mood, etc.
         reference_images: Optional list of image URLs. Use upload_image first if needed.
@@ -1339,8 +1893,8 @@ async def generate_image(
         save_folder: Optional local folder path to save generated JPEG files.
 
     Returns:
-        JSON metadata with image_url for chaining, plus ImageContent objects shown inline
-        by claude.ai. Use image_url to pass this image to edit_image, swap_background, etc.
+        Inline image previews, markdown download links, and JSON metadata with
+        image_url for tool chaining.
     """
     from google.genai import types
 
@@ -1432,14 +1986,14 @@ async def generate_image(
         render_md, json_result, thumbnails = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="gen")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload generated images: {e}"})
-    return [render_md, json_result] + [Image(data=t, format="jpeg") for t in thumbnails]
+    return [Image(data=t, format="jpeg") for t in thumbnails] + [render_md, json_result]
 
 
 @mcp.tool(structured_output=False)
 async def edit_image(
     prompt: str,
     ctx: Context,
-    image: str,
+    image: Annotated[str, Field(max_length=2048)],
     reference_images: list[str] | None = None,
     mask: str | None = None,
     edit_mode: str = "inpaint-insertion",
@@ -1450,9 +2004,6 @@ async def edit_image(
     """Edit an existing image — add objects, remove objects, or extend the canvas.
 
     Only pass URLs — use upload_image first if needed.
-
-    Edited images are always displayed inline in Claude. If save_folder is provided,
-    images are also saved as JPEG files in that directory.
 
     Args:
         image: Source image URL. Use upload_image first if needed.
@@ -1474,8 +2025,8 @@ async def edit_image(
         save_folder: Optional local folder path to save edited JPEG files.
 
     Returns:
-        JSON metadata with image_url for chaining, plus ImageContent objects shown inline
-        by claude.ai. Use image_url to pass this image to edit_image, swap_background, etc.
+        Inline image previews, markdown download links, and JSON metadata with
+        image_url for tool chaining.
     """
     from google.genai import types
 
@@ -1558,25 +2109,21 @@ async def edit_image(
         render_md, json_result, thumbnails = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="edit")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload edited images: {e}"})
-    return [render_md, json_result] + [Image(data=t, format="jpeg") for t in thumbnails]
+    return [Image(data=t, format="jpeg") for t in thumbnails] + [render_md, json_result]
 
 
 @mcp.tool(structured_output=False)
 async def swap_background(
     background: str,
     ctx: Context,
-    image: str,
+    image: Annotated[str, Field(max_length=2048)],
     aspect_ratio: str | None = None,
     count: int = 1,
     save_folder: str | None = None,
 ) -> list | str:
     """Replace the background of an image while keeping the foreground subject intact.
 
-    Automatically segments the foreground and generates a new background.
     Only pass URLs — use upload_image first if needed.
-
-    Result images are always displayed inline in Claude. If save_folder is provided,
-    images are also saved as JPEG files in that directory.
 
     Args:
         image: Source image URL. Use upload_image first if needed.
@@ -1586,8 +2133,8 @@ async def swap_background(
         save_folder: Optional local folder path to save result JPEG files.
 
     Returns:
-        JSON metadata with image_url for chaining, plus ImageContent objects shown inline
-        by claude.ai. Use image_url to pass this image to edit_image, swap_background, etc.
+        Inline image previews, markdown download links, and JSON metadata with
+        image_url for tool chaining.
     """
     from google.genai import types
 
@@ -1634,13 +2181,13 @@ async def swap_background(
         render_md, json_result, thumbnails = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="bgswap")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload background-swapped images: {e}"})
-    return [render_md, json_result] + [Image(data=t, format="jpeg") for t in thumbnails]
+    return [Image(data=t, format="jpeg") for t in thumbnails] + [render_md, json_result]
 
 
 @mcp.tool(structured_output=False)
 async def create_variations(
     ctx: Context,
-    image: str,
+    image: Annotated[str, Field(max_length=2048)],
     prompt: str | None = None,
     variation_strength: str = "medium",
     aspect_ratio: str | None = None,
@@ -1655,9 +2202,6 @@ async def create_variations(
     Preserves the core subject while exploring different compositions, lighting,
     or styling. Only pass URLs — use upload_image first if needed.
 
-    Variations are always displayed inline in Claude. If save_folder is provided,
-    images are also saved as JPEG files in that directory.
-
     Args:
         image: Source image URL. Use upload_image first if needed.
         prompt: Optional guidance for variations.
@@ -1670,8 +2214,8 @@ async def create_variations(
         save_folder: Optional local folder path to save variation JPEG files.
 
     Returns:
-        JSON metadata with image_url for chaining, plus ImageContent objects shown inline
-        by claude.ai. Use image_url to pass this image to edit_image, swap_background, etc.
+        Inline image previews, markdown download links, and JSON metadata with
+        image_url for tool chaining.
     """
     from google.genai import types
 
@@ -1697,7 +2241,7 @@ async def create_variations(
 
     try:
         img_bytes, img_mime = await _acquire_image(image, ctx, purpose="source image")
-    except Exception as e:
+    except ValueError as e:
         return json.dumps({"error": str(e)})
 
     variation_prompt = strength_prompts[variation_strength]
@@ -1745,7 +2289,7 @@ async def create_variations(
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload variation images: {e}"})
 
-    return [render_md, json_result] + [Image(data=t, format="jpeg") for t in thumbnails]
+    return [Image(data=t, format="jpeg") for t in thumbnails] + [render_md, json_result]
 
 
 # ---------------------------------------------------------------------------
@@ -1819,7 +2363,7 @@ async def _analyze_one(client, img_bytes: bytes, img_mime: str, focus: str) -> d
 @mcp.tool()
 async def analyze_image(
     ctx: Context,
-    image: str,
+    image: Annotated[str, Field(max_length=2048)],
     focus: str = "general",
 ) -> str:
     """Analyze a single image using Gemini vision — describe, tag, or assess quality.

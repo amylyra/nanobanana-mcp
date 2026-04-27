@@ -41,7 +41,7 @@ from mcp.server.fastmcp import Image as MCPImage
 def _parse_result(result) -> dict:
     """Parse JSON metadata from a tool result.
 
-    Tool functions return [render_md, json_str, Image, ...].
+    Tool functions return [Image, ..., render_md, json_str].
     _build_image_response returns (render_md, json_str, thumbnails) — a tuple.
     Error paths return a plain str JSON with an 'error' key.
     Searches all string items and returns the first valid JSON object.
@@ -513,7 +513,7 @@ class TestGenerateImageFlow:
         with patch.object(server, "_get_client", return_value=mock_client):
             result = await server.generate_image("a cute cat")
 
-        # Tools return [json_str, Image, ...] — Image objects render inline in claude.ai
+        # Tools return [Image, ..., render_md, json_str]
         assert isinstance(result, list)
         metadata = _parse_result(result)
         assert "model" in metadata
@@ -1048,10 +1048,11 @@ class TestEndUserJourneys:
             )
 
         assert isinstance(result, list)
-        assert result[0].startswith("![](") or result[0].startswith("![Image")
-        meta = json.loads(result[1])
+        # Thumbnails come first, then markdown, then JSON
+        assert isinstance(result[0], MCPImage)
+        assert result[1].startswith("![](") or result[1].startswith("![Image")
+        meta = json.loads(result[2])
         assert "image_url" in meta
-        assert isinstance(result[2], MCPImage)
 
     @pytest.mark.asyncio
     async def test_upload_endpoint_accepts_multipart_file_field(self):
@@ -1219,12 +1220,7 @@ class TestCloudOutputKeyConsistency:
         meta = json.loads(json_str)
         assert meta["image_url"].startswith("http"), "image_url must be http URL for chaining"
         assert "data:" not in meta["image_url"], "image_url must not be a data URI"
-        assert "\n\nURL: " in render_md
-        assert meta["display_markdown"] == render_md
-        assert meta["display_urls"] == [meta["image_url"]]
-        assert meta["display_text_urls"] == meta["image_url"]
-        assert "chat_response_template" in meta
-        assert meta["display_text_urls"] in meta["chat_response_template"]
+        assert "[Download image](" in render_md
         assert len(thumbnails) == 1
         assert isinstance(thumbnails[0], bytes)
 
@@ -1236,10 +1232,6 @@ class TestCloudOutputKeyConsistency:
         meta = json.loads(json_str)
         assert "images" in meta
         assert len(meta["images"]) == 3
-        assert meta["display_markdown"] == render_md
-        assert len(meta["display_urls"]) == 3
-        assert meta["display_text_urls"].count("http") == 3
-        assert "chat_response_template" in meta
         assert len(thumbnails) == 3
         for img in meta["images"]:
             assert "image_url" in img
@@ -1676,7 +1668,7 @@ class TestDataUriInTools:
 
 
 # ---------------------------------------------------------------------------
-# 25. Embedded image contract — tools must return [json_str, Image, ...]
+# 25. Embedded image contract — tools must return [Image, ..., render_md, json_str]
 # ---------------------------------------------------------------------------
 
 class TestEmbeddedImageContract:
@@ -1703,22 +1695,23 @@ class TestEmbeddedImageContract:
 
     @pytest.mark.asyncio
     async def test_generate_image_returns_list_with_image(self):
-        """generate_image returns [render_md, json_str, MCPImage] — Image renders inline in claude.ai."""
+        """generate_image returns [MCPImage, render_md, json_str] — Image renders inline in claude.ai."""
         mock_client = MagicMock()
         mock_client.models.generate_content.return_value = self._mock_gemini_response()
 
         with patch.object(server, "_get_client", return_value=mock_client):
             result = await server.generate_image("a sunset")
 
-        assert isinstance(result, list), "Should return list [render_md, json_str, Image]"
-        assert isinstance(result[0], str)
-        assert isinstance(result[2], MCPImage)
-        meta = _parse_result(result)
+        assert isinstance(result, list), "Should return list [Image, render_md, json_str]"
+        assert isinstance(result[0], MCPImage)
+        assert isinstance(result[-2], str)  # render_md
+        assert isinstance(result[-1], str)  # json_str
+        meta = json.loads(result[-1])
         assert "image_url" in meta
 
     @pytest.mark.asyncio
     async def test_generate_image_count3_returns_3_image_objects(self):
-        """count=3: returns [render_md, json_str, Image1, Image2, Image3]."""
+        """count=3: returns [Image1, Image2, Image3, render_md, json_str]."""
         mock_client = MagicMock()
         mock_client.models.generate_content.return_value = self._mock_gemini_response()
 
@@ -1726,8 +1719,8 @@ class TestEmbeddedImageContract:
             result = await server.generate_image("cats", count=3)
 
         assert isinstance(result, list)
-        assert len(result) == 5, "Should be [render_md, json_str, img1, img2, img3]"
-        assert all(isinstance(result[i], MCPImage) for i in range(2, 5))
+        assert len(result) == 5, "Should be [img1, img2, img3, render_md, json_str]"
+        assert all(isinstance(result[i], MCPImage) for i in range(3))
 
     @pytest.mark.asyncio
     async def test_edit_image_returns_list_with_image(self):
@@ -1743,7 +1736,7 @@ class TestEmbeddedImageContract:
             )
 
         assert isinstance(result, list)
-        assert isinstance(result[2], MCPImage)
+        assert isinstance(result[0], MCPImage)
 
     @pytest.mark.asyncio
     async def test_swap_background_returns_list_with_image(self):
@@ -1759,7 +1752,7 @@ class TestEmbeddedImageContract:
             )
 
         assert isinstance(result, list)
-        assert isinstance(result[2], MCPImage)
+        assert isinstance(result[0], MCPImage)
 
     @pytest.mark.asyncio
     async def test_create_variations_returns_image_objects(self):
@@ -1775,8 +1768,8 @@ class TestEmbeddedImageContract:
             )
 
         assert isinstance(result, list)
-        assert len(result) == 4, "Should be [render_md, json_str, img1, img2]"
-        assert all(isinstance(result[i], MCPImage) for i in range(2, 4))
+        assert len(result) == 4, "Should be [img1, img2, render_md, json_str]"
+        assert all(isinstance(result[i], MCPImage) for i in range(2))
 
     @pytest.mark.asyncio
     async def test_error_paths_return_str_not_list(self):
@@ -1842,10 +1835,10 @@ class TestEmbeddedImageContract:
 # ---------------------------------------------------------------------------
 
 class TestDefaultOutputBehavior:
-    """Validate the new default output contract:
+    """Validate the default output contract:
 
-    - Tools return [render_md, json_str, MCPImage, ...] (render_md starts with ![)
-    - Images always displayed inline in Claude (MCPImage in return list)
+    - Tools return [MCPImage, ..., render_md, json_str]
+    - Images always displayed inline in Claude (MCPImage first in return list)
     - image_url always points to /images/ (in-memory, 1-hour TTL) for chaining
     - S3 catch-all upload fires in background when S3_BUCKET is configured
     - save_folder writes JPEG files to disk when provided
@@ -1893,7 +1886,6 @@ class TestDefaultOutputBehavior:
             assert "/images/" in meta["image_url"], "must return /images/ URL"
             assert "amazonaws.com" not in meta["image_url"]
             assert "expires_in" in meta
-            assert meta["storage_backend"] == "local"
         finally:
             server.S3_BUCKET = orig_s3
 
@@ -1907,7 +1899,7 @@ class TestDefaultOutputBehavior:
             result = await server.generate_image("cat")
 
         assert isinstance(result, list)
-        assert isinstance(result[2], MCPImage)
+        assert isinstance(result[0], MCPImage)
 
     @pytest.mark.asyncio
     async def test_s3_bucket_gives_s3_url_in_metadata(self):
@@ -1926,10 +1918,9 @@ class TestDefaultOutputBehavior:
         assert meta["image_url"] == fake_s3_url, "S3 URL must be returned as image_url"
         assert "amazonaws.com" in meta["image_url"]
         assert "expires_in" not in meta, "S3 URLs don't expire"
-        assert meta["storage_backend"] == "s3"
         # MCPImage still returned for inline display
         assert isinstance(result, list)
-        assert isinstance(result[2], MCPImage)
+        assert isinstance(result[0], MCPImage)
 
     @pytest.mark.asyncio
     async def test_no_s3_bucket_uses_local_url(self):
@@ -2001,8 +1992,8 @@ class TestClaudeCodeContext:
         edit_meta = _parse_result(edit_result)
         assert "image_url" in edit_meta
         # MCPImage present in both results for inline display
-        assert isinstance(gen_result, list) and isinstance(gen_result[2], MCPImage)
-        assert isinstance(edit_result, list) and isinstance(edit_result[2], MCPImage)
+        assert isinstance(gen_result, list) and isinstance(gen_result[0], MCPImage)
+        assert isinstance(edit_result, list) and isinstance(edit_result[0], MCPImage)
 
     @pytest.mark.asyncio
     async def test_s3_urls_returned_for_both_gen_and_edit(self):
@@ -2594,7 +2585,7 @@ class TestCompositeSwap:
             )
 
         assert isinstance(result, list)
-        assert isinstance(result[2], MCPImage)
+        assert isinstance(result[0], MCPImage)
 
 
 # ---------------------------------------------------------------------------
@@ -3024,8 +3015,8 @@ class TestGeminiExceptionHandling:
             )
 
         # Should return the one successful image, not fail entirely
-        assert isinstance(result, list), "Partial success must still return [render_md, json, Image]"
-        assert isinstance(result[2], MCPImage), "Must still include MCPImage"
+        assert isinstance(result, list), "Partial success must still return [Image, render_md, json]"
+        assert isinstance(result[0], MCPImage), "Must still include MCPImage"
         meta = _parse_result(result)
         assert "errors" in meta, "Partial failure must be reported in errors field"
 
@@ -3043,8 +3034,8 @@ class TestGeminiExceptionHandling:
             )
 
         assert isinstance(result, list)
-        assert len(result) == 4, "Should be [render_md, json_str, img1, img2]"
-        assert all(isinstance(result[i], MCPImage) for i in range(2, 4))
+        assert len(result) == 4, "Should be [img1, img2, render_md, json_str]"
+        assert all(isinstance(result[i], MCPImage) for i in range(2))
         meta = _parse_result(result)
         assert "images" in meta, "Multi-image result must use images[] array"
         assert len(meta["images"]) == 2
@@ -3064,8 +3055,8 @@ class TestGeminiExceptionHandling:
             )
 
         assert isinstance(result, list)
-        assert len(result) == 4, "Should be [render_md, json_str, img1, img2]"
-        assert all(isinstance(result[i], MCPImage) for i in range(2, 4))
+        assert len(result) == 4, "Should be [img1, img2, render_md, json_str]"
+        assert all(isinstance(result[i], MCPImage) for i in range(2))
         meta = _parse_result(result)
         assert "images" in meta
         assert len(meta["images"]) == 2
@@ -3120,7 +3111,7 @@ class TestMCPImageValidity:
         img = PILImage.open(BytesIO(thumbnails[0]))
         assert img.format == "JPEG"
         w, h = img.size
-        assert max(w, h) <= 512, f"MCPImage thumbnail too large: {w}x{h}"
+        assert max(w, h) <= 1024, f"MCPImage thumbnail too large: {w}x{h}"
 
     def test_multi_image_all_mcp_images_are_valid_jpegs(self):
         """Multi-image response: every MCPImage decodes to a valid JPEG."""
@@ -3131,7 +3122,7 @@ class TestMCPImageValidity:
             pil_img = PILImage.open(BytesIO(thumb))
             assert pil_img.format == "JPEG", f"Image {i} MCPImage is not JPEG"
             w, h = pil_img.size
-            assert max(w, h) <= 512, f"Image {i} thumbnail too large: {w}x{h}"
+            assert max(w, h) <= 1024, f"Image {i} thumbnail too large: {w}x{h}"
 
     @pytest.mark.asyncio
     async def test_generate_image_mcp_image_is_valid_jpeg(self):
@@ -3142,11 +3133,11 @@ class TestMCPImageValidity:
         with patch.object(server, "_get_client", return_value=mock_client):
             result = await server.generate_image("a test image")
 
-        mcp_img = result[2]
+        mcp_img = result[0]
         assert isinstance(mcp_img, MCPImage)
         img = PILImage.open(BytesIO(mcp_img.data))
         assert img.format == "JPEG"
-        assert max(img.size) <= 512
+        assert max(img.size) <= 1024
 
     @pytest.mark.asyncio
     async def test_rgba_source_produces_valid_jpeg(self):
@@ -3164,7 +3155,7 @@ class TestMCPImageValidity:
         with patch.object(server, "_get_client", return_value=mock_client):
             result = await server.generate_image("test rgba")
 
-        img = PILImage.open(BytesIO(result[2].data))
+        img = PILImage.open(BytesIO(result[0].data))
         assert img.format == "JPEG"
 
 
@@ -3847,12 +3838,12 @@ class TestDnsUploadFailureScenario:
 
     @pytest.mark.asyncio
     async def test_not_local_file_error_includes_urllib_snippet(self):
-        """Production path: Claude tries /mnt/user-data/uploads/file.jpg (matches pattern),
+        """Production path: Claude tries /mnt/user-data/uploads/file.jpg,
         but os.path.isfile() returns False on Cloud Run, hitting the 'not a URL or local file'
         error. That error MUST include the full urllib snippet inline — not just 'see server
         instructions' — so Claude runs it immediately without searching elsewhere."""
         mock_ctx = MagicMock()
-        # Simulate the path Claude tries after the pattern blocks data URI
+        # Simulate the path Claude tries for a non-existent local file
         result = await server.upload_image(
             ctx=mock_ctx,
             image="/mnt/user-data/uploads/some_pasted_image.jpg",
@@ -3862,8 +3853,7 @@ class TestDnsUploadFailureScenario:
         error_text = data.get("error", "") + data.get("next_step", "")
         # Must include the urllib snippet directly
         assert "urllib" in error_text, (
-            "Error for non-existent local path must include urllib snippet inline. "
-            "This is the error Claude reads in the production flow after pattern blocks data URI."
+            "Error for non-existent local path must include urllib snippet inline."
         )
         assert "/mnt/user-data/uploads" in error_text, (
             "Error must include the uploads directory so Claude knows where to read files from."
@@ -3896,12 +3886,21 @@ class TestDnsUploadFailureScenario:
     @pytest.mark.asyncio
     async def test_production_upload_flow_sequence(self):
         """Integration test modeling the actual production flow:
-        1. data URI → blocked by pattern (Pydantic, never reaches function body)
-        2. local path → pattern accepts, os.path.isfile False → 'not local file' error with snippet
-        3. urllib POSTs raw bytes → /upload endpoint → returns URL → success
-
-        Steps 1-2 are function-body tests (bypassing pattern). Step 3 uses http_upload."""
+        1. data URI → reaches function body, returns error with urllib snippet
+        2. local path → os.path.isfile False → 'not local file' error with snippet
+        3. urllib POSTs raw bytes → /upload endpoint → returns URL → success"""
         mock_ctx = MagicMock()
+
+        # Step 1: data URI → function body returns error with urllib recovery snippet
+        result = await server.upload_image(
+            ctx=mock_ctx,
+            image="data:image/jpeg;base64,/9j/short",
+        )
+        data = json.loads(result)
+        assert "error" in data, "data URI must return error"
+        assert "urllib" in data.get("error", ""), (
+            "Step 1 data URI error must contain urllib snippet for Claude to follow"
+        )
 
         # Step 2: local path that doesn't exist on server → must include urllib snippet
         result = await server.upload_image(
@@ -3924,6 +3923,139 @@ class TestDnsUploadFailureScenario:
         upload_data = json.loads(upload_resp.body)
         assert "url" in upload_data and upload_data["url"].startswith("http"), (
             "Step 3 must return a real http URL for Claude to pass to image tools"
+        )
+
+
+# ---------------------------------------------------------------------------
+# REST API endpoints and web app
+# ---------------------------------------------------------------------------
+
+class TestRESTApiEndpoints:
+    """Tests for /api/* JSON endpoints and /app web UI."""
+
+    @pytest.mark.asyncio
+    async def test_api_styles_returns_json_list(self):
+        """GET /api/styles must return a JSON list of style preset names."""
+        req = MagicMock()
+        req.method = "GET"
+        resp = await server.api_styles(req)
+        assert resp.status_code == 200
+        data = json.loads(resp.body)
+        assert isinstance(data, list)
+        assert "cinematic" in data
+        assert "watercolor" in data
+
+    @pytest.mark.asyncio
+    async def test_api_styles_cors_headers(self):
+        """GET /api/styles must include CORS headers."""
+        req = MagicMock()
+        req.method = "GET"
+        resp = await server.api_styles(req)
+        assert resp.headers.get("access-control-allow-origin") == "*"
+
+    @pytest.mark.asyncio
+    async def test_api_styles_options_preflight(self):
+        """OPTIONS /api/styles must return 204 with CORS headers."""
+        req = MagicMock()
+        req.method = "OPTIONS"
+        resp = await server.api_styles(req)
+        assert resp.status_code == 204
+        assert resp.headers.get("access-control-allow-origin") == "*"
+
+    @pytest.mark.asyncio
+    async def test_api_generate_requires_prompt(self):
+        """POST /api/generate with empty prompt must return 400."""
+        req = MagicMock()
+        req.method = "POST"
+        req.json = AsyncMock(return_value={"prompt": ""})
+        resp = await server.api_generate(req)
+        assert resp.status_code == 400
+        data = json.loads(resp.body)
+        assert "error" in data
+
+    @pytest.mark.asyncio
+    async def test_api_generate_invalid_json_returns_400(self):
+        """POST /api/generate with invalid JSON must return 400."""
+        req = MagicMock()
+        req.method = "POST"
+        req.json = AsyncMock(side_effect=ValueError("bad json"))
+        resp = await server.api_generate(req)
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_api_edit_requires_image_and_prompt(self):
+        """POST /api/edit without image or prompt must return 400."""
+        req = MagicMock()
+        req.method = "POST"
+        req.json = AsyncMock(return_value={"prompt": "fix it"})
+        resp = await server.api_edit(req)
+        assert resp.status_code == 400
+        data = json.loads(resp.body)
+        assert "image" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_api_swap_background_requires_fields(self):
+        """POST /api/swap-background without required fields must return 400."""
+        req = MagicMock()
+        req.method = "POST"
+        req.json = AsyncMock(return_value={"image": "https://example.com/img.jpg"})
+        resp = await server.api_swap_background(req)
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_api_variations_requires_image(self):
+        """POST /api/variations without image must return 400."""
+        req = MagicMock()
+        req.method = "POST"
+        req.json = AsyncMock(return_value={})
+        resp = await server.api_variations(req)
+        assert resp.status_code == 400
+
+    @pytest.mark.asyncio
+    async def test_app_page_returns_html(self):
+        """GET /app must return HTML containing NanoBanana Studio."""
+        req = MagicMock()
+        resp = await server.http_app(req)
+        assert resp.status_code == 200
+        body = resp.body.decode() if isinstance(resp.body, bytes) else resp.body
+        assert "NanoBanana Studio" in body
+        assert "<html" in body
+
+
+class TestServerInstructionsCompleteness:
+    """Additional instruction checks beyond TestServerInstructions."""
+
+    def _get_instructions(self):
+        instructions = getattr(server.mcp, 'instructions', "") or ""
+        if not instructions:
+            instructions = getattr(server.mcp, '_instructions', "") or \
+                           getattr(server.mcp.settings, 'instructions', "")
+        return instructions
+
+    def test_instructions_mention_app_endpoint(self):
+        """Instructions must mention /app web UI as a fallback."""
+        instructions = self._get_instructions()
+        assert "/app" in instructions, "Instructions must mention /app web UI endpoint"
+
+    def test_instructions_warn_about_bash(self):
+        """Instructions must warn against running the Python snippet in bash/shell."""
+        instructions = self._get_instructions().lower()
+        assert "not bash" in instructions or "not shell" in instructions, (
+            "Instructions must warn against running the upload snippet in bash"
+        )
+
+    def test_instructions_have_retry_logic(self):
+        """Instructions upload snippet must include retry logic."""
+        instructions = self._get_instructions()
+        assert "attempt" in instructions and "range(3)" in instructions, (
+            "Instructions upload snippet must include retry logic (3 attempts)"
+        )
+
+    def test_instructions_placeholders_resolved(self):
+        """Instructions must not contain unresolved {upload_url} placeholders."""
+        instructions = self._get_instructions()
+        assert "{upload_url}" not in instructions, (
+            "Instructions must not contain unresolved {upload_url} placeholder"
         )
 
 
