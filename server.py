@@ -269,19 +269,24 @@ mcp = FastMCP(
         "**Multi-object swap** (objects from images B and C into image A): "
         "call edit_image(image=urlA, reference_images=[urlB, urlC], "
         "prompt='replace X with reference image 1 and Y with reference image 2').\n\n"
-        "## Intake before generate_image — REQUIRED\n"
-        "Before calling `generate_image`, confirm aspect ratio and resolution with the user "
-        "if they haven't already specified one. Ask once, in a single message:\n\n"
-        "> Before I generate, two quick choices:\n"
-        "> • **Aspect ratio?** 1:1, 2:3, 3:2, 3:4, 4:3, 4:5 (default), 5:4, 9:16, 16:9, 21:9\n"
-        "> • **Resolution?** 1K (default), 2K, 4K\n"
+        "## Intake before any image-output tool — REQUIRED\n"
+        "Image-output tools: `generate_image`, `edit_image`, `swap_background`, `create_variations`. "
+        "Before the first call to any of these, confirm aspect ratio (and resolution where supported) "
+        "with the user. Ask once, in a single message:\n\n"
+        "> Before I {{generate / edit / swap background / create variations}}, two quick choices:\n"
+        "> • **Aspect ratio?** 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9\n"
+        "> • **Resolution?** 1K, 2K, 4K\n"
         ">\n"
-        "> Reply with your picks, or say 'defaults' for 4:5 / 1K.\n\n"
-        "Skip the intake when the user already named a ratio/resolution in the conversation, "
-        "when generating variations of a previously approved image at the same settings, "
-        "or when chaining from another tool that fixed those values. "
-        "`edit_image`, `swap_background`, and `create_variations` default to the source image's "
-        "shape — no intake needed unless the user wants to change it (e.g. outpaint to 16:9).\n\n"
+        "> Defaults: 4:5 / 1K for new generations; same shape as the source image for edits, "
+        "background swaps, and variations. Reply with your picks, or say 'defaults'.\n\n"
+        "Per-tool support:\n"
+        "- `generate_image`: aspect_ratio + resolution. No source, so the user must pick a ratio.\n"
+        "- `create_variations`: aspect_ratio + resolution. Default = same shape as source.\n"
+        "- `edit_image`, `swap_background`: aspect_ratio only — Gemini's edit API doesn't accept "
+        "a resolution param. Default = same shape as source. If the user picks a resolution for these, "
+        "explain it'll match the source and proceed.\n\n"
+        "Skip the intake when the user already named values in the conversation, when re-running at "
+        "known settings, or when chaining from another tool with fixed values.\n\n"
         "## Presenting images to the user — CRITICAL\n"
         "The tool pane shows a small thumbnail. Your chat reply is the user-facing presentation.\n"
         "After every image tool call, your assistant reply MUST:\n"
@@ -1944,11 +1949,10 @@ async def generate_image(
     Only pass URLs — use upload_image first if needed.
 
     INTAKE REQUIRED: Before calling this tool, confirm aspect_ratio and resolution
-    with the user if they haven't already specified one. Ask both in a single
-    message — see the "Intake before generate_image" section in server instructions.
-    Skip the intake only when the user already named a ratio/resolution, when
-    re-generating at known settings, or when chaining from another tool that
-    fixed those values.
+    with the user. Defaults: 4:5 / 1K. Ask both in a single message — see the
+    "Intake before any image-output tool" section in server instructions. Skip
+    when the user already named a ratio/resolution, when re-generating at known
+    settings, or when chaining from a fixed-settings tool.
 
     Args:
         prompt: What to generate. Describe subject, style, lighting, mood, etc.
@@ -2077,6 +2081,12 @@ async def edit_image(
 
     Only pass URLs — use upload_image first if needed.
 
+    INTAKE REQUIRED: Before calling this tool, confirm aspect_ratio with the user
+    (default = same shape as source). Resolution is NOT configurable for edits —
+    the output matches the source. See "Intake before any image-output tool" in
+    server instructions. Skip when the user already specified, when re-running at
+    known settings, or when chaining from a fixed-settings tool.
+
     Args:
         image: Source image URL. Use upload_image first if needed.
         prompt: Edit instruction. Be specific about what to change.
@@ -2092,7 +2102,9 @@ async def edit_image(
         mask: Optional mask image (URL). White = edit region, black = preserve.
         edit_mode: "inpaint-insertion" (add/replace), "inpaint-removal" (remove + fill),
                    "outpaint" (extend canvas). Default: inpaint-insertion
-        aspect_ratio: Output aspect ratio (useful for outpaint). Default: same as input.
+        aspect_ratio: One of 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9.
+                      Default = same as source. Confirm with the user (especially
+                      for outpaint, where reshaping is the whole point).
         count: Number of candidates (1–4). Default: 1
         save_folder: Optional local folder path to save edited JPEG files.
 
@@ -2197,10 +2209,17 @@ async def swap_background(
 
     Only pass URLs — use upload_image first if needed.
 
+    INTAKE REQUIRED: Before calling this tool, confirm aspect_ratio with the user
+    (default = same shape as source). Resolution is NOT configurable for swaps —
+    the output matches the source. See "Intake before any image-output tool" in
+    server instructions. Skip when the user already specified, when re-running at
+    known settings, or when chaining from a fixed-settings tool.
+
     Args:
         image: Source image URL. Use upload_image first if needed.
         background: Description of the new background. Be specific.
-        aspect_ratio: Output aspect ratio. Default: same as input.
+        aspect_ratio: One of 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9.
+                      Default = same as source. Confirm with the user.
         count: Number of candidates (1–4). Default: 1
         save_folder: Optional local folder path to save result JPEG files.
 
@@ -2274,12 +2293,19 @@ async def create_variations(
     Preserves the core subject while exploring different compositions, lighting,
     or styling. Only pass URLs — use upload_image first if needed.
 
+    INTAKE REQUIRED: Before calling this tool, confirm aspect_ratio and resolution
+    with the user. Defaults: aspect_ratio = same as source, resolution = 1K. See
+    "Intake before any image-output tool" in server instructions. Skip when the
+    user already specified, when re-running at known settings, or when chaining
+    from a fixed-settings tool.
+
     Args:
         image: Source image URL. Use upload_image first if needed.
         prompt: Optional guidance for variations.
         variation_strength: "subtle", "medium", or "strong". Default: medium
-        aspect_ratio: Output aspect ratio. Default: same as source image
-        resolution: Output resolution: 1K, 2K, 4K. Default: 1K
+        aspect_ratio: One of 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9.
+                      Default = same as source. Confirm with the user.
+        resolution: 1K, 2K, or 4K. Default 1K. Confirm with the user.
         quality: "default" or "pro". Default: default
         count: Number of variations (1–4). Default: 3
         qa: Score each variation and rank by quality. Default: false

@@ -27,18 +27,30 @@ gcloud run services list
 - Tool pane inline rendering is reliable.
 - Claude chat reply inline rendering is not guaranteed (consent gating). Download links are the reliable fallback.
 
-## Intake before generate_image
+## Intake before any image-output tool
 
-The agent must confirm `aspect_ratio` and `resolution` with the user before calling `generate_image` when they haven't already specified one. Single-message intake:
+Image-output tools: `generate_image`, `edit_image`, `swap_background`, `create_variations`. The agent must confirm aspect ratio (and resolution where supported) with the user before the first call to any of them.
 
-- Aspect ratio: `1:1, 2:3, 3:2, 3:4, 4:3, 4:5 (default), 5:4, 9:16, 16:9, 21:9`
-- Resolution: `1K (default), 2K, 4K`
+Single-message intake:
+- Aspect ratio: `1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9`
+- Resolution: `1K, 2K, 4K`
+- Defaults: `4:5 / 1K` for new generations; `same shape as source` for edits/swaps/variations
 
-Lives in two places — both must stay aligned:
-- Server `instructions` block (`## Intake before generate_image — REQUIRED`)
-- `generate_image` docstring (`INTAKE REQUIRED:` paragraph + per-arg notes)
+Per-tool support (mirror in docstrings + server instructions):
 
-Skip cases (no intake needed): user already named a ratio/resolution; re-generating at known settings; chaining from another tool with fixed values; calling `edit_image`, `swap_background`, or `create_variations` (they default to source-image shape).
+| Tool | aspect_ratio | resolution | Default |
+|---|---|---|---|
+| `generate_image` | configurable | configurable | 4:5 / 1K |
+| `create_variations` | configurable | configurable | source shape / 1K |
+| `edit_image` | configurable | **not supported** (Gemini API limitation) | source shape |
+| `swap_background` | configurable | **not supported** (Gemini API limitation) | source shape |
+
+Lives in three places — all must stay aligned:
+- Server `instructions` block (`## Intake before any image-output tool — REQUIRED`)
+- Each tool's docstring (`INTAKE REQUIRED:` paragraph + per-arg notes)
+- This section
+
+Skip cases (no intake needed): user already named values; re-running at known settings; chaining from a fixed-settings tool.
 
 ## Upload constraints
 
