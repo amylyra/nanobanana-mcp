@@ -29,7 +29,7 @@ gcloud run services list
 
 ## Save to Google Drive
 
-The `render_md` from every image-output tool ends with a one-line nudge: `**Save to Google Drive?** Reply *save* and I'll upload via the Google Drive MCP.` When the user replies "save" / "save to drive", the agent fetches bytes from the most recent `image_url` and calls the Google Drive MCP's `create_file` tool. The nudge is generated in `_build_image_response()` (server.py) and the workflow is taught in three places — must stay aligned:
+The `render_md` from every image-output tool ends with a one-line nudge: `**Save to Google Drive?** Reply *save* and I'll upload via the Google Drive MCP.` When the user replies "save" / "save to drive", the agent fetches bytes from the most recent `image_url` and calls the Google Drive MCP's `create_file` tool. The nudge is generated in `_build_image_response()` (`server.py`); the workflow is taught in three external places — all must stay aligned:
 - Server `instructions` block (`## Save to Google Drive — when the user replies 'save'`)
 - `mcp-s3-companion/SKILL.md` (Step 4)
 - This section

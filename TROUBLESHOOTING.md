@@ -90,10 +90,40 @@ Using local `/images/{id}` storage without cloud backing — images can expire o
 
 ---
 
-## 5) Recommended production baseline
+## 5) "Save to Drive" reply doesn't save anything
+
+### Cause
+
+The Save-to-Drive flow is markdown-link UX, not a clickable button. When the user replies "save", the agent must:
+1. Fetch bytes from the most recent `image_url` (Python `urllib.request.urlopen`).
+2. Call the Google Drive MCP's `create_file` tool with the bytes.
+
+Common failure modes:
+
+- **Google Drive MCP not installed.** The agent has no `create_file` tool to call. It must tell the user, not fabricate a Drive URL.
+- **`urlopen` blocked / 503 on the S3 URL.** Same transient Cloud Run scaling issues as the upload path. Retry with backoff.
+- **Agent skipped the carry-through step.** Server instructions tell the agent to surface the nudge in chat; without it, the user never sees the prompt and never replies "save".
+- **`image_url` missing from JSON metadata.** The agent should never strip it. Confirm `_build_image_response()` populates `image_url` (S3 or `/images/<id>`).
+
+### Fast checks
+
+1. Confirm the user is in claude.ai (web or Cowork) — Claude Code CLI doesn't have the Google Drive MCP by default.
+2. Confirm the agent's last assistant message included the **Save to Google Drive?** nudge verbatim. If not, the nudge isn't being rendered or the agent dropped it.
+3. Confirm `image_url` in the most recent `json_str` resolves to fetchable bytes (`curl -I {url}`).
+
+### Mitigation
+
+- If Drive MCP is unavailable, fall back to the `[Download image](url)` link — this always works.
+- For frequent failures, ensure `S3_BUCKET` is set so URLs are durable.
+- The workflow is taught in `server.py` instructions, `mcp-s3-companion/SKILL.md` Step 4, and `CLAUDE.md` — keep all three aligned (see CLAUDE.md "Save to Google Drive" section).
+
+---
+
+## 6) Recommended production baseline
 
 1. `PUBLIC_URL` set correctly.
 2. `S3_BUCKET` configured (preferred) for durable assets.
 3. `--min-instances=1` on Cloud Run to prevent cold-start 503s.
 4. Tool response order: `[ImageContent..., render_md, json_str]`.
-5. Document Claude chat rendering limitation prominently.
+5. `render_md` ends with the **Save to Google Drive?** nudge.
+6. Document Claude chat rendering limitation prominently.
