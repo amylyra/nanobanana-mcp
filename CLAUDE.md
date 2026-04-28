@@ -36,6 +36,15 @@ The `render_md` from every image-output tool ends with a one-line nudge: `**Save
 
 Important: this is markdown-link UX, not a true clickable button. Markdown can't trigger an MCP call; the agent must read the user's "save" reply and act. If the Google Drive MCP isn't installed, tell the user — never fabricate a Drive URL.
 
+## Saving images locally — no `save_folder` parameter
+
+The server has **no `save_folder` parameter** and never writes to disk on the user's behalf. Cloud Run can't reach the user's filesystem; an earlier attempt at a server-side `save_folder` wrote inside the container and returned `/Users/...` paths the agent then attached as chat artifacts → "Failed to load local file" preview errors. Do not re-add it.
+
+Working paths for a local copy:
+- **Browser** (works everywhere): click the `[Download image](url)` link → Save As.
+- **Google Drive**: user replies *save* → agent uses Google Drive MCP `create_file` (see section above).
+- **Cowork / Claude Code only**: the agent has client-side Python/Bash tools running on the user's machine. Ask it to fetch bytes from `image_url` (`urllib.request.urlopen(url).read()`) and write them to a folder. This is an agent action on the user's machine, never a server action.
+
 ## Intake before any image-output tool
 
 Image-output tools: `generate_image`, `edit_image`, `swap_background`, `create_variations`. The agent must confirm aspect ratio (and resolution where supported) with the user before the first call to any of them.
