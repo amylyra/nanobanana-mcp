@@ -161,6 +161,11 @@ To chain a generated image into another tool, use `image_url` from the JSON meta
 
 **Save-to-Drive flow:** when the user replies *save* (or "save to drive"), the agent fetches bytes from the most recent `image_url` and calls the Google Drive MCP's `create_file` tool. If the Google Drive MCP isn't installed, the agent tells the user — it never fabricates a Drive URL.
 
+**Saving locally:** the server has no `save_folder` parameter — it can't reach the user's filesystem. Three working paths for a local copy:
+- **Browser** (everywhere): click `[Download image](url)` → Save As.
+- **Google Drive**: reply *save* (requires Google Drive MCP).
+- **Cowork / Claude Code**: ask the agent to fetch bytes from `image_url` and write them to a folder using its client-side Python/Bash tools.
+
 ---
 
 ## REST API

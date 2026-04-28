@@ -1595,25 +1595,9 @@ def _upload_to_cloud(jpeg_bytes: bytes, prefix: str = "gen") -> str:
 # ---------------------------------------------------------------------------
 # Helpers — image output formatting
 # ---------------------------------------------------------------------------
-def _save_to_folder(jpeg_bytes: bytes, folder: str, prefix: str = "gen") -> str | None:
-    """Save JPEG bytes to a local folder. Returns the saved file path, or None on failure."""
-    try:
-        os.makedirs(folder, exist_ok=True)
-        filename = f"{prefix}_{uuid.uuid4().hex[:8]}.jpg"
-        path = os.path.join(folder, filename)
-        with open(path, "wb") as f:
-            f.write(jpeg_bytes)
-        return path
-    except Exception as e:
-        log(f"[nanobanana] Warning: failed to save image to {folder}: {e}\n")
-        return None
-
-
-
 def _build_image_response(
     result: dict,
     generated: list[tuple[bytes, dict]],
-    save_folder: str | None = None,
     prefix: str = "gen",
 ) -> tuple[str, str, list[bytes]]:
     """Build a tool response.
@@ -1656,10 +1640,6 @@ def _build_image_response(
         buf = BytesIO()
         pil.save(buf, format="JPEG", quality=85, optimize=True)
         thumbnails.append(buf.getvalue())
-        if save_folder:
-            saved_path = _save_to_folder(jpeg_bytes, save_folder, prefix)
-            if saved_path:
-                meta["saved_to"] = saved_path
 
     save_nudge = (
         "**Save to Google Drive?** Reply *save* and I'll upload "
@@ -1979,7 +1959,6 @@ async def generate_image(
     quality: str = "default",
     count: int = 1,
     qa: bool = False,
-    save_folder: str | None = None,
 ) -> list | str:
     """Generate an image from a text prompt with optional reference images and style presets.
 
@@ -2004,7 +1983,6 @@ async def generate_image(
         quality: "default" (fast) or "pro" (higher quality). Default: default
         count: Number of images to generate (1–4). Default: 1
         qa: If true, AI-score each image. When count > 1, ranks by total score.
-        save_folder: Optional local folder path to save generated JPEG files.
 
     Returns:
         Inline image previews, markdown download links, and JSON metadata with
@@ -2097,7 +2075,7 @@ async def generate_image(
         result["errors"] = errors
 
     try:
-        render_md, json_result, thumbnails = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="gen")
+        render_md, json_result, thumbnails = await _run_in_thread(_build_image_response, result, generated, prefix="gen")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload generated images: {e}"})
     return [Image(data=t, format="jpeg") for t in thumbnails] + [render_md, json_result]
@@ -2113,7 +2091,6 @@ async def edit_image(
     edit_mode: str = "inpaint-insertion",
     aspect_ratio: str | None = None,
     count: int = 1,
-    save_folder: str | None = None,
 ) -> list | str:
     """Edit an existing image — add objects, remove objects, or extend the canvas.
 
@@ -2144,7 +2121,6 @@ async def edit_image(
                       Default = same as source. Confirm with the user (especially
                       for outpaint, where reshaping is the whole point).
         count: Number of candidates (1–4). Default: 1
-        save_folder: Optional local folder path to save edited JPEG files.
 
     Returns:
         Inline image previews, markdown download links, and JSON metadata with
@@ -2228,7 +2204,7 @@ async def edit_image(
     if errors:
         result["errors"] = errors
     try:
-        render_md, json_result, thumbnails = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="edit")
+        render_md, json_result, thumbnails = await _run_in_thread(_build_image_response, result, generated, prefix="edit")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload edited images: {e}"})
     return [Image(data=t, format="jpeg") for t in thumbnails] + [render_md, json_result]
@@ -2241,7 +2217,6 @@ async def swap_background(
     image: Annotated[str, Field(max_length=2048)],
     aspect_ratio: str | None = None,
     count: int = 1,
-    save_folder: str | None = None,
 ) -> list | str:
     """Replace the background of an image while keeping the foreground subject intact.
 
@@ -2259,7 +2234,6 @@ async def swap_background(
         aspect_ratio: One of 1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9.
                       Default = same as source. Confirm with the user.
         count: Number of candidates (1–4). Default: 1
-        save_folder: Optional local folder path to save result JPEG files.
 
     Returns:
         Inline image previews, markdown download links, and JSON metadata with
@@ -2307,7 +2281,7 @@ async def swap_background(
     if errors:
         result["errors"] = errors
     try:
-        render_md, json_result, thumbnails = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="bgswap")
+        render_md, json_result, thumbnails = await _run_in_thread(_build_image_response, result, generated, prefix="bgswap")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload background-swapped images: {e}"})
     return [Image(data=t, format="jpeg") for t in thumbnails] + [render_md, json_result]
@@ -2324,7 +2298,6 @@ async def create_variations(
     quality: str = "default",
     count: int = 3,
     qa: bool = False,
-    save_folder: str | None = None,
 ) -> list | str:
     """Generate variations of an existing image.
 
@@ -2347,7 +2320,6 @@ async def create_variations(
         quality: "default" or "pro". Default: default
         count: Number of variations (1–4). Default: 3
         qa: Score each variation and rank by quality. Default: false
-        save_folder: Optional local folder path to save variation JPEG files.
 
     Returns:
         Inline image previews, markdown download links, and JSON metadata with
@@ -2421,7 +2393,7 @@ async def create_variations(
         result["guidance"] = prompt
 
     try:
-        render_md, json_result, thumbnails = await _run_in_thread(_build_image_response, result, generated, save_folder, prefix="var")
+        render_md, json_result, thumbnails = await _run_in_thread(_build_image_response, result, generated, prefix="var")
     except Exception as e:
         return json.dumps({"error": f"Failed to store/upload variation images: {e}"})
 

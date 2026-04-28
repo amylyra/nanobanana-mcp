@@ -309,26 +309,6 @@ class TestGenerateImageValidation:
         assert "available" in data
 
     @pytest.mark.asyncio
-    async def test_save_folder_invalid_path_is_non_fatal(self):
-        """save_folder pointing to an unwritable path logs a warning but doesn't fail."""
-        mock_client = MagicMock()
-        test_img = _make_test_image(64, 64)
-        mock_part = MagicMock()
-        mock_part.inline_data = MagicMock(mime_type="image/png", data=test_img)
-        mock_candidate = MagicMock()
-        mock_candidate.content.parts = [mock_part]
-        mock_response = MagicMock()
-        mock_response.candidates = [mock_candidate]
-        mock_client.models.generate_content.return_value = mock_response
-
-        with patch.object(server, "_get_client", return_value=mock_client):
-            # /root/noperms should fail to create on macOS — _save_to_folder swallows it
-            result = await server.generate_image("test", save_folder="/root/noperms/nbtest")
-        # Should still return images even if folder save fails
-        assert isinstance(result, list)
-        assert "image_url" in _parse_result(result)
-
-    @pytest.mark.asyncio
     async def test_empty_reference_image_rejected(self):
         """Empty string in reference_images should produce a clear error."""
         mock_client = MagicMock()
@@ -375,32 +355,6 @@ class TestNoDoubleJPEG:
         metadata = _parse_result(result)
         assert "images" in metadata
         assert len(metadata["images"]) == 3
-
-    def test_save_folder_writes_files(self, tmp_path):
-        """When save_folder is provided, JPEG files are written there."""
-        jpeg = _make_test_image(100, 100)
-        result = server._build_image_response(
-            {}, [(jpeg, {"index": 1})], save_folder=str(tmp_path), prefix="test"
-        )
-        metadata = _parse_result(result)
-        assert "saved_to" in metadata
-        saved = metadata["saved_to"]
-        assert saved.startswith(str(tmp_path))
-        assert os.path.isfile(saved)
-        # File should be a valid JPEG
-        from PIL import Image as PILImage
-        from io import BytesIO
-        with open(saved, "rb") as f:
-            PILImage.open(f).verify()
-
-    def test_save_folder_multiple_images(self, tmp_path):
-        """Multiple images with save_folder — each gets its own file."""
-        imgs = [(_make_test_image(100, 100), {"index": i}) for i in range(3)]
-        result = server._build_image_response({}, imgs, save_folder=str(tmp_path), prefix="var")
-        metadata = _parse_result(result)
-        for img_meta in metadata["images"]:
-            assert "saved_to" in img_meta
-            assert os.path.isfile(img_meta["saved_to"])
 
 
 # ---------------------------------------------------------------------------
@@ -1944,7 +1898,6 @@ class TestDefaultOutputBehavior:
     - Images always displayed inline in Claude (MCPImage first in return list)
     - image_url always points to /images/ (in-memory, 1-hour TTL) for chaining
     - S3 catch-all upload fires in background when S3_BUCKET is configured
-    - save_folder writes JPEG files to disk when provided
     """
 
     def _mock_gemini_response(self):
@@ -2919,88 +2872,6 @@ class TestDocstringInstructions:
             assert "image_url" in doc, (
                 f"{tool.__name__} docstring must mention image_url for tool chaining."
             )
-
-
-# ---------------------------------------------------------------------------
-# 33. save_folder + S3 simultaneously
-# ---------------------------------------------------------------------------
-
-class TestSaveFolderWithS3:
-    """Both save_folder and S3 can be active at the same time."""
-
-    def _mock_gemini_response(self):
-        test_img = _make_test_image(128, 128)
-        mock_part = MagicMock()
-        mock_part.inline_data = MagicMock(mime_type="image/png", data=test_img)
-        mock_candidate = MagicMock()
-        mock_candidate.content.parts = [mock_part]
-        mock_response = MagicMock()
-        mock_response.candidates = [mock_candidate]
-        return mock_response
-
-    def setup_method(self):
-        with server._STORE_LOCK:
-            server._IMAGE_STORE.clear()
-
-    @pytest.mark.asyncio
-    async def test_single_image_has_both_s3_url_and_saved_path(self, tmp_path):
-        """Single image: metadata has S3 image_url AND local saved_to path."""
-        mock_client = MagicMock()
-        mock_client.models.generate_content.return_value = self._mock_gemini_response()
-        fake_s3 = "https://bucket.s3.amazonaws.com/gen/abc.jpg"
-
-        with patch.object(server, "_get_client", return_value=mock_client), \
-             patch.object(server, "S3_BUCKET", "bucket"), \
-             patch.object(server, "_upload_to_s3", return_value=fake_s3):
-            result = await server.generate_image("cat", save_folder=str(tmp_path))
-
-        meta = _parse_result(result)
-        assert meta["image_url"] == fake_s3
-        assert "saved_to" in meta
-        assert os.path.isfile(meta["saved_to"])
-        assert str(tmp_path) in meta["saved_to"]
-
-    @pytest.mark.asyncio
-    async def test_multi_image_each_has_s3_url_and_saved_path(self, tmp_path):
-        """count=2 with S3 + save_folder: each image has both fields."""
-        mock_client = MagicMock()
-        mock_client.models.generate_content.return_value = self._mock_gemini_response()
-
-        n = [0]
-        def make_url(b, prefix="gen"):
-            n[0] += 1
-            return f"https://bucket.s3.amazonaws.com/gen/{n[0]}.jpg"
-
-        with patch.object(server, "_get_client", return_value=mock_client), \
-             patch.object(server, "S3_BUCKET", "bucket"), \
-             patch.object(server, "_upload_to_s3", side_effect=make_url):
-            result = await server.generate_image("cats", count=2, save_folder=str(tmp_path))
-
-        meta = _parse_result(result)
-        assert "images" in meta
-        for img in meta["images"]:
-            assert "amazonaws.com" in img["image_url"]
-            assert "saved_to" in img
-            assert os.path.isfile(img["saved_to"])
-        # Files must be distinct
-        paths = [img["saved_to"] for img in meta["images"]]
-        assert len(set(paths)) == 2
-
-    @pytest.mark.asyncio
-    async def test_s3_failure_still_saves_to_folder(self, tmp_path):
-        """Even when S3 upload fails, save_folder write succeeds."""
-        mock_client = MagicMock()
-        mock_client.models.generate_content.return_value = self._mock_gemini_response()
-
-        with patch.object(server, "_get_client", return_value=mock_client), \
-             patch.object(server, "S3_BUCKET", "bucket"), \
-             patch.object(server, "_upload_to_s3", side_effect=Exception("S3 down")):
-            result = await server.generate_image("cat", save_folder=str(tmp_path))
-
-        meta = _parse_result(result)
-        assert "/images/" in meta["image_url"]   # fallback URL
-        assert "saved_to" in meta                # local save still worked
-        assert os.path.isfile(meta["saved_to"])
 
 
 # ---------------------------------------------------------------------------
