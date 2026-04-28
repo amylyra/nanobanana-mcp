@@ -1682,6 +1682,21 @@ class TestUploadSnippetsByEnvironment:
         assert "/mnt/user-data/uploads" in snippet
         assert "candidates" in snippet
 
+    def test_urllib_snippet_handles_empty_uploads_folder(self):
+        """When the uploads folder exists but is empty (Cowork pasted-inline doesn't
+        write to disk), the snippet must print actionable guidance — not silently
+        no-op, which would leave the agent improvising."""
+        snippet = server._urllib_snippet()
+        assert "if not files:" in snippet, (
+            "snippet must explicitly handle the empty-folder case"
+        )
+        assert "paperclip" in snippet or "upload button" in snippet, (
+            "guidance should name the upload mechanism the user needs to switch to"
+        )
+        assert "pasted" in snippet.lower() or "dragged" in snippet.lower(), (
+            "guidance should explain why the folder is empty"
+        )
+
     @pytest.mark.asyncio
     async def test_data_uri_error_includes_both_environment_snippets(self):
         """The data-URI rejection should show both web (urllib) and Claude Code (curl)
