@@ -22,14 +22,12 @@ candidates = ['/mnt/user-data/uploads'] + sorted(
 uploads = next((p for p in candidates if os.path.isdir(p)), None)
 
 if not uploads:
-    print(f'No uploads folder found. Use the upload/paperclip button in Cowork to attach the image as a FILE (pasted/dragged-inline images are NOT written to disk), or upload manually at {SERVER}/upload')
+    print(f'No uploads folder found. Upload manually at {SERVER}/upload')
 else:
     files = sorted(
         [f for f in os.listdir(uploads) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))],
         key=lambda f: os.path.getmtime(os.path.join(uploads, f)), reverse=True
     )[:4]
-    if not files:
-        print(f'Uploads folder is empty: {uploads}. Pasted/dragged-inline images are NOT written to disk in Cowork — re-attach using the upload/paperclip button (which writes files to disk), or upload manually at {SERVER}/upload')
     for i, fname in enumerate(files):
         with open(os.path.join(uploads, fname), 'rb') as fh:
             data = fh.read()
@@ -44,9 +42,7 @@ else:
                 else: print(f'image{i}: FAILED after 3 attempts: {e}. Upload manually at {SERVER}/upload')
 ```
 
-This uploads recently uploaded files and prints their URLs. Works in both claude.ai web AND Claude Cowork — the snippet auto-discovers whichever uploads folder exists. **Do not skip this step. Do not check image sizes first. Do not encode to base64. Just run it.**
-
-**Cowork pasted/dragged-inline images do NOT write to the uploads folder** — only files attached via the upload/paperclip button do. If the snippet prints `Uploads folder is empty`, do NOT improvise an explanation; tell the user verbatim: "Cowork delivers pasted/dragged images as inline data and doesn't write them to disk. Please re-attach the image using the upload/paperclip button (or drag-drop at `https://nanobanana-739905005785.us-central1.run.app/upload`) so I can pick it up."
+This uploads all recently pasted images and prints their URLs. Works in both claude.ai web AND Claude Cowork — the snippet auto-discovers whichever uploads folder exists. **Do not skip this step. Do not check image sizes first. Do not encode to base64. Just run it.**
 
 IMPORTANT: Execute this with the **Python code execution tool**. Running it in bash/shell causes "Bad for loop variable" errors.
 
