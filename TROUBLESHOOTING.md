@@ -119,7 +119,36 @@ Common failure modes:
 
 ---
 
-## 6) Recommended production baseline
+## 6) Cowork: agent says "uploads folder empty, please re-share"
+
+### Cause
+
+Cowork delivers **pasted/dragged-inline images** as multimodal data in the conversation — they are NOT written to `~/Library/Application Support/Claude/local-agent-mode-sessions/<session>/uploads/`. Only files attached via the **upload/paperclip button** land in that folder.
+
+The auto-discovery snippet (`_urllib_snippet()`) lists `*.jpg/png/...` in the uploads folder and uploads each one. If pasted inline images are the only content, the folder is empty and the snippet has nothing to send.
+
+Pre-fix symptom: silent no-op — agent improvises an explanation about multimodal data and asks the user to re-share, which feels random.
+
+### Fix (server side)
+
+The snippet now prints explicit guidance when `uploads` exists but `files == []`:
+
+> Uploads folder is empty: <path>. Pasted/dragged-inline images are NOT written to disk in Cowork — re-attach using the upload/paperclip button (which writes files to disk), or upload manually at <SERVER>/upload
+
+### Fast checks
+
+1. Confirm the user is in Cowork (path mentions `local-agent-mode-sessions`).
+2. Confirm whether they pasted vs uploaded — only uploads land in the folder.
+3. Direct them to the paperclip/upload button, or `{PUBLIC_URL}/upload` for drag-drop.
+
+### Mitigation
+
+- Skill copy: SKILL.md Step 1 tells the agent to repeat the empty-folder guidance verbatim instead of improvising.
+- For frequent users, `{PUBLIC_URL}/app` (full web app) avoids the paste/upload distinction entirely.
+
+---
+
+## 7) Recommended production baseline
 
 1. `PUBLIC_URL` set correctly.
 2. `S3_BUCKET` configured (preferred) for durable assets.
